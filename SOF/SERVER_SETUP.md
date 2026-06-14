@@ -55,9 +55,11 @@ For x1 render-restoration priors, also provide:
   renders_lr_same_size/
 ```
 
-## Base Environment
+## Restoration-Only Environment
 
-Use conda only to create an isolated Python, then install the rest with `pip`.
+Use this path when you only need to generate NAFNet/Restormer priors. It does
+not install GS training dependencies such as `open3d`, `plyfile`, or CUDA
+rasterizers.
 
 ```bash
 conda create -n newsr python=3.10 -y
@@ -93,13 +95,48 @@ Install Python dependencies:
 
 ```bash
 cd /root/autodl-tmp/newsr
-pip install -r SOF/requirements-server.txt
-pip install -r mip-splatting/requirements.txt
-pip install numpy==1.26.4 scipy pyyaml requests tensorboard imageio imageio-ffmpeg kornia trimesh pillow
+pip uninstall -y opencv-python opencv-python-headless plyfile open3d || true
+pip install --force-reinstall numpy==1.26.4 opencv-python-headless==4.10.0.84
+pip install pillow tqdm einops scipy scikit-image pyyaml requests imageio imageio-ffmpeg kornia tensorboard lmdb addict future yapf
+cat >/tmp/newsr-restoration-constraints.txt <<'EOF'
+numpy==1.26.4
+opencv-python==4.10.0.84
+opencv-python-headless==4.10.0.84
+EOF
 ```
 
-Do not blindly install `mip-splatting/hybrid_sdfgs/requirements.unified.txt` on
-this env because it pins an older CUDA/PyTorch stack.
+Do not install `SOF/requirements-server.txt`,
+`mip-splatting/requirements.txt`, or
+`mip-splatting/hybrid_sdfgs/requirements.unified.txt` for restoration-only
+prior generation. Those files include GS-side packages and can pull incompatible
+NumPy/OpenCV/PyTorch versions.
+
+If a previous install already created a NumPy conflict, repair the env with:
+
+```bash
+conda activate newsr
+pip uninstall -y opencv-python opencv-python-headless plyfile open3d
+pip install --force-reinstall numpy==1.26.4 opencv-python-headless==4.10.0.84
+pip check
+```
+
+`pip check` should no longer mention `opencv-python` or `plyfile` after they are
+removed.
+
+## Optional GS Training Environment
+
+Only use this section when you also want to run the 3DGS/NoSR training code in
+the same env.
+
+```bash
+cd /root/autodl-tmp/newsr
+pip install -r SOF/requirements-server.txt
+pip install -r mip-splatting/requirements.txt
+pip install scipy pyyaml requests tensorboard imageio imageio-ffmpeg kornia trimesh pillow
+```
+
+Do not blindly install `mip-splatting/hybrid_sdfgs/requirements.unified.txt`
+because it pins an older CUDA/PyTorch stack.
 
 ## CUDA Extensions
 
@@ -152,11 +189,11 @@ conflicts become annoying, create separate envs and pass
 ```bash
 conda activate newsr
 cd /root/autodl-tmp/external/NAFNet
-pip install -r requirements.txt || true
+pip install -c /tmp/newsr-restoration-constraints.txt -r requirements.txt || true
 python setup.py develop --no_cuda_ext || true
 
 cd /root/autodl-tmp/external/Restormer
-pip install -r requirements.txt || true
+pip install -c /tmp/newsr-restoration-constraints.txt -r requirements.txt || true
 python setup.py develop --no_cuda_ext || true
 ```
 
