@@ -188,14 +188,25 @@ conflicts become annoying, create separate envs and pass
 
 ```bash
 conda activate newsr
+
 cd /root/autodl-tmp/external/NAFNet
-pip install -c /tmp/newsr-restoration-constraints.txt -r requirements.txt || true
-python setup.py develop --no_cuda_ext || true
+if [[ -f requirements.txt ]]; then
+  pip install -c /tmp/newsr-restoration-constraints.txt -r requirements.txt
+fi
 
 cd /root/autodl-tmp/external/Restormer
-pip install -c /tmp/newsr-restoration-constraints.txt -r requirements.txt || true
-python setup.py develop --no_cuda_ext || true
+if [[ -f requirements.txt ]]; then
+  pip install -c /tmp/newsr-restoration-constraints.txt -r requirements.txt
+else
+  pip install -c /tmp/newsr-restoration-constraints.txt einops gdown natsort basicsr
+fi
 ```
+
+Do not run `python setup.py develop` for NAFNet or Restormer in this
+restoration-only setup. Their setup scripts can trigger isolated editable builds
+that fail with `ModuleNotFoundError: No module named 'torch'`. The newsr prior
+generator launches the upstream demo scripts with the external repo root added
+to `PYTHONPATH`, so editable installation is not required.
 
 Download the NAFNet/Restormer pretrained checkpoints according to each upstream
 repo and update their option files if needed.

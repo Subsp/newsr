@@ -317,7 +317,14 @@ def _ensure_unique_stems(paths: Iterable[Path]) -> None:
 def _run_command(cmd: list[str], cwd: Path) -> None:
     printable = " ".join(cmd)
     print(f"[enhancement-priors] run external: {printable}", flush=True)
-    subprocess.run(cmd, cwd=str(cwd), check=True)
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        str(cwd)
+        if not existing_pythonpath
+        else f"{cwd}{os.pathsep}{existing_pythonpath}"
+    )
+    subprocess.run(cmd, cwd=str(cwd), check=True, env=env)
 
 
 def _link_or_copy(src: Path, dst: Path) -> None:
