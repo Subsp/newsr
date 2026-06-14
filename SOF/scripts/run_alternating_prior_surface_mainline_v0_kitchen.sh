@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SOF_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+
+WORK_ROOT="${WORK_ROOT:-/root/autodl-tmp}"
+SCENE_NAME="${SCENE_NAME:-kitchen}"
+SCENE_ROOT="${SCENE_ROOT:-${WORK_ROOT}/${SCENE_NAME}}"
+
+RUN_NAME="${RUN_NAME:-alternating_prior_surface_mainline5k_v0}"
+PATCH_OBSERVATION_RUN_NAME="${PATCH_OBSERVATION_RUN_NAME:-mesh_patch_observations_smoke_v0}"
+PREPARED_SR_PRIOR_NAME="${PREPARED_SR_PRIOR_NAME:-quality_fuse_v1_maskreparam_geometry_only_safe_hf_v1}"
+STAGE_NAME="${STAGE_NAME:-debug_stage_00b3_after_scale_canonicalize}"
+
+TOTAL_STEPS="${TOTAL_STEPS:-5000}"
+APPEARANCE_STEPS="${APPEARANCE_STEPS:-50}"
+STRUCTURE_STEPS="${STRUCTURE_STEPS:-50}"
+SAVE_EVERY_CYCLES="${SAVE_EVERY_CYCLES:-10}"
+OUTPUT_ITERATION="${OUTPUT_ITERATION:-${TOTAL_STEPS}}"
+
+MAX_VIEWS="${MAX_VIEWS:-0}"
+MIN_VIEWS="${MIN_VIEWS:-2}"
+MIN_CONFIDENCE="${MIN_CONFIDENCE:-0.0}"
+MAX_DISAGREEMENT="${MAX_DISAGREEMENT:-0.20}"
+ANCHOR_LOWFREQ_THRESHOLD="${ANCHOR_LOWFREQ_THRESHOLD:-0.12}"
+INIT_COLOR_SOURCE="${INIT_COLOR_SOURCE:-fused_rgb}"
+
+export SCENE_NAME
+export SCENE_ROOT
+export STAGE_NAME
+export PATCH_OBSERVATION_RUN_NAME
+export PREPARED_SR_PRIOR_NAME
+export RUN_NAME
+export TOTAL_STEPS
+export APPEARANCE_STEPS
+export STRUCTURE_STEPS
+export SAVE_EVERY_CYCLES
+export OUTPUT_ITERATION
+export MAX_VIEWS
+export MIN_VIEWS
+export MIN_CONFIDENCE
+export MAX_DISAGREEMENT
+export ANCHOR_LOWFREQ_THRESHOLD
+export INIT_COLOR_SOURCE
+
+bash "${SOF_ROOT}/scripts/run_alternating_prior_surface_v0_kitchen.sh"

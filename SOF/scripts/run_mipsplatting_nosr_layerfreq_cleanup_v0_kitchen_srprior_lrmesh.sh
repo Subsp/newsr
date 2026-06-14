@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SOF_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+
+WORK_ROOT="${WORK_ROOT:-/root/autodl-tmp}"
+SCENE_NAME="${SCENE_NAME:-kitchen}"
+SCENE_ROOT="${SCENE_ROOT:-${WORK_ROOT}/${SCENE_NAME}}"
+SCENE_ASSET_ROOT="${SCENE_ASSET_ROOT:-${SCENE_ROOT}/_hrgsrefiner_assets}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${SOF_ROOT}/output}"
+
+PREPARED_SR_PRIOR_NAME="${PREPARED_SR_PRIOR_NAME:-qwen_steps1_seed42_rcgm_aligned_images2_train244_v0}"
+PREPARED_SR_PRIOR_ROOT="${PREPARED_SR_PRIOR_ROOT:-${SCENE_ASSET_ROOT}/prepared_sr_priors/${PREPARED_SR_PRIOR_NAME}}"
+PRIOR_IMAGE_SUBDIR="${PRIOR_IMAGE_SUBDIR:-fused_priors}"
+PRIOR_IMAGE_DIR="${PRIOR_IMAGE_DIR:-${PREPARED_SR_PRIOR_ROOT}/${PRIOR_IMAGE_SUBDIR}}"
+
+REFERENCE_IMAGES_SUBDIR="${REFERENCE_IMAGES_SUBDIR:-images_2}"
+FALLBACK_IMAGES_SUBDIR="${FALLBACK_IMAGES_SUBDIR:-images_2}"
+TARGET_IMAGES_SUBDIR="${TARGET_IMAGES_SUBDIR:-images_2}"
+LOWFREQ_ANCHOR_MODE="${LOWFREQ_ANCHOR_MODE:-images8}"
+HF_RETENTION_PROFILE="${HF_RETENTION_PROFILE:-preserve_v1}"
+
+# Input model: the SR-prior-only field. This runner deliberately avoids HR/real
+# full-resolution supervision: LR inputs anchor geometry/low frequency, while SR
+# priors are routed through NoSR's surface-HF target.
+INPUT_RUN_TAG="${INPUT_RUN_TAG:-mip30k_r1_qwen_prioronly_scratch_v0}"
+INPUT_MODEL_DIR="${INPUT_MODEL_DIR:-${OUTPUT_ROOT}/mipsplatting_prior_only_from_scratch_v0/${SCENE_NAME}/${INPUT_RUN_TAG}}"
+INPUT_ITERATION="${INPUT_ITERATION:-30000}"
+CLEANUP_ITERS="${CLEANUP_ITERS:-2000}"
+FINAL_ITER="${FINAL_ITER:-$(( INPUT_ITERATION + CLEANUP_ITERS ))}"
+
+case "${LOWFREQ_ANCHOR_MODE}" in
+  images8)
+    LOWFREQ_MODE_TAG="images8"
+    EXPECTED_TRAIN_SCENE_ROOT="${SCENE_ROOT}"
+    EXPECTED_TRAIN_IMAGES_SUBDIR="images_8"
+    EXPECTED_TRAIN_RESOLUTION="1"
+    TRAIN_SCENE_ROOT="${TRAIN_SCENE_ROOT:-${SCENE_ROOT}}"
+    TRAIN_IMAGES_SUBDIR="${TRAIN_IMAGES_SUBDIR:-images_8}"
+    TRAIN_RESOLUTION="${TRAIN_RESOLUTION:-1}"
+    ;;
+  images2_r4)
+    LOWFREQ_MODE_TAG="images2r4"
+    EXPECTED_TRAIN_SCENE_ROOT="${SCENE_ROOT}"
+    EXPECTED_TRAIN_IMAGES_SUBDIR="images_2"
+    EXPECTED_TRAIN_RESOLUTION="4"
+    TRAIN_SCENE_ROOT="${TRAIN_SCENE_ROOT:-${SCENE_ROOT}}"
+    TRAIN_IMAGES_SUBDIR="${TRAIN_IMAGES_SUBDIR:-images_2}"
+    TRAIN_RESOLUTION="${TRAIN_RESOLUTION:-4}"
+    ;;
+  mip_render)
+    LOWFREQ_MODE_TAG="miprender"
+    MIP_RENDER_EXPERIMENT_GROUP="${MIP_RENDER_EXPERIMENT_GROUP:-${SCENE_NAME}_mip_vanilla_images8_v1}"
+    MIP_RENDER_MODEL_NAME="${MIP_RENDER_MODEL_NAME:-mip30k}"
+    MIP_RENDER_MODEL_PATH="${MIP_RENDER_MODEL_PATH:-${SCENE_ASSET_ROOT}/${MIP_RENDER_EXPERIMENT_GROUP}/${MIP_RENDER_MODEL_NAME}}"
+    MIP_RENDER_IMAGES_SUBDIR="${MIP_RENDER_IMAGES_SUBDIR:-images_2}"
+    MIP_RENDER_ROOT="${MIP_RENDER_ROOT:-${SCENE_ASSET_ROOT}/${MIP_RENDER_EXPERIMENT_GROUP}/${MIP_RENDER_MODEL_NAME}_render_no_gt_${MIP_RENDER_IMAGES_SUBDIR}}"
+    MIP_RENDER_SPLIT="${MIP_RENDER_SPLIT:-train}"
+    MIP_RENDER_ITERATION="${MIP_RENDER_ITERATION:-30000}"
+    MIP_RENDER_DIR="${MIP_RENDER_DIR:-${MIP_RENDER_ROOT}/${MIP_RENDER_SPLIT}/ours_${MIP_RENDER_ITERATION}/renders}"
+    MIP_RENDER_CAMERA_IMAGES_SUBDIR="${MIP_RENDER_CAMERA_IMAGES_SUBDIR:-images_8}"
+    NAMED_MIP_RENDER_DIR="${NAMED_MIP_RENDER_DIR:-${OUTPUT_ROOT}/named_mip_render_supervision_v0/${SCENE_NAME}/${MIP_RENDER_MODEL_NAME}_${MIP_RENDER_IMAGES_SUBDIR}_${MIP_RENDER_SPLIT}_${MIP_RENDER_ITERATION}_named}"
+    LOWFREQ_ALIAS_ROOT="${LOWFREQ_ALIAS_ROOT:-${OUTPUT_ROOT}/colmap_lowfreq_anchor_scene_v0/${SCENE_NAME}}"
+    LOWFREQ_ALIAS_TAG="${LOWFREQ_ALIAS_TAG:-${INPUT_RUN_TAG}_${LOWFREQ_MODE_TAG}_${MIP_RENDER_ITERATION}_v0}"
+    LOWFREQ_ALIAS_DIR="${LOWFREQ_ALIAS_DIR:-${LOWFREQ_ALIAS_ROOT}/${LOWFREQ_ALIAS_TAG}}"
+    EXPECTED_TRAIN_SCENE_ROOT="${LOWFREQ_ALIAS_DIR}"
+    EXPECTED_TRAIN_IMAGES_SUBDIR="images"
+    EXPECTED_TRAIN_RESOLUTION="1"
+    TRAIN_SCENE_ROOT="${TRAIN_SCENE_ROOT:-${LOWFREQ_ALIAS_DIR}}"
+    TRAIN_IMAGES_SUBDIR="${TRAIN_IMAGES_SUBDIR:-images}"
+    TRAIN_RESOLUTION="${TRAIN_RESOLUTION:-1}"
+    LINK_MODE="${LINK_MODE:-symlink}"
+    ;;
+  directsrc_render)
+    LOWFREQ_MODE_TAG="directsrc"
+    MIP_RENDER_EXPERIMENT_GROUP="${MIP_RENDER_EXPERIMENT_GROUP:-${SCENE_NAME}_mip_vanilla_images8_v1}"
+    MIP_RENDER_MODEL_NAME="${MIP_RENDER_MODEL_NAME:-mip30k_rerun_check_directsrc_r1_v0}"
+    MIP_RENDER_MODEL_PATH="${MIP_RENDER_MODEL_PATH:-${SCENE_ASSET_ROOT}/${MIP_RENDER_EXPERIMENT_GROUP}/${MIP_RENDER_MODEL_NAME}}"
+    MIP_RENDER_SPLIT="${MIP_RENDER_SPLIT:-train}"
+    MIP_RENDER_ITERATION="${MIP_RENDER_ITERATION:-30000}"
+    MIP_RENDER_CAMERA_IMAGES_SUBDIR="${MIP_RENDER_CAMERA_IMAGES_SUBDIR:-images_2}"
+    MIP_RENDER_DIR="${MIP_RENDER_DIR:-${MIP_RENDER_MODEL_PATH}/${MIP_RENDER_SPLIT}/ours_${MIP_RENDER_ITERATION}/test_preds_1}"
+    NAMED_MIP_RENDER_DIR="${NAMED_MIP_RENDER_DIR:-${OUTPUT_ROOT}/named_mip_render_supervision_v0/${SCENE_NAME}/${MIP_RENDER_MODEL_NAME}_${MIP_RENDER_SPLIT}_${MIP_RENDER_ITERATION}_testpreds1_named}"
+    LOWFREQ_ALIAS_ROOT="${LOWFREQ_ALIAS_ROOT:-${OUTPUT_ROOT}/colmap_lowfreq_anchor_scene_v0/${SCENE_NAME}}"
+    LOWFREQ_ALIAS_TAG="${LOWFREQ_ALIAS_TAG:-${INPUT_RUN_TAG}_${LOWFREQ_MODE_TAG}_${MIP_RENDER_ITERATION}_v0}"
+    LOWFREQ_ALIAS_DIR="${LOWFREQ_ALIAS_DIR:-${LOWFREQ_ALIAS_ROOT}/${LOWFREQ_ALIAS_TAG}}"
+    EXPECTED_TRAIN_SCENE_ROOT="${LOWFREQ_ALIAS_DIR}"
+    EXPECTED_TRAIN_IMAGES_SUBDIR="images"
+    EXPECTED_TRAIN_RESOLUTION="1"
+    TRAIN_SCENE_ROOT="${TRAIN_SCENE_ROOT:-${LOWFREQ_ALIAS_DIR}}"
+    TRAIN_IMAGES_SUBDIR="${TRAIN_IMAGES_SUBDIR:-images}"
+    TRAIN_RESOLUTION="${TRAIN_RESOLUTION:-1}"
+    LINK_MODE="${LINK_MODE:-symlink}"
+    ;;
+  *)
+    echo "[nosr-srprior-lrmesh-v0] unsupported LOWFREQ_ANCHOR_MODE=${LOWFREQ_ANCHOR_MODE}; use images8, images2_r4, mip_render, or directsrc_render" >&2
+    exit 1
+    ;;
+esac
+
+case "${HF_RETENTION_PROFILE}" in
+  conservative_v0)
+    HF_PROFILE_TAG="hfconservative"
+    DEFAULT_LAMBDA_NON_SURFACE_HF="0.030"
+    DEFAULT_LAMBDA_SURFACE_HF_CLOSURE="0.020"
+    DEFAULT_LAMBDA_SURFACE_START_HF_PRESERVE="0.060"
+    DEFAULT_LAYER_FREQUENCY_START_HF_LOWFREQ_THRESHOLD="0.060"
+    DEFAULT_LAYER_FREQUENCY_START_HF_ENERGY_THRESHOLD="0.006"
+    DEFAULT_LAYER_FREQUENCY_START_HF_MASK_POWER="1.0"
+    DEFAULT_LAYER_FREQUENCY_START_HF_PROTECT_NON_SURFACE="0"
+    DEFAULT_SURFACE_HF_UPDATE_SCALE="0.75"
+    ;;
+  preserve_v1)
+    HF_PROFILE_TAG="hfpreserve"
+    DEFAULT_LAMBDA_NON_SURFACE_HF="0.020"
+    DEFAULT_LAMBDA_SURFACE_HF_CLOSURE="0.035"
+    DEFAULT_LAMBDA_SURFACE_START_HF_PRESERVE="0.180"
+    DEFAULT_LAYER_FREQUENCY_START_HF_LOWFREQ_THRESHOLD="0.120"
+    DEFAULT_LAYER_FREQUENCY_START_HF_ENERGY_THRESHOLD="0.003"
+    DEFAULT_LAYER_FREQUENCY_START_HF_MASK_POWER="0.60"
+    DEFAULT_LAYER_FREQUENCY_START_HF_PROTECT_NON_SURFACE="1"
+    DEFAULT_SURFACE_HF_UPDATE_SCALE="1.25"
+    ;;
+  aggressive_v1)
+    HF_PROFILE_TAG="hfaggressive"
+    DEFAULT_LAMBDA_NON_SURFACE_HF="0.015"
+    DEFAULT_LAMBDA_SURFACE_HF_CLOSURE="0.050"
+    DEFAULT_LAMBDA_SURFACE_START_HF_PRESERVE="0.280"
+    DEFAULT_LAYER_FREQUENCY_START_HF_LOWFREQ_THRESHOLD="0.160"
+    DEFAULT_LAYER_FREQUENCY_START_HF_ENERGY_THRESHOLD="0.002"
+    DEFAULT_LAYER_FREQUENCY_START_HF_MASK_POWER="0.50"
+    DEFAULT_LAYER_FREQUENCY_START_HF_PROTECT_NON_SURFACE="1"
+    DEFAULT_SURFACE_HF_UPDATE_SCALE="1.60"
+    ;;
+  *)
+    echo "[nosr-srprior-lrmesh-v0] unsupported HF_RETENTION_PROFILE=${HF_RETENTION_PROFILE}; use conservative_v0, preserve_v1, or aggressive_v1" >&2
+    exit 1
+    ;;
+esac
+
+if [[ "${ALLOW_CUSTOM_LOWFREQ_ANCHOR:-0}" != "1" ]]; then
+  if [[ "${TRAIN_SCENE_ROOT}" != "${EXPECTED_TRAIN_SCENE_ROOT}" ]]; then
+    echo "[nosr-srprior-lrmesh-v0] refusing stale TRAIN_SCENE_ROOT=${TRAIN_SCENE_ROOT}" >&2
+    echo "[nosr-srprior-lrmesh-v0] expected for LOWFREQ_ANCHOR_MODE=${LOWFREQ_ANCHOR_MODE}: ${EXPECTED_TRAIN_SCENE_ROOT}" >&2
+    echo "[nosr-srprior-lrmesh-v0] unset TRAIN_SCENE_ROOT, or set ALLOW_CUSTOM_LOWFREQ_ANCHOR=1 if this is intentional." >&2
+    exit 1
+  fi
+  if [[ "${TRAIN_IMAGES_SUBDIR}" != "${EXPECTED_TRAIN_IMAGES_SUBDIR}" || "${TRAIN_RESOLUTION}" != "${EXPECTED_TRAIN_RESOLUTION}" ]]; then
+    echo "[nosr-srprior-lrmesh-v0] refusing stale lowfreq train settings: images=${TRAIN_IMAGES_SUBDIR} -r ${TRAIN_RESOLUTION}" >&2
+    echo "[nosr-srprior-lrmesh-v0] expected for LOWFREQ_ANCHOR_MODE=${LOWFREQ_ANCHOR_MODE}: images=${EXPECTED_TRAIN_IMAGES_SUBDIR} -r ${EXPECTED_TRAIN_RESOLUTION}" >&2
+    echo "[nosr-srprior-lrmesh-v0] unset TRAIN_IMAGES_SUBDIR/TRAIN_RESOLUTION, or set ALLOW_CUSTOM_LOWFREQ_ANCHOR=1 if this is intentional." >&2
+    exit 1
+  fi
+fi
+
+RUN_TAG_FROM_ENV="${RUN_TAG:-}"
+RUN_TAG_DEFAULT="${INPUT_RUN_TAG}_to${FINAL_ITER}_${LOWFREQ_MODE_TAG}_${HF_PROFILE_TAG}_nosr28_lrinput_srprior_lrmesh_v0"
+if [[ -n "${RUN_TAG_FROM_ENV}" ]]; then
+  if [[ "${ALLOW_CUSTOM_RUN_TAG:-0}" != "1" ]]; then
+    echo "[nosr-srprior-lrmesh-v0] refusing custom/stale RUN_TAG=${RUN_TAG_FROM_ENV}" >&2
+    echo "[nosr-srprior-lrmesh-v0] default for LOWFREQ_ANCHOR_MODE=${LOWFREQ_ANCHOR_MODE}: ${RUN_TAG_DEFAULT}" >&2
+    echo "[nosr-srprior-lrmesh-v0] unset RUN_TAG, or set ALLOW_CUSTOM_RUN_TAG=1 if this is intentional." >&2
+    exit 1
+  fi
+  RUN_TAG="${RUN_TAG_FROM_ENV}"
+else
+  RUN_TAG="${RUN_TAG_DEFAULT}"
+fi
+
+# NoSR layer-frequency defaults: SR prior supplies image/HF supervision through
+# layer-frequency's prior target; LR/Mip mesh supplies surface/non-surface ownership.
+export TRAIN_SCENE_ROOT
+export EVAL_SCENE_ROOT="${EVAL_SCENE_ROOT:-${SCENE_ROOT}}"
+export TRAIN_IMAGES_SUBDIR
+export TARGET_IMAGES_SUBDIR
+export TRAIN_RESOLUTION
+export LAYER_FREQUENCY_SURFACE_TARGET="${LAYER_FREQUENCY_SURFACE_TARGET:-prior}"
+export LAMBDA_NON_SURFACE_HF="${LAMBDA_NON_SURFACE_HF:-${DEFAULT_LAMBDA_NON_SURFACE_HF}}"
+export LAMBDA_NON_SURFACE_RGB_ENERGY="${LAMBDA_NON_SURFACE_RGB_ENERGY:-0.0}"
+export LAMBDA_NON_SURFACE_ALPHA_HF="${LAMBDA_NON_SURFACE_ALPHA_HF:-0.0}"
+export LAMBDA_NON_SURFACE_ALPHA_MASS="${LAMBDA_NON_SURFACE_ALPHA_MASS:-0.0}"
+export LAMBDA_SURFACE_HF_CLOSURE="${LAMBDA_SURFACE_HF_CLOSURE:-${DEFAULT_LAMBDA_SURFACE_HF_CLOSURE}}"
+export LAMBDA_SURFACE_START_HF_PRESERVE="${LAMBDA_SURFACE_START_HF_PRESERVE:-${DEFAULT_LAMBDA_SURFACE_START_HF_PRESERVE}}"
+export LAYER_FREQUENCY_START_HF_CHECKPOINT="${LAYER_FREQUENCY_START_HF_CHECKPOINT:-${INPUT_MODEL_DIR}/chkpnt${INPUT_ITERATION}.pth}"
+export LAYER_FREQUENCY_START_HF_LOWFREQ_KERNEL="${LAYER_FREQUENCY_START_HF_LOWFREQ_KERNEL:-15}"
+export LAYER_FREQUENCY_START_HF_LOWFREQ_THRESHOLD="${LAYER_FREQUENCY_START_HF_LOWFREQ_THRESHOLD:-${DEFAULT_LAYER_FREQUENCY_START_HF_LOWFREQ_THRESHOLD}}"
+export LAYER_FREQUENCY_START_HF_ENERGY_THRESHOLD="${LAYER_FREQUENCY_START_HF_ENERGY_THRESHOLD:-${DEFAULT_LAYER_FREQUENCY_START_HF_ENERGY_THRESHOLD}}"
+export LAYER_FREQUENCY_START_HF_MASK_POWER="${LAYER_FREQUENCY_START_HF_MASK_POWER:-${DEFAULT_LAYER_FREQUENCY_START_HF_MASK_POWER}}"
+export LAYER_FREQUENCY_START_HF_PROTECT_NON_SURFACE="${LAYER_FREQUENCY_START_HF_PROTECT_NON_SURFACE:-${DEFAULT_LAYER_FREQUENCY_START_HF_PROTECT_NON_SURFACE}}"
+export SURFACE_HF_UPDATE_SCALE="${SURFACE_HF_UPDATE_SCALE:-${DEFAULT_SURFACE_HF_UPDATE_SCALE}}"
+export SURFACE_NORMAL_LOCK="${SURFACE_NORMAL_LOCK:-1}"
+export EXTERNAL_PRIOR_ROOT="${EXTERNAL_PRIOR_ROOT:-${PREPARED_SR_PRIOR_ROOT}}"
+export EXTERNAL_PRIOR_SUBDIR="${EXTERNAL_PRIOR_SUBDIR:-${PRIOR_IMAGE_SUBDIR}}"
+export EXTERNAL_PRIOR_MASK_SUBDIR="${EXTERNAL_PRIOR_MASK_SUBDIR:-}"
+export PRIOR_CONSISTENCY_THRESHOLD="${PRIOR_CONSISTENCY_THRESHOLD:-1.0}"
+export PRIOR_MIN_VALID_RATIO="${PRIOR_MIN_VALID_RATIO:-0.0}"
+
+for path in \
+  "${SCENE_ROOT}" \
+  "${SCENE_ROOT}/sparse/0" \
+  "${SCENE_ROOT}/${FALLBACK_IMAGES_SUBDIR}" \
+  "${PRIOR_IMAGE_DIR}" \
+  "${INPUT_MODEL_DIR}/chkpnt${INPUT_ITERATION}.pth"; do
+  if [[ ! -e "${path}" ]]; then
+    echo "[nosr-srprior-lrmesh-v0] required path not found: ${path}" >&2
+    exit 1
+  fi
+done
+
+if [[ "${LOWFREQ_ANCHOR_MODE}" == "mip_render" || "${LOWFREQ_ANCHOR_MODE}" == "directsrc_render" ]]; then
+  for path in "${MIP_RENDER_MODEL_PATH}" "${MIP_RENDER_DIR}" "${SCENE_ROOT}/${MIP_RENDER_CAMERA_IMAGES_SUBDIR}"; do
+    if [[ ! -e "${path}" ]]; then
+      echo "[nosr-srprior-lrmesh-v0] required mip-render anchor path not found: ${path}" >&2
+      exit 1
+    fi
+  done
+
+  mkdir -p "${LOWFREQ_ALIAS_ROOT}" "${NAMED_MIP_RENDER_DIR}"
+  echo "[nosr-srprior-lrmesh-v0] prepare mip-render lowfreq anchor names: ${MIP_RENDER_DIR}"
+  (
+    cd "${SOF_ROOT}"
+    "${PYTHON_BIN:-python}" scripts/prepare_named_mip_render_supervision_v0.py \
+      --scene_root "${SCENE_ROOT}" \
+      --model_path "${MIP_RENDER_MODEL_PATH}" \
+      --images_subdir "${MIP_RENDER_CAMERA_IMAGES_SUBDIR}" \
+      --split "${MIP_RENDER_SPLIT}" \
+      --render_root "${MIP_RENDER_DIR}" \
+      --output_dir "${NAMED_MIP_RENDER_DIR}"
+  )
+  echo "[nosr-srprior-lrmesh-v0] prepare mip-render COLMAP alias: ${LOWFREQ_ALIAS_DIR}"
+  (
+    cd "${SOF_ROOT}"
+    "${PYTHON_BIN:-python}" scripts/prepare_colmap_prior_supervision_scene_v0.py \
+      --scene_root "${SCENE_ROOT}" \
+      --scene_alias_dir "${LOWFREQ_ALIAS_DIR}" \
+      --prior_dir "${NAMED_MIP_RENDER_DIR}" \
+      --reference_images_subdir "${MIP_RENDER_CAMERA_IMAGES_SUBDIR}" \
+      --fallback_images_subdir "${FALLBACK_IMAGES_SUBDIR}" \
+      --output_images_subdir images \
+      --missing_policy fallback \
+      --link_mode "${LINK_MODE}"
+  )
+fi
+
+for path in \
+  "${TRAIN_SCENE_ROOT}" \
+  "${TRAIN_SCENE_ROOT}/sparse/0" \
+  "${TRAIN_SCENE_ROOT}/${TRAIN_IMAGES_SUBDIR}"; do
+  if [[ ! -e "${path}" ]]; then
+    echo "[nosr-srprior-lrmesh-v0] required lowfreq train path not found: ${path}" >&2
+    exit 1
+  fi
+done
+
+echo "[nosr-srprior-lrmesh-v0] scene root      : ${SCENE_ROOT}"
+echo "[nosr-srprior-lrmesh-v0] lowfreq anchor  : mode=${LOWFREQ_ANCHOR_MODE} scene=${TRAIN_SCENE_ROOT} images=${TRAIN_IMAGES_SUBDIR} -r ${TRAIN_RESOLUTION}"
+echo "[nosr-srprior-lrmesh-v0] SR prior dir    : ${PRIOR_IMAGE_DIR}"
+echo "[nosr-srprior-lrmesh-v0] eval scene      : ${EVAL_SCENE_ROOT}"
+echo "[nosr-srprior-lrmesh-v0] input model     : ${INPUT_MODEL_DIR}/chkpnt${INPUT_ITERATION}.pth"
+echo "[nosr-srprior-lrmesh-v0] output tag      : ${RUN_TAG}"
+echo "[nosr-srprior-lrmesh-v0] HF profile      : ${HF_RETENTION_PROFILE}"
+echo "[nosr-srprior-lrmesh-v0] NoSR weights    : ns_hf=${LAMBDA_NON_SURFACE_HF} surf_hf=${LAMBDA_SURFACE_HF_CLOSURE} start_hf=${LAMBDA_SURFACE_START_HF_PRESERVE} scale=${SURFACE_HF_UPDATE_SCALE}"
+echo "[nosr-srprior-lrmesh-v0] start-HF gate   : lf_thr=${LAYER_FREQUENCY_START_HF_LOWFREQ_THRESHOLD} energy_thr=${LAYER_FREQUENCY_START_HF_ENERGY_THRESHOLD} power=${LAYER_FREQUENCY_START_HF_MASK_POWER} protect_ns=${LAYER_FREQUENCY_START_HF_PROTECT_NON_SURFACE}"
+
+echo
+echo "[1/1] run NoSR layer-frequency cleanup using LR inputs + SR-prior surface target + LR/Mip mesh"
+SCENE_ROOT="${SCENE_ROOT}" \
+INPUT_MODEL_DIR="${INPUT_MODEL_DIR}" \
+INPUT_ITERATION="${INPUT_ITERATION}" \
+CLEANUP_ITERS="${CLEANUP_ITERS}" \
+FINAL_ITER="${FINAL_ITER}" \
+RUN_TAG="${RUN_TAG}" \
+bash "${SCRIPT_DIR}/run_mipsplatting_nosr_layerfreq_cleanup_v0_kitchen.sh"

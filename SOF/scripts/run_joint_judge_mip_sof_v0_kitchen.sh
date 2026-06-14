@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SOF_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+
+SCENE_NAME="${SCENE_NAME:-kitchen}"
+SCENE_ROOT="${SCENE_ROOT:-/root/autodl-tmp/kitchen}"
+SCENE_ASSET_ROOT="${SCENE_ASSET_ROOT:-${SCENE_ROOT}/_hrgsrefiner_assets}"
+
+MIP_EXPERIMENT_GROUP="${MIP_EXPERIMENT_GROUP:-${SCENE_NAME}_mip_vanilla_images8_v1}"
+MIP_EXPERIMENT_NAME="${MIP_EXPERIMENT_NAME:-mip30k}"
+MIP_INPUT_MODEL_PATH="${MIP_INPUT_MODEL_PATH:-${SCENE_ASSET_ROOT}/${MIP_EXPERIMENT_GROUP}/${MIP_EXPERIMENT_NAME}_sof_native_input}"
+MIP_JUDGE_MODEL_PATH="${MIP_JUDGE_MODEL_PATH:-${MIP_INPUT_MODEL_PATH}}"
+MIP_JUDGE_ITERATION="${MIP_JUDGE_ITERATION:-30000}"
+
+SOF_PRIOR_RUN_NAME="${SOF_PRIOR_RUN_NAME:-mip_to_soflr_surface_v0}"
+SOF_PRIOR_MODEL_PATH="${SOF_PRIOR_MODEL_PATH:-${SOF_ROOT}/output/mip_to_sof_surface_v0/${SCENE_NAME}/${SOF_PRIOR_RUN_NAME}/pulled_mip_model}"
+SOF_PRIOR_ITERATION="${SOF_PRIOR_ITERATION:-32000}"
+
+RUN_NAME="${RUN_NAME:-joint_judge_mip_sof_v0}"
+RUN_ROOT="${RUN_ROOT:-${SOF_ROOT}/output/joint_judge_mip_sof_v0/${SCENE_NAME}/${RUN_NAME}}"
+
+IMAGES_SUBDIR="${IMAGES_SUBDIR:-images_8}"
+MAX_VIEWS="${MAX_VIEWS:-16}"
+CLEANUP_MODE="${CLEANUP_MODE:-dry_run}"
+OUTPUT_ITERATION="${OUTPUT_ITERATION:-32000}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+JUDGE_PROFILE="${JUDGE_PROFILE:-conservative_v0}"
+
+JUDGE_OUTPUT_DIR="${JUDGE_OUTPUT_DIR:-${RUN_ROOT}/judge_${JUDGE_PROFILE}_${CLEANUP_MODE}}"
+CLEANED_MIP_MODEL_PATH="${CLEANED_MIP_MODEL_PATH:-${RUN_ROOT}/cleaned_mip_model_${JUDGE_PROFILE}_${CLEANUP_MODE}}"
+
+case "${JUDGE_PROFILE}" in
+  conservative_v0)
+    DEFAULT_LARGE_RADIUS_PX="96"
+    DEFAULT_MIP_BLOB_MAX_LARGE_VIEWS="1"
+    DEFAULT_MIP_BLOB_MAX_VISIBLE_VIEWS="4"
+    DEFAULT_MIP_BLOB_LR_RESIDUAL_THRESHOLD="0.20"
+    DEFAULT_MIP_BLOB_MAX_OPACITY="0.55"
+    DEFAULT_MIP_BLOB_MAX_FRACTION="0.005"
+    DEFAULT_MIP_BLOB_MAX_COUNT="2048"
+    DEFAULT_SOF_SPIKE_ANISOTROPY_THRESHOLD="40"
+    DEFAULT_SOF_SPIKE_RADIUS_PX="48"
+    DEFAULT_SOF_SPIKE_MAX_LARGE_VIEWS="2"
+    DEFAULT_SOF_SPIKE_MAX_VISIBLE_VIEWS="5"
+    DEFAULT_SOF_SPIKE_MAX_FRACTION="0.01"
+    DEFAULT_SOF_SPIKE_MAX_COUNT="4096"
+    DEFAULT_SOFT_OPACITY_SCALE="0.70"
+    DEFAULT_SOFT_SCALE_SHRINK="0.90"
+    ;;
+  loose_v1)
+    DEFAULT_LARGE_RADIUS_PX="56"
+    DEFAULT_MIP_BLOB_MAX_LARGE_VIEWS="2"
+    DEFAULT_MIP_BLOB_MAX_VISIBLE_VIEWS="8"
+    DEFAULT_MIP_BLOB_LR_RESIDUAL_THRESHOLD="0.12"
+    DEFAULT_MIP_BLOB_MAX_OPACITY="0.80"
+    DEFAULT_MIP_BLOB_MAX_FRACTION="0.02"
+    DEFAULT_MIP_BLOB_MAX_COUNT="8192"
+    DEFAULT_SOF_SPIKE_ANISOTROPY_THRESHOLD="20"
+    DEFAULT_SOF_SPIKE_RADIUS_PX="28"
+    DEFAULT_SOF_SPIKE_MAX_LARGE_VIEWS="3"
+    DEFAULT_SOF_SPIKE_MAX_VISIBLE_VIEWS="8"
+    DEFAULT_SOF_SPIKE_MAX_FRACTION="0.02"
+    DEFAULT_SOF_SPIKE_MAX_COUNT="8192"
+    DEFAULT_SOFT_OPACITY_SCALE="0.35"
+    DEFAULT_SOFT_SCALE_SHRINK="0.75"
+    ;;
+  aggressive_v1)
+    DEFAULT_LARGE_RADIUS_PX="36"
+    DEFAULT_MIP_BLOB_MAX_LARGE_VIEWS="3"
+    DEFAULT_MIP_BLOB_MAX_VISIBLE_VIEWS="12"
+    DEFAULT_MIP_BLOB_LR_RESIDUAL_THRESHOLD="0.08"
+    DEFAULT_MIP_BLOB_MAX_OPACITY="0.95"
+    DEFAULT_MIP_BLOB_MAX_FRACTION="0.05"
+    DEFAULT_MIP_BLOB_MAX_COUNT="20000"
+    DEFAULT_SOF_SPIKE_ANISOTROPY_THRESHOLD="12"
+    DEFAULT_SOF_SPIKE_RADIUS_PX="18"
+    DEFAULT_SOF_SPIKE_MAX_LARGE_VIEWS="5"
+    DEFAULT_SOF_SPIKE_MAX_VISIBLE_VIEWS="12"
+    DEFAULT_SOF_SPIKE_MAX_FRACTION="0.05"
+    DEFAULT_SOF_SPIKE_MAX_COUNT="20000"
+    DEFAULT_SOFT_OPACITY_SCALE="0.20"
+    DEFAULT_SOFT_SCALE_SHRINK="0.60"
+    ;;
+  *)
+    echo "[joint-judge-v0] unknown JUDGE_PROFILE: ${JUDGE_PROFILE}" >&2
+    exit 1
+    ;;
+esac
+
+# SR prior injection weights stay in the prior training script; these thresholds
+# only nominate risky GS for dry-run/cleanup.
+LARGE_RADIUS_PX="${LARGE_RADIUS_PX:-${DEFAULT_LARGE_RADIUS_PX}}"
+MIP_BLOB_MAX_LARGE_VIEWS="${MIP_BLOB_MAX_LARGE_VIEWS:-${DEFAULT_MIP_BLOB_MAX_LARGE_VIEWS}}"
+MIP_BLOB_MAX_VISIBLE_VIEWS="${MIP_BLOB_MAX_VISIBLE_VIEWS:-${DEFAULT_MIP_BLOB_MAX_VISIBLE_VIEWS}}"
+MIP_BLOB_LR_RESIDUAL_THRESHOLD="${MIP_BLOB_LR_RESIDUAL_THRESHOLD:-${DEFAULT_MIP_BLOB_LR_RESIDUAL_THRESHOLD}}"
+MIP_BLOB_MAX_OPACITY="${MIP_BLOB_MAX_OPACITY:-${DEFAULT_MIP_BLOB_MAX_OPACITY}}"
+MIP_BLOB_MAX_FRACTION="${MIP_BLOB_MAX_FRACTION:-${DEFAULT_MIP_BLOB_MAX_FRACTION}}"
+MIP_BLOB_MAX_COUNT="${MIP_BLOB_MAX_COUNT:-${DEFAULT_MIP_BLOB_MAX_COUNT}}"
+
+SOF_SPIKE_ANISOTROPY_THRESHOLD="${SOF_SPIKE_ANISOTROPY_THRESHOLD:-${DEFAULT_SOF_SPIKE_ANISOTROPY_THRESHOLD}}"
+SOF_SPIKE_RADIUS_PX="${SOF_SPIKE_RADIUS_PX:-${DEFAULT_SOF_SPIKE_RADIUS_PX}}"
+SOF_SPIKE_MAX_LARGE_VIEWS="${SOF_SPIKE_MAX_LARGE_VIEWS:-${DEFAULT_SOF_SPIKE_MAX_LARGE_VIEWS}}"
+SOF_SPIKE_MAX_VISIBLE_VIEWS="${SOF_SPIKE_MAX_VISIBLE_VIEWS:-${DEFAULT_SOF_SPIKE_MAX_VISIBLE_VIEWS}}"
+SOF_SPIKE_MAX_FRACTION="${SOF_SPIKE_MAX_FRACTION:-${DEFAULT_SOF_SPIKE_MAX_FRACTION}}"
+SOF_SPIKE_MAX_COUNT="${SOF_SPIKE_MAX_COUNT:-${DEFAULT_SOF_SPIKE_MAX_COUNT}}"
+
+SOFT_OPACITY_SCALE="${SOFT_OPACITY_SCALE:-${DEFAULT_SOFT_OPACITY_SCALE}}"
+SOFT_SCALE_SHRINK="${SOFT_SCALE_SHRINK:-${DEFAULT_SOFT_SCALE_SHRINK}}"
+
+if [[ ! -e "${MIP_JUDGE_MODEL_PATH}/point_cloud/iteration_${MIP_JUDGE_ITERATION}/point_cloud.ply" ]]; then
+  echo "[joint-judge-v0] missing mip judge model: ${MIP_JUDGE_MODEL_PATH}/point_cloud/iteration_${MIP_JUDGE_ITERATION}/point_cloud.ply" >&2
+  exit 1
+fi
+
+if [[ ! -e "${SOF_PRIOR_MODEL_PATH}/point_cloud/iteration_${SOF_PRIOR_ITERATION}/point_cloud.ply" ]]; then
+  echo "[joint-judge-v0] missing SOF prior model: ${SOF_PRIOR_MODEL_PATH}/point_cloud/iteration_${SOF_PRIOR_ITERATION}/point_cloud.ply" >&2
+  exit 1
+fi
+
+if [[ ! -d "${SCENE_ROOT}/${IMAGES_SUBDIR}" ]]; then
+  echo "[joint-judge-v0] missing image subdir: ${SCENE_ROOT}/${IMAGES_SUBDIR}" >&2
+  exit 1
+fi
+
+mkdir -p "${JUDGE_OUTPUT_DIR}"
+
+echo "[joint-judge-v0] scene        : ${SCENE_ROOT}"
+echo "[joint-judge-v0] mip model    : ${MIP_JUDGE_MODEL_PATH} iter=${MIP_JUDGE_ITERATION}"
+echo "[joint-judge-v0] SOF model    : ${SOF_PRIOR_MODEL_PATH} iter=${SOF_PRIOR_ITERATION}"
+echo "[joint-judge-v0] images       : ${IMAGES_SUBDIR} max_views=${MAX_VIEWS}"
+echo "[joint-judge-v0] profile      : ${JUDGE_PROFILE}"
+echo "[joint-judge-v0] cleanup mode : ${CLEANUP_MODE}"
+echo "[joint-judge-v0] mip blob     : radius>=${LARGE_RADIUS_PX} residual>=${MIP_BLOB_LR_RESIDUAL_THRESHOLD} max_frac=${MIP_BLOB_MAX_FRACTION} soft=${SOFT_OPACITY_SCALE}/${SOFT_SCALE_SHRINK}"
+echo "[joint-judge-v0] output       : ${JUDGE_OUTPUT_DIR}"
+
+CMD=(
+  "${PYTHON_BIN}" -u "${SOF_ROOT}/joint_judge_mip_sof_v0.py"
+  --scene_root "${SCENE_ROOT}"
+  --mip_model_path "${MIP_JUDGE_MODEL_PATH}"
+  --sof_model_path "${SOF_PRIOR_MODEL_PATH}"
+  --output_dir "${JUDGE_OUTPUT_DIR}"
+  --mip_iteration "${MIP_JUDGE_ITERATION}"
+  --sof_iteration "${SOF_PRIOR_ITERATION}"
+  --output_iteration "${OUTPUT_ITERATION}"
+  --images_subdir "${IMAGES_SUBDIR}"
+  --max_views "${MAX_VIEWS}"
+  --large_radius_px "${LARGE_RADIUS_PX}"
+  --mip_blob_max_large_views "${MIP_BLOB_MAX_LARGE_VIEWS}"
+  --mip_blob_max_visible_views "${MIP_BLOB_MAX_VISIBLE_VIEWS}"
+  --mip_blob_lr_residual_threshold "${MIP_BLOB_LR_RESIDUAL_THRESHOLD}"
+  --mip_blob_max_opacity "${MIP_BLOB_MAX_OPACITY}"
+  --mip_blob_max_fraction "${MIP_BLOB_MAX_FRACTION}"
+  --mip_blob_max_count "${MIP_BLOB_MAX_COUNT}"
+  --sof_spike_anisotropy_threshold "${SOF_SPIKE_ANISOTROPY_THRESHOLD}"
+  --sof_spike_radius_px "${SOF_SPIKE_RADIUS_PX}"
+  --sof_spike_max_large_views "${SOF_SPIKE_MAX_LARGE_VIEWS}"
+  --sof_spike_max_visible_views "${SOF_SPIKE_MAX_VISIBLE_VIEWS}"
+  --sof_spike_max_fraction "${SOF_SPIKE_MAX_FRACTION}"
+  --sof_spike_max_count "${SOF_SPIKE_MAX_COUNT}"
+  --cleanup_mode "${CLEANUP_MODE}"
+  --soft_opacity_scale "${SOFT_OPACITY_SCALE}"
+  --soft_scale_shrink "${SOFT_SCALE_SHRINK}"
+)
+
+if [[ "${CLEANUP_MODE}" != "dry_run" ]]; then
+  CMD+=(--cleaned_mip_model_path "${CLEANED_MIP_MODEL_PATH}")
+fi
+
+"${CMD[@]}"
+
+echo "[done] summary     : ${JUDGE_OUTPUT_DIR}/summary.json"
+echo "[done] payload     : ${JUDGE_OUTPUT_DIR}/joint_judge_payload.pt"
+if [[ "${CLEANUP_MODE}" != "dry_run" ]]; then
+  echo "[done] cleaned mip : ${CLEANED_MIP_MODEL_PATH}/point_cloud/iteration_${OUTPUT_ITERATION}/point_cloud.ply"
+fi

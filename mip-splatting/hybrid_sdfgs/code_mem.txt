@@ -1,0 +1,108 @@
+[HBSR / hybrid_sdfgs code memory]
+Last update: 2026-03-13
+
+1) Current mainline direction
+- Keep: GS + SDF hybrid training + external priors.
+- Remove: all FLUX generation/inference/training dependencies.
+- Main prior path: Upscale-A-Video (UAV) external priors.
+
+2) Canonical fixed paths (server baseline)
+- HBSR_ROOT=/data3/liutl/HBSR
+- DATASET_PATH=/data3/liutl/nerf_synthetic/lego
+- VIDEO_SR_MODELS=/data3/liutl/HBSR/video_sr_models
+- PRIOR_ROOT=/data3/liutl/HBSR/priors
+
+3) Current training truth
+- train.py only optimizes GS parameters.
+- SDF adapter is still teacher-mode (analytic/neuralangelo, queried under no-grad).
+- Core hybrid loss: surface + normal + offsurface (stage A/B/C scheduler).
+- Prior loss (external priors only):
+  - masked L1 + masked high-frequency residual
+  - args are now `--prior_*` (no `--flux_*` left).
+
+4) Current active scripts
+- 00_install_experiment.sh
+- 01_install_uav_env_cu118.sh
+- 02_run_baseline_gs_lego.sh
+- 03_generate_video_priors_flashvsr_lego.sh
+- 04_run_hybrid_gsbootstrap_sdfdensify_4x_lego.sh
+- 05_eval_model.sh
+
+5) External prior interface (train.py)
+- --external_prior_root
+- --external_prior_subdir (default: priors)
+- --external_prior_exts (default: png,jpg,jpeg,webp)
+- --prior_l1_weight
+- --prior_hf_weight
+- --prior_delta_clip
+- --prior_consistency_threshold
+- --prior_min_valid_ratio
+
+6) Experimental blocks kept (decoupled)
+- SDF densify proxy: blocks/sdf_densify_block.py
+- FM SDS-like: blocks/fm_sds_block.py
+- Frequency block: blocks/frequency_block.py
+- Scaffold block: blocks/scaffold_geometry_block.py
+
+7) Important reminders
+- If torch/cuda version changes, rebuild CUDA extensions.
+- Analytic SDF is pipeline sanity-check only, not final geometry claim.
+- For external priors, file stem must match camera image_name (e.g., r_12.png).
+
+8) Status note
+- FLUX route is intentionally removed from codebase (scripts + modules + args).
+- Historical FLUX experiment outcomes are retained only in reports for reference.
+
+9) Latest observation
+- Upscale-A-Video (UAV) shows visually good super-resolution quality in the 800 -> 3200 setting.
+
+10) 2026-03-12 updates (GS->SDF + SR-guided densify)
+- Added `sdf_mode=gs_bootstrap` in `hybrid_sdfgs/sdf_adapter.py`:
+  - builds pseudo-SDF anchors from current GS (xyz + normal from covariance axis + sigma/confidence).
+  - supports periodic refresh (`--gs_bootstrap_update_interval`) to keep teacher synchronized with evolving GS.
+- Extended `SDFDensifyBlock`:
+  - emits SR local resamples around selected points.
+  - supports SR guidance fusion in scoring via `--sdf_densify_sr_score_coef` + per-point sampled guidance.
+- `train.py` now:
+  - preloads per-view external prior once per iter (if provided),
+  - constructs HF prior guidance map from `(prior - gt)` residual,
+  - projects sampled GS points into camera view and samples guidance,
+  - feeds sampled SR guidance into densify scoring,
+  - keeps SR local resample regularization loss path (`--sdf_densify_sr_weight`).
+- New experiment script:
+  - `hybrid_sdfgs/exp_scripts/04_run_hybrid_gsbootstrap_sdfdensify_4x_lego.sh`
+
+11) 2026-03-12 pipeline extension (explicit SR proposal anchors)
+- Added explicit proposal path in `train.py`:
+  1. Extract 2D SR proposal pixels from HF prior map.
+  2. Backproject pixels to rays (inverse full projection).
+  3. Ray sample SDF surface candidates (min |SDF| along each ray).
+  4. Gate by GS/SDF consistency: `|sdf|`, GS support, GS-nearest alignment.
+  5. Build local tangent-plane samples `(u,v,delta)` around accepted anchors.
+  6. Merge proposal samples into SDF densify SR regularization path.
+- New args namespace: `--sdf_proposal_*` (topk/thresholds/ray/gating/plane sampling/logging).
+
+12) 2026-03-13 script cleanup
+- `hybrid_sdfgs/exp_scripts` removed unrelated legacy scripts.
+- Script naming is now contiguous from `00` to `05`.
+- `README.md` updated to reflect only current mainline execution order.
+
+13) 2026-03-13 dataset loader extension
+- Re-enabled direct COLMAP dataset loading for both training entries:
+  - `scene/__init__.py` (baseline `train.py`)
+  - `hybrid_sdfgs/scene.py` (hybrid `hybrid_sdfgs/train.py`)
+- New accepted input pattern:
+  - `sparse/0/images.bin` or `sparse/0/images.txt` + corresponding COLMAP files.
+- This enables direct use of mipnerf360-style scenes (e.g., `garden`, `kitchen`) without creating Blender transforms files.
+
+14) 2026-03-13 FlashVSR prior route (replace UAV)
+- Added dedicated prior-only script:
+  - `hybrid_sdfgs/tools/generate_flashvsr_priors.py`
+  - scope: image sequence -> FlashVSR inference -> cached output video/frames -> `output_root/priors`.
+- Added `flashvsr` option in the multi-backend wrapper:
+  - `hybrid_sdfgs/tools/generate_video_sr_priors.py --model flashvsr`
+  - dispatches to the dedicated script (keeps FlashVSR runtime/cache isolated).
+- Updated main prior script:
+  - `hybrid_sdfgs/exp_scripts/03_generate_video_priors_flashvsr_lego.sh`
+  - default cache root: `${OUTPUT_ROOT}/cache`
+  - default model dir: `.../FlashVSR/examples/WanVSR/FlashVSR-v1.1`

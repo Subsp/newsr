@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+SCENE_NAME="${SCENE_NAME:-kitchen}"
+SCENE_ROOT="${SCENE_ROOT:-/root/autodl-tmp/kitchen}"
+SCENE_ASSET_ROOT="${SCENE_ASSET_ROOT:-${SCENE_ROOT}/_hrgsrefiner_assets}"
+MIP_EXPERIMENT_GROUP="${MIP_EXPERIMENT_GROUP:-${SCENE_NAME}_mip_vanilla_images8_v1}"
+MIP_EXPERIMENT_NAME="${MIP_EXPERIMENT_NAME:-mip30k}"
+
+SCENE_NAME="${SCENE_NAME}" \
+SCENE_ROOT="${SCENE_ROOT}" \
+SCENE_ASSET_ROOT="${SCENE_ASSET_ROOT}" \
+MIP_EXPERIMENT_GROUP="${MIP_EXPERIMENT_GROUP}" \
+MIP_EXPERIMENT_NAME="${MIP_EXPERIMENT_NAME}" \
+MIP_MODEL_PATH="${MIP_MODEL_PATH:-${SCENE_ASSET_ROOT}/${MIP_EXPERIMENT_GROUP}/${MIP_EXPERIMENT_NAME}_sof_native_input_init_energy_curve_refit_v0}" \
+RUN_NAME="${RUN_NAME:-view_aligned_volume_delete_v1_init_energy_curve_refit_v0_prune_more_v1}" \
+LR_RECOVER_RUN_NAME="${LR_RECOVER_RUN_NAME:-view_aligned_volume_delete_v1_init_energy_curve_refit_v0_prune_more_v1_mip_hr_anchor_v0_miphr_v1}" \
+LR_RECOVER_PROFILE="${LR_RECOVER_PROFILE:-mip_hr_anchor_v0}" \
+RECOMPUTE_FILTER3D="${RECOMPUTE_FILTER3D:-0}" \
+DELETE_QUANTILE="${DELETE_QUANTILE:-0.930}" \
+MAX_PRUNE_FRACTION="${MAX_PRUNE_FRACTION:-0.120}" \
+MAX_PRUNE_COUNT="${MAX_PRUNE_COUNT:-0}" \
+MAX_OPACITY="${MAX_OPACITY:-1.0}" \
+RUN_RENDER="${RUN_RENDER:-1}" \
+RUN_LR_RECOVER="${RUN_LR_RECOVER:-1}" \
+bash "${SCRIPT_DIR}/run_cleanup_mip_view_aligned_volume_artifacts_v0_kitchen.sh"

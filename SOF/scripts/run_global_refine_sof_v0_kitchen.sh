@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SOF_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+
+SCENE_NAME="${SCENE_NAME:-kitchen}"
+SCENE_ROOT="${SCENE_ROOT:-/root/autodl-tmp/kitchen}"
+SCENE_ASSET_ROOT="${SCENE_ASSET_ROOT:-${SCENE_ROOT}/_hrgsrefiner_assets}"
+
+MIP_EXPERIMENT_GROUP="${MIP_EXPERIMENT_GROUP:-${SCENE_NAME}_mip_vanilla_images8_v1}"
+MIP_EXPERIMENT_NAME="${MIP_EXPERIMENT_NAME:-mip30k}"
+MIP_ANCHOR_MODEL_PATH="${MIP_ANCHOR_MODEL_PATH:-${SCENE_ASSET_ROOT}/${MIP_EXPERIMENT_GROUP}/${MIP_EXPERIMENT_NAME}_sof_native_input}"
+MIP_ANCHOR_ITERATION="${MIP_ANCHOR_ITERATION:-30000}"
+
+START_SOF_RUN_NAME="${START_SOF_RUN_NAME:-mip_to_soflr_surface_v0}"
+START_SOF_MODEL_PATH="${START_SOF_MODEL_PATH:-${SOF_ROOT}/output/mip_to_sof_surface_v0/${SCENE_NAME}/${START_SOF_RUN_NAME}/pulled_mip_model}"
+START_SOF_ITERATION="${START_SOF_ITERATION:-32000}"
+
+RUN_NAME="${RUN_NAME:-sof_global_refine_v0}"
+RUN_ROOT="${RUN_ROOT:-${SOF_ROOT}/output/global_refine_sof_v0/${SCENE_NAME}/${RUN_NAME}}"
+
+IMAGES_SUBDIR="${IMAGES_SUBDIR:-images_8}"
+SR_IMAGES_SUBDIR="${SR_IMAGES_SUBDIR:-images_2}"
+SR_PRIOR_ROOT="${SR_PRIOR_ROOT:-${SCENE_ASSET_ROOT}/prepared_sr_priors/sof_surface_v0_images_8_to_images_2_mask0.12_soft}"
+SR_PRIOR_SUBDIR="${SR_PRIOR_SUBDIR:-fused_priors}"
+SR_PRIOR_MASK_SUBDIR="${SR_PRIOR_MASK_SUBDIR:-usable_masks}"
+SR_ANCHOR_SUBDIR="${SR_ANCHOR_SUBDIR:-aligned_references}"
+
+REFINE_PROFILE="${REFINE_PROFILE:-conservative_v0}"
+case "${REFINE_PROFILE}" in
+  conservative_v0)
+    DEFAULT_OUTPUT_SUFFIX="conservative_v0"
+    DEFAULT_OUTPUT_ITERATION="33000"
+    DEFAULT_ITERATIONS="1000"
+    DEFAULT_XYZ_LR="5e-6"
+    DEFAULT_OPACITY_LR="5e-4"
+    DEFAULT_SCALE_LR="1e-4"
+    DEFAULT_LAMBDA_MIP_RGB="0.35"
+    DEFAULT_LAMBDA_LR_RGB="0.10"
+    DEFAULT_LAMBDA_SR_MIP_RGB="0.10"
+    DEFAULT_LAMBDA_XYZ_ANCHOR="35.0"
+    DEFAULT_LAMBDA_OPACITY_ANCHOR="0.05"
+    DEFAULT_LAMBDA_SCALE_ANCHOR="0.20"
+    DEFAULT_LAMBDA_RISK_OPACITY="0.02"
+    DEFAULT_LAMBDA_RISK_SCALE="0.002"
+    DEFAULT_MAX_DISPLACEMENT_RATIO="0.001"
+    DEFAULT_SR_PRIOR_L1_WEIGHT="0.05"
+    DEFAULT_SR_PRIOR_HF_WEIGHT="0.30"
+    DEFAULT_CLEANUP_MODE="soft"
+    DEFAULT_CLEANUP_MAX_PRUNE_FRACTION="0.0"
+    DEFAULT_CLEANUP_MAX_SUPPRESS_FRACTION="0.010"
+    DEFAULT_CLEANUP_SOFT_OPACITY_SCALE="0.75"
+    DEFAULT_CLEANUP_SOFT_SCALE_SHRINK="0.90"
+    ;;
+  strong_v1)
+    DEFAULT_OUTPUT_SUFFIX="strong_v1"
+    DEFAULT_OUTPUT_ITERATION="34000"
+    DEFAULT_ITERATIONS="2000"
+    DEFAULT_XYZ_LR="8e-6"
+    DEFAULT_OPACITY_LR="8e-4"
+    DEFAULT_SCALE_LR="2e-4"
+    DEFAULT_LAMBDA_MIP_RGB="0.28"
+    DEFAULT_LAMBDA_LR_RGB="0.08"
+    DEFAULT_LAMBDA_SR_MIP_RGB="0.08"
+    DEFAULT_LAMBDA_XYZ_ANCHOR="20.0"
+    DEFAULT_LAMBDA_OPACITY_ANCHOR="0.035"
+    DEFAULT_LAMBDA_SCALE_ANCHOR="0.12"
+    DEFAULT_LAMBDA_RISK_OPACITY="0.05"
+    DEFAULT_LAMBDA_RISK_SCALE="0.006"
+    DEFAULT_MAX_DISPLACEMENT_RATIO="0.002"
+    DEFAULT_SR_PRIOR_L1_WEIGHT="0.06"
+    DEFAULT_SR_PRIOR_HF_WEIGHT="0.42"
+    DEFAULT_CLEANUP_MODE="hybrid"
+    DEFAULT_CLEANUP_MAX_PRUNE_FRACTION="0.002"
+    DEFAULT_CLEANUP_MAX_SUPPRESS_FRACTION="0.025"
+    DEFAULT_CLEANUP_SOFT_OPACITY_SCALE="0.55"
+    DEFAULT_CLEANUP_SOFT_SCALE_SHRINK="0.82"
+    ;;
+  aggressive_v1)
+    DEFAULT_OUTPUT_SUFFIX="aggressive_v1"
+    DEFAULT_OUTPUT_ITERATION="35000"
+    DEFAULT_ITERATIONS="3000"
+    DEFAULT_XYZ_LR="1.2e-5"
+    DEFAULT_OPACITY_LR="1.2e-3"
+    DEFAULT_SCALE_LR="3e-4"
+    DEFAULT_LAMBDA_MIP_RGB="0.22"
+    DEFAULT_LAMBDA_LR_RGB="0.06"
+    DEFAULT_LAMBDA_SR_MIP_RGB="0.06"
+    DEFAULT_LAMBDA_XYZ_ANCHOR="12.0"
+    DEFAULT_LAMBDA_OPACITY_ANCHOR="0.025"
+    DEFAULT_LAMBDA_SCALE_ANCHOR="0.08"
+    DEFAULT_LAMBDA_RISK_OPACITY="0.08"
+    DEFAULT_LAMBDA_RISK_SCALE="0.010"
+    DEFAULT_MAX_DISPLACEMENT_RATIO="0.003"
+    DEFAULT_SR_PRIOR_L1_WEIGHT="0.08"
+    DEFAULT_SR_PRIOR_HF_WEIGHT="0.50"
+    DEFAULT_CLEANUP_MODE="hybrid"
+    DEFAULT_CLEANUP_MAX_PRUNE_FRACTION="0.005"
+    DEFAULT_CLEANUP_MAX_SUPPRESS_FRACTION="0.050"
+    DEFAULT_CLEANUP_SOFT_OPACITY_SCALE="0.45"
+    DEFAULT_CLEANUP_SOFT_SCALE_SHRINK="0.75"
+    ;;
+  delete_v1)
+    DEFAULT_OUTPUT_SUFFIX="delete_v1"
+    DEFAULT_OUTPUT_ITERATION="36000"
+    DEFAULT_ITERATIONS="2000"
+    DEFAULT_XYZ_LR="8e-6"
+    DEFAULT_OPACITY_LR="8e-4"
+    DEFAULT_SCALE_LR="2e-4"
+    DEFAULT_LAMBDA_MIP_RGB="0.28"
+    DEFAULT_LAMBDA_LR_RGB="0.08"
+    DEFAULT_LAMBDA_SR_MIP_RGB="0.08"
+    DEFAULT_LAMBDA_XYZ_ANCHOR="20.0"
+    DEFAULT_LAMBDA_OPACITY_ANCHOR="0.035"
+    DEFAULT_LAMBDA_SCALE_ANCHOR="0.12"
+    DEFAULT_LAMBDA_RISK_OPACITY="0.05"
+    DEFAULT_LAMBDA_RISK_SCALE="0.006"
+    DEFAULT_MAX_DISPLACEMENT_RATIO="0.002"
+    DEFAULT_SR_PRIOR_L1_WEIGHT="0.06"
+    DEFAULT_SR_PRIOR_HF_WEIGHT="0.42"
+    DEFAULT_CLEANUP_MODE="delete"
+    DEFAULT_CLEANUP_MAX_PRUNE_FRACTION="0.025"
+    DEFAULT_CLEANUP_MAX_SUPPRESS_FRACTION="0.0"
+    DEFAULT_CLEANUP_SOFT_OPACITY_SCALE="1.0"
+    DEFAULT_CLEANUP_SOFT_SCALE_SHRINK="1.0"
+    ;;
+  *)
+    echo "[global-refine-sof-v0] unknown REFINE_PROFILE: ${REFINE_PROFILE}" >&2
+    exit 1
+    ;;
+esac
+
+OUTPUT_SUFFIX="${OUTPUT_SUFFIX:-${DEFAULT_OUTPUT_SUFFIX}}"
+OUTPUT_MODEL="${OUTPUT_MODEL:-${RUN_ROOT}/refined_sof_model_${OUTPUT_SUFFIX}}"
+OUTPUT_ITERATION="${OUTPUT_ITERATION:-${DEFAULT_OUTPUT_ITERATION}}"
+ITERATIONS="${ITERATIONS:-${DEFAULT_ITERATIONS}}"
+MAX_VIEWS="${MAX_VIEWS:-16}"
+SR_MAX_VIEWS="${SR_MAX_VIEWS:-${MAX_VIEWS}}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+
+# Profile defaults start from the tested stronger_v1 prior injection and can
+# intentionally push SR loss higher for stronger/aggressive refinement runs.
+SR_PRIOR_L1_WEIGHT="${SR_PRIOR_L1_WEIGHT:-${DEFAULT_SR_PRIOR_L1_WEIGHT}}"
+SR_PRIOR_HF_WEIGHT="${SR_PRIOR_HF_WEIGHT:-${DEFAULT_SR_PRIOR_HF_WEIGHT}}"
+SR_PRIOR_CONSISTENCY_THRESHOLD="${SR_PRIOR_CONSISTENCY_THRESHOLD:-0.12}"
+SR_PRIOR_MIN_VALID_RATIO="${SR_PRIOR_MIN_VALID_RATIO:-0.50}"
+SR_PRIOR_DELTA_CLIP="${SR_PRIOR_DELTA_CLIP:-0.15}"
+
+# Global-refine parameters are profile-controlled but remain overridable.
+XYZ_LR="${XYZ_LR:-${DEFAULT_XYZ_LR}}"
+OPACITY_LR="${OPACITY_LR:-${DEFAULT_OPACITY_LR}}"
+SCALE_LR="${SCALE_LR:-${DEFAULT_SCALE_LR}}"
+ENABLE_OPACITY_UPDATE="${ENABLE_OPACITY_UPDATE:-1}"
+ENABLE_SCALE_UPDATE="${ENABLE_SCALE_UPDATE:-1}"
+LAMBDA_MIP_RGB="${LAMBDA_MIP_RGB:-${DEFAULT_LAMBDA_MIP_RGB}}"
+LAMBDA_LR_RGB="${LAMBDA_LR_RGB:-${DEFAULT_LAMBDA_LR_RGB}}"
+LAMBDA_SR_MIP_RGB="${LAMBDA_SR_MIP_RGB:-${DEFAULT_LAMBDA_SR_MIP_RGB}}"
+LAMBDA_XYZ_ANCHOR="${LAMBDA_XYZ_ANCHOR:-${DEFAULT_LAMBDA_XYZ_ANCHOR}}"
+LAMBDA_OPACITY_ANCHOR="${LAMBDA_OPACITY_ANCHOR:-${DEFAULT_LAMBDA_OPACITY_ANCHOR}}"
+LAMBDA_SCALE_ANCHOR="${LAMBDA_SCALE_ANCHOR:-${DEFAULT_LAMBDA_SCALE_ANCHOR}}"
+LAMBDA_RISK_OPACITY="${LAMBDA_RISK_OPACITY:-${DEFAULT_LAMBDA_RISK_OPACITY}}"
+LAMBDA_RISK_SCALE="${LAMBDA_RISK_SCALE:-${DEFAULT_LAMBDA_RISK_SCALE}}"
+RISK_RADIUS_THRESHOLD="${RISK_RADIUS_THRESHOLD:-56}"
+RISK_LR_RESIDUAL_THRESHOLD="${RISK_LR_RESIDUAL_THRESHOLD:-0.12}"
+RISK_ANISOTROPY_THRESHOLD="${RISK_ANISOTROPY_THRESHOLD:-20}"
+RISK_MIN_SUPPORT_VIEWS="${RISK_MIN_SUPPORT_VIEWS:-4}"
+MAX_DISPLACEMENT_RATIO="${MAX_DISPLACEMENT_RATIO:-${DEFAULT_MAX_DISPLACEMENT_RATIO}}"
+MAX_DISPLACEMENT_ABS="${MAX_DISPLACEMENT_ABS:-0.0}"
+
+CLEANUP_MODE="${CLEANUP_MODE:-${DEFAULT_CLEANUP_MODE}}"
+CLEANUP_LR_PROTECT_THRESHOLD="${CLEANUP_LR_PROTECT_THRESHOLD:-0.08}"
+CLEANUP_LR_SOFT_BAD_THRESHOLD="${CLEANUP_LR_SOFT_BAD_THRESHOLD:-0.14}"
+CLEANUP_LR_HARD_BAD_THRESHOLD="${CLEANUP_LR_HARD_BAD_THRESHOLD:-0.20}"
+CLEANUP_SR_SUPPORT_THRESHOLD="${CLEANUP_SR_SUPPORT_THRESHOLD:-0.25}"
+CLEANUP_SR_PROTECT_RESIDUAL_THRESHOLD="${CLEANUP_SR_PROTECT_RESIDUAL_THRESHOLD:-0.10}"
+CLEANUP_SR_BAD_RESIDUAL_THRESHOLD="${CLEANUP_SR_BAD_RESIDUAL_THRESHOLD:-0.20}"
+CLEANUP_SOFT_RISK_THRESHOLD="${CLEANUP_SOFT_RISK_THRESHOLD:-0.35}"
+CLEANUP_HARD_RISK_THRESHOLD="${CLEANUP_HARD_RISK_THRESHOLD:-0.60}"
+CLEANUP_RADIUS_THRESHOLD="${CLEANUP_RADIUS_THRESHOLD:-56}"
+CLEANUP_ANISOTROPY_THRESHOLD="${CLEANUP_ANISOTROPY_THRESHOLD:-24}"
+CLEANUP_MAX_VISIBLE_VIEWS="${CLEANUP_MAX_VISIBLE_VIEWS:-3}"
+CLEANUP_MAX_LARGE_VIEWS="${CLEANUP_MAX_LARGE_VIEWS:-1}"
+CLEANUP_MAX_PRUNE_FRACTION="${CLEANUP_MAX_PRUNE_FRACTION:-${DEFAULT_CLEANUP_MAX_PRUNE_FRACTION}}"
+CLEANUP_MAX_PRUNE_COUNT="${CLEANUP_MAX_PRUNE_COUNT:-0}"
+CLEANUP_MAX_SUPPRESS_FRACTION="${CLEANUP_MAX_SUPPRESS_FRACTION:-${DEFAULT_CLEANUP_MAX_SUPPRESS_FRACTION}}"
+CLEANUP_MAX_SUPPRESS_COUNT="${CLEANUP_MAX_SUPPRESS_COUNT:-0}"
+CLEANUP_SOFT_OPACITY_SCALE="${CLEANUP_SOFT_OPACITY_SCALE:-${DEFAULT_CLEANUP_SOFT_OPACITY_SCALE}}"
+CLEANUP_SOFT_SCALE_SHRINK="${CLEANUP_SOFT_SCALE_SHRINK:-${DEFAULT_CLEANUP_SOFT_SCALE_SHRINK}}"
+
+RUN_RENDER="${RUN_RENDER:-0}"
+RENDER_IMAGES_SUBDIR="${RENDER_IMAGES_SUBDIR:-images_2}"
+RENDER_SPLIT="${RENDER_SPLIT:-test}"
+RENDER_DIR="${RENDER_DIR:-${RUN_ROOT}/refined_sof_renders_no_gt_${OUTPUT_SUFFIX}}"
+
+if [[ ! -e "${START_SOF_MODEL_PATH}/point_cloud/iteration_${START_SOF_ITERATION}/point_cloud.ply" ]]; then
+  echo "[global-refine-sof-v0] missing start SOF model: ${START_SOF_MODEL_PATH}/point_cloud/iteration_${START_SOF_ITERATION}/point_cloud.ply" >&2
+  exit 1
+fi
+
+if [[ ! -e "${MIP_ANCHOR_MODEL_PATH}/point_cloud/iteration_${MIP_ANCHOR_ITERATION}/point_cloud.ply" ]]; then
+  echo "[global-refine-sof-v0] missing mip anchor model: ${MIP_ANCHOR_MODEL_PATH}/point_cloud/iteration_${MIP_ANCHOR_ITERATION}/point_cloud.ply" >&2
+  exit 1
+fi
+
+if [[ ! -d "${SR_PRIOR_ROOT}/${SR_PRIOR_SUBDIR}" || ! -d "${SR_PRIOR_ROOT}/${SR_PRIOR_MASK_SUBDIR}" || ! -d "${SR_PRIOR_ROOT}/${SR_ANCHOR_SUBDIR}" ]]; then
+  echo "[global-refine-sof-v0] missing prepared SR prior cache: ${SR_PRIOR_ROOT}" >&2
+  echo "[global-refine-sof-v0] run run_mip_to_sof_surface_v0_kitchen.sh once to prepare fused_priors/usable_masks/aligned_references." >&2
+  exit 1
+fi
+
+echo "[global-refine-sof-v0] scene       : ${SCENE_ROOT}"
+echo "[global-refine-sof-v0] start SOF   : ${START_SOF_MODEL_PATH} iter=${START_SOF_ITERATION}"
+echo "[global-refine-sof-v0] mip anchor  : ${MIP_ANCHOR_MODEL_PATH} iter=${MIP_ANCHOR_ITERATION}"
+echo "[global-refine-sof-v0] SR cache    : ${SR_PRIOR_ROOT}"
+echo "[global-refine-sof-v0] output      : ${OUTPUT_MODEL}"
+echo "[global-refine-sof-v0] profile     : ${REFINE_PROFILE}"
+echo "[global-refine-sof-v0] train       : iter=${ITERATIONS} xyz_lr=${XYZ_LR} op=${ENABLE_OPACITY_UPDATE} scale=${ENABLE_SCALE_UPDATE}"
+echo "[global-refine-sof-v0] SR weights  : l1=${SR_PRIOR_L1_WEIGHT} hf=${SR_PRIOR_HF_WEIGHT}"
+echo "[global-refine-sof-v0] cleanup     : mode=${CLEANUP_MODE} prune_cap=${CLEANUP_MAX_PRUNE_FRACTION} suppress_cap=${CLEANUP_MAX_SUPPRESS_FRACTION}"
+echo "[global-refine-sof-v0] render      : ${RUN_RENDER}"
+
+CMD=(
+  "${PYTHON_BIN}" -u "${SOF_ROOT}/global_refine_sof_v0.py"
+  --scene_root "${SCENE_ROOT}"
+  --start_sof_model_path "${START_SOF_MODEL_PATH}"
+  --mip_anchor_model_path "${MIP_ANCHOR_MODEL_PATH}"
+  --output_model_path "${OUTPUT_MODEL}"
+  --start_iteration "${START_SOF_ITERATION}"
+  --mip_iteration "${MIP_ANCHOR_ITERATION}"
+  --output_iteration "${OUTPUT_ITERATION}"
+  --images_subdir "${IMAGES_SUBDIR}"
+  --sr_images_subdir "${SR_IMAGES_SUBDIR}"
+  --sr_prior_root "${SR_PRIOR_ROOT}"
+  --sr_prior_subdir "${SR_PRIOR_SUBDIR}"
+  --sr_prior_mask_subdir "${SR_PRIOR_MASK_SUBDIR}"
+  --sr_anchor_subdir "${SR_ANCHOR_SUBDIR}"
+  --max_views "${MAX_VIEWS}"
+  --sr_max_views "${SR_MAX_VIEWS}"
+  --iterations "${ITERATIONS}"
+  --xyz_lr "${XYZ_LR}"
+  --opacity_lr "${OPACITY_LR}"
+  --scale_lr "${SCALE_LR}"
+  --lambda_mip_rgb "${LAMBDA_MIP_RGB}"
+  --lambda_lr_rgb "${LAMBDA_LR_RGB}"
+  --lambda_sr_l1 "${SR_PRIOR_L1_WEIGHT}"
+  --lambda_sr_hf "${SR_PRIOR_HF_WEIGHT}"
+  --lambda_sr_mip_rgb "${LAMBDA_SR_MIP_RGB}"
+  --lambda_xyz_anchor "${LAMBDA_XYZ_ANCHOR}"
+  --lambda_opacity_anchor "${LAMBDA_OPACITY_ANCHOR}"
+  --lambda_scale_anchor "${LAMBDA_SCALE_ANCHOR}"
+  --lambda_risk_opacity "${LAMBDA_RISK_OPACITY}"
+  --lambda_risk_scale "${LAMBDA_RISK_SCALE}"
+  --risk_radius_threshold "${RISK_RADIUS_THRESHOLD}"
+  --risk_lr_residual_threshold "${RISK_LR_RESIDUAL_THRESHOLD}"
+  --risk_anisotropy_threshold "${RISK_ANISOTROPY_THRESHOLD}"
+  --risk_min_support_views "${RISK_MIN_SUPPORT_VIEWS}"
+  --sr_prior_consistency_threshold "${SR_PRIOR_CONSISTENCY_THRESHOLD}"
+  --sr_prior_min_valid_ratio "${SR_PRIOR_MIN_VALID_RATIO}"
+  --sr_prior_delta_clip "${SR_PRIOR_DELTA_CLIP}"
+  --max_displacement_ratio "${MAX_DISPLACEMENT_RATIO}"
+  --max_displacement_abs "${MAX_DISPLACEMENT_ABS}"
+  --cleanup_mode "${CLEANUP_MODE}"
+  --cleanup_lr_protect_threshold "${CLEANUP_LR_PROTECT_THRESHOLD}"
+  --cleanup_lr_soft_bad_threshold "${CLEANUP_LR_SOFT_BAD_THRESHOLD}"
+  --cleanup_lr_hard_bad_threshold "${CLEANUP_LR_HARD_BAD_THRESHOLD}"
+  --cleanup_sr_support_threshold "${CLEANUP_SR_SUPPORT_THRESHOLD}"
+  --cleanup_sr_protect_residual_threshold "${CLEANUP_SR_PROTECT_RESIDUAL_THRESHOLD}"
+  --cleanup_sr_bad_residual_threshold "${CLEANUP_SR_BAD_RESIDUAL_THRESHOLD}"
+  --cleanup_soft_risk_threshold "${CLEANUP_SOFT_RISK_THRESHOLD}"
+  --cleanup_hard_risk_threshold "${CLEANUP_HARD_RISK_THRESHOLD}"
+  --cleanup_radius_threshold "${CLEANUP_RADIUS_THRESHOLD}"
+  --cleanup_anisotropy_threshold "${CLEANUP_ANISOTROPY_THRESHOLD}"
+  --cleanup_max_visible_views "${CLEANUP_MAX_VISIBLE_VIEWS}"
+  --cleanup_max_large_views "${CLEANUP_MAX_LARGE_VIEWS}"
+  --cleanup_max_prune_fraction "${CLEANUP_MAX_PRUNE_FRACTION}"
+  --cleanup_max_prune_count "${CLEANUP_MAX_PRUNE_COUNT}"
+  --cleanup_max_suppress_fraction "${CLEANUP_MAX_SUPPRESS_FRACTION}"
+  --cleanup_max_suppress_count "${CLEANUP_MAX_SUPPRESS_COUNT}"
+  --cleanup_soft_opacity_scale "${CLEANUP_SOFT_OPACITY_SCALE}"
+  --cleanup_soft_scale_shrink "${CLEANUP_SOFT_SCALE_SHRINK}"
+)
+
+if [[ "${ENABLE_OPACITY_UPDATE}" == "1" ]]; then
+  CMD+=(--enable_opacity_update)
+fi
+if [[ "${ENABLE_SCALE_UPDATE}" == "1" ]]; then
+  CMD+=(--enable_scale_update)
+fi
+
+"${CMD[@]}"
+
+if [[ "${RUN_RENDER}" == "1" ]]; then
+  "${PYTHON_BIN}" -u "${SOF_ROOT}/scripts/render_model_no_gt.py" \
+    --scene_root "${SCENE_ROOT}" \
+    --model_path "${OUTPUT_MODEL}" \
+    --output_dir "${RENDER_DIR}" \
+    --images_subdir "${RENDER_IMAGES_SUBDIR}" \
+    --iteration "${OUTPUT_ITERATION}" \
+    --split "${RENDER_SPLIT}"
+fi
+
+echo "[done] output model : ${OUTPUT_MODEL}"
+echo "[done] output ply   : ${OUTPUT_MODEL}/point_cloud/iteration_${OUTPUT_ITERATION}/point_cloud.ply"
+echo "[done] summary      : ${OUTPUT_MODEL}/global_refine_sof_v0_summary.json"
+if [[ "${RUN_RENDER}" == "1" ]]; then
+  echo "[done] renders      : ${RENDER_DIR}/${RENDER_SPLIT}/ours_${OUTPUT_ITERATION}/renders"
+fi

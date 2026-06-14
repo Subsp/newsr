@@ -1,0 +1,14 @@
+.DS_Store
+*.pyc
+
+__pycache__/
+
+SOF/output/
+SOF/toy_outputs/
+mip-splatting/output/
+
+external/
+*.pth
+*.pt
+*.ckpt
+*.safetensors

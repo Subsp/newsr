@@ -1,0 +1,49 @@
+# Unified pip requirements for Neuralangelo + mip-splatting hybrid experiments.
+# Prefer pip-first install to avoid long conda solver time.
+# For CUDA 11.8 toolchain hosts, use cu118 wheels.
+
+--extra-index-url https://download.pytorch.org/whl/cu118
+torch==2.2.2+cu118
+torchvision==0.17.2+cu118
+torchaudio==2.2.2+cu118
+numpy==1.26.4
+
+# mip-splatting core
+open3d
+plyfile
+ninja
+GPUtil
+opencv-python-headless==4.10.0.84
+lpips
+
+# neuralangelo core
+addict
+gdown
+gpustat
+icecream
+imageio-ffmpeg
+imageio
+imutils
+ipdb
+k3d
+kornia
+mediapy
+nvidia-ml-py3
+OpenEXR
+pathlib
+pillow
+plotly
+pyequilib
+pyexr
+PyMCubes
+pyquaternion
+pyyaml
+requests
+scikit-image
+scikit-video
+scipy
+seaborn
+tensorboard
+termcolor
+trimesh
+wandb

@@ -1,0 +1,14 @@
+plyfile
+tqdm
+dacite
+open3d
+ninja
+GPUtil
+opencv-python
+trimesh
+einops
+imgui_bundle==1.5.2
+imgui==2.0.0
+scikit-image==0.24
+imagecodecs[all]==2024.6.1
+nvidia-ml-py

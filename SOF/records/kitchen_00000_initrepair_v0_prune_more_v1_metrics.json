@@ -1,0 +1,69 @@
+{
+  "record_name": "kitchen_00000_initrepair_v0_prune_more_v1",
+  "recorded_on": "2026-05-12",
+  "scene": "kitchen",
+  "view": "00000.png",
+  "status": "current accepted single-view baseline for view 00000",
+  "candidate_label": "22",
+  "candidate_download": "/Users/ltl/Downloads/00000 (22).png",
+  "gt_download": "/Users/ltl/Downloads/00000gt.png",
+  "render_path": "/root/autodl-tmp/SOFSR/output/recover_cleaned_mip_lr_v0/kitchen/view_aligned_volume_delete_v1_initrepair_v0_prune_more_v1_mip_hr_anchor_v0_miphr_v1/recovered_mip_renders_no_gt_hr_v0/test/ours_31600/renders/00000.png",
+  "run": {
+    "prepare_input_model": "/root/autodl-tmp/kitchen/_hrgsrefiner_assets/kitchen_mip_vanilla_images8_v1/mip30k_sof_native_input_init_repair_v0",
+    "cleanup_run_name": "view_aligned_volume_delete_v1_initrepair_v0_prune_more_v1",
+    "recover_run_name": "view_aligned_volume_delete_v1_initrepair_v0_prune_more_v1_mip_hr_anchor_v0_miphr_v1",
+    "recovery_profile": "mip_hr_anchor_v0",
+    "recompute_filter3d": false,
+    "delete_quantile": 0.93,
+    "max_prune_fraction": 0.12,
+    "max_prune_count": 0,
+    "max_opacity": 1.0
+  },
+  "image_size": {
+    "width": 1558,
+    "height": 1039
+  },
+  "metrics": {
+    "global_psnr_db": {
+      "rgb": 24.60380046326772,
+      "low": 30.740282621932163,
+      "mid": 32.12434042092775,
+      "high": 29.741414748023654
+    },
+    "local_patch_psnr_db": {
+      "patch_window_px": 64,
+      "mean": {
+        "rgb": 27.397403717041016,
+        "low": 35.362876892089844,
+        "mid": 36.4251823425293,
+        "high": 32.596004486083984
+      }
+    }
+  },
+  "comparison_to_softbright_aggressive_label_23": {
+    "softbright_render_path": "/root/autodl-tmp/SOFSR/output/recover_cleaned_mip_lr_v0/kitchen/view_aligned_volume_delete_v1_initrepair_softbright_aggressive_v0_mip_hr_anchor_v0_miphr_v1/recovered_mip_renders_no_gt_hr_v0/test/ours_31600/renders/00000.png",
+    "global_psnr_delta_db_22_minus_23": {
+      "rgb": 0.5711072855466061,
+      "low": 1.2631754048162203,
+      "mid": 0.4623762473067126,
+      "high": 0.03598531915619479
+    },
+    "local_patch_delta_db_22_minus_23": {
+      "rgb_mean": 0.6862249374389648,
+      "low_mean": 0.8019189238548279,
+      "mid_mean": 0.8108054995536804,
+      "high_mean": 0.21372263133525848
+    },
+    "local_patch_area_fraction": {
+      "rgb_22_better_by_more_than_0p5db": 0.3778968125023938,
+      "rgb_23_better_by_more_than_0p5db": 0.07291683397559369,
+      "rgb_abs_delta_more_than_1db": 0.24059806197575678
+    }
+  },
+  "heatmap_artifacts_local": {
+    "metrics_json": "/private/tmp/vggtsr_psnr_23_22/metrics.json",
+    "rgb_contact_sheet": "/private/tmp/vggtsr_psnr_23_22/contact_rgb_psnr_patch64.png",
+    "frequency_contact_sheet": "/private/tmp/vggtsr_psnr_23_22/contact_frequency_psnr_patch64.png",
+    "delta_overlay": "/private/tmp/vggtsr_psnr_23_22/overlay_delta_rgb_23_minus_22.png"
+  }
+}
