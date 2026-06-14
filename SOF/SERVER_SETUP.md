@@ -96,7 +96,7 @@ Install Python dependencies:
 ```bash
 cd /root/autodl-tmp/newsr
 pip uninstall -y opencv-python opencv-python-headless plyfile open3d || true
-pip install --force-reinstall numpy==1.26.4 opencv-python-headless==4.10.0.84
+pip install --force-reinstall numpy==1.26.4 opencv-python==4.10.0.84
 pip install pillow tqdm einops scipy scikit-image pyyaml requests imageio imageio-ffmpeg kornia tensorboard lmdb addict future yapf
 cat >/tmp/newsr-restoration-constraints.txt <<'EOF'
 numpy==1.26.4
@@ -116,7 +116,7 @@ If a previous install already created a NumPy conflict, repair the env with:
 ```bash
 conda activate newsr
 pip uninstall -y opencv-python opencv-python-headless plyfile open3d
-pip install --force-reinstall numpy==1.26.4 opencv-python-headless==4.10.0.84
+pip install --force-reinstall numpy==1.26.4 opencv-python==4.10.0.84
 pip check
 ```
 
