@@ -1,43 +1,70 @@
 # Server Setup
 
-This fork is intended to run `SOF` remotely on a Linux + NVIDIA CUDA server.
+This repo is intended to run the extracted `newsr` mainline on a Linux +
+NVIDIA CUDA server.
 
-## Clone
+## Sync
+
+First clone:
 
 ```bash
-git clone --recursive git@github.com:Subsp/SOFSR.git
-cd SOFSR
+cd /root/autodl-tmp
+git clone git@github.com:Subsp/newsr.git
+cd newsr
+```
+
+If the server only has HTTPS credentials:
+
+```bash
+cd /root/autodl-tmp
+git clone https://github.com/Subsp/newsr.git
+cd newsr
+```
+
+Later updates:
+
+```bash
+cd /root/autodl-tmp/newsr
+git pull --ff-only origin main
 ```
 
 Recommended server layout:
 
 ```text
 /root/autodl-tmp/
-  SOFSR/
+  newsr/
   kitchen/
-  experiments/sof/kitchen_pseudogt/
-    alias/
-    model/
+  external/
+    NAFNet/
+    Restormer/
 ```
 
-If you already cloned without submodules:
+The `kitchen` scene is expected to contain at least:
 
-```bash
-git submodule update --init --recursive
+```text
+/root/autodl-tmp/kitchen/
+  images_8/
+  images_2/
+  sparse/0/
 ```
 
-## Fast Server Environment
+For x1 render-restoration priors, also provide:
 
-Do not use `conda env create -f environment.yml` on slow or fragile servers unless you really need the full solver-driven setup.
+```text
+/root/autodl-tmp/kitchen/
+  renders_lr_same_size/
+```
+
+## Base Environment
 
 Use conda only to create an isolated Python, then install the rest with `pip`.
 
 ```bash
-conda create -n sof python=3.10 -y
-conda activate sof
+conda create -n newsr python=3.10 -y
+conda activate newsr
 ```
 
-Install system packages first:
+Install system packages:
 
 ```bash
 apt-get update
@@ -50,128 +77,156 @@ Upgrade packaging tools:
 pip install --upgrade pip setuptools wheel
 ```
 
-Install PyTorch first. This example uses CUDA 12.1 wheels:
+Install PyTorch first. For CUDA 12.1:
 
 ```bash
 pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cu121
 ```
 
-Install the Python dependencies:
-
-```bash
-pip install -r requirements-server.txt
-```
-
-If your server can clone GitHub over `ssh` but times out on `https`, rewrite GitHub URLs once:
-
-```bash
-git config --global url."git@github.com:".insteadOf https://github.com/
-```
-
-Then install all CUDA extensions with the helper script:
-
-```bash
-bash ./scripts/install_server_extensions.sh
-```
-
-If your server is on CUDA 11.8 instead of 12.1, replace the PyTorch install line with:
+For CUDA 11.8 instead:
 
 ```bash
 pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cu118
 ```
 
-Notes:
-
-- `fused-ssim` is optional now. If that install fails, `train.py` will automatically fall back to the repository's slower Python SSIM implementation.
-- `scripts/install_server_extensions.sh` auto-detects `CUDA_HOME`, exports it for `simple-knn` and `diff-gaussian-rasterization`, rewrites GitHub `https` URLs to `ssh` when enabled, and builds tetra triangulation with an explicit `CMAKE_CUDA_ARCHITECTURES`.
-- If you need to override the tetra build architecture, for example on a machine where `native` is not desirable, use:
+Install Python dependencies:
 
 ```bash
-TETRA_CUDA_ARCHITECTURES=89 bash ./scripts/install_server_extensions.sh
+cd /root/autodl-tmp/newsr
+pip install -r SOF/requirements-server.txt
+pip install -r mip-splatting/requirements.txt
+pip install numpy==1.26.4 scipy pyyaml requests tensorboard imageio imageio-ffmpeg kornia trimesh pillow
 ```
 
-## Sync
+Do not blindly install `mip-splatting/hybrid_sdfgs/requirements.unified.txt` on
+this env because it pins an older CUDA/PyTorch stack.
 
-First time on the server:
+## CUDA Extensions
+
+Install the SOF-side CUDA extensions:
 
 ```bash
-git clone --recursive git@github.com:Subsp/SOFSR.git
-cd SOFSR
+cd /root/autodl-tmp/newsr/SOF
+bash scripts/install_server_extensions.sh
 ```
 
-Later updates:
+Install the mip-splatting-side CUDA extensions:
 
 ```bash
-cd SOFSR
-git pull origin main
-git submodule update --init --recursive
+cd /root/autodl-tmp/newsr/mip-splatting
+pip install --no-build-isolation submodules/simple-knn/
+pip install --no-build-isolation submodules/diff-gaussian-rasterization/
+pip install --no-build-isolation submodules/diff-gaussian-rasterization-sof-vanilla/
 ```
 
-If upstream submodules changed and you want them refreshed aggressively:
+If CUDA is not auto-detected, set it explicitly before installing extensions:
 
 ```bash
-cd SOFSR
-git submodule sync --recursive
-git submodule update --init --recursive --remote
+export CUDA_HOME=/usr/local/cuda-12.1
+export PATH="${CUDA_HOME}/bin:${PATH}"
+export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
 ```
 
-## Kitchen Pseudo-GT Experiment
-
-Assume your dataset lives at `/data/scenes/kitchen` and contains:
-
-```text
-/data/scenes/kitchen/
-  images_8/
-  images_2/
-  sparse/0/
-```
-
-Prepare the bicubic pseudo scene from `images_8 -> images_2`:
+If GitHub HTTPS installs time out but SSH works:
 
 ```bash
-cd /root/autodl-tmp/SOFSR
-SCENE_ROOT=/data/scenes/kitchen \
-EXPERIMENT_ROOT=/root/autodl-tmp/experiments/sof/kitchen_pseudogt \
-PREPARE_ONLY=1 \
-PYTHON_BIN=python \
-bash ./scripts/run_kitchen_pseudogt_nvs.sh
+git config --global url."git@github.com:".insteadOf https://github.com/
 ```
 
-Run training:
+## External Restoration Backends
+
+Clone restoration repos outside this repo so their weights and environments do
+not get committed accidentally.
 
 ```bash
-cd /root/autodl-tmp/SOFSR
-python train.py \
-  --splatting_config configs/hierarchical.json \
-  -s /root/autodl-tmp/experiments/sof/kitchen_pseudogt/alias \
-  --eval \
-  -m /root/autodl-tmp/experiments/sof/kitchen_pseudogt/model \
-  --iterations 30000
+mkdir -p /root/autodl-tmp/external
+cd /root/autodl-tmp/external
+git clone https://github.com/megvii-research/NAFNet.git
+git clone https://github.com/swz30/Restormer.git
 ```
 
-Render against the real `images_2` views:
+Install their extra dependencies in the same `newsr` env first. If dependency
+conflicts become annoying, create separate envs and pass
+`EXTERNAL_RESTORATION_PYTHON=/path/to/python`.
 
 ```bash
-cd /root/autodl-tmp/SOFSR
-python render.py \
-  -m /root/autodl-tmp/experiments/sof/kitchen_pseudogt/model \
-  -s /data/scenes/kitchen \
-  -i images_2 \
-  --eval \
-  --skip_train \
-  --data_device cpu
+conda activate newsr
+cd /root/autodl-tmp/external/NAFNet
+pip install -r requirements.txt || true
+python setup.py develop --no_cuda_ext || true
+
+cd /root/autodl-tmp/external/Restormer
+pip install -r requirements.txt || true
+python setup.py develop --no_cuda_ext || true
 ```
 
-Evaluate PSNR / SSIM / LPIPS / FLIP:
+Download the NAFNet/Restormer pretrained checkpoints according to each upstream
+repo and update their option files if needed.
+
+## Smoke Checks
+
+Check the prior generator CLI:
 
 ```bash
-cd /root/autodl-tmp/SOFSR
-python metrics.py -m /root/autodl-tmp/experiments/sof/kitchen_pseudogt/model
+cd /root/autodl-tmp/newsr
+python SOF/scripts/generate_enhancement_sr_priors.py --help
 ```
 
-Results will be written to:
+Check NAFNet x1 prior generation on a few render frames:
 
-```text
-/root/autodl-tmp/experiments/sof/kitchen_pseudogt/model/results_full.json
-/root/autodl-tmp/experiments/sof/kitchen_pseudogt/model/per_view.json
+```bash
+cd /root/autodl-tmp/newsr
+python SOF/scripts/generate_enhancement_sr_priors.py \
+  --input_dir /root/autodl-tmp/kitchen/renders_lr_same_size \
+  --output_dir /root/autodl-tmp/kitchen/render_x1_priors_nafnet_smoke \
+  --backend nafnet \
+  --external_repo_root /root/autodl-tmp/external/NAFNet \
+  --external_config options/test/REDS/NAFNet-width64.yml \
+  --limit 2
+```
+
+Check Restormer x1 prior generation on a few render frames:
+
+```bash
+cd /root/autodl-tmp/newsr
+python SOF/scripts/generate_enhancement_sr_priors.py \
+  --input_dir /root/autodl-tmp/kitchen/renders_lr_same_size \
+  --output_dir /root/autodl-tmp/kitchen/render_x1_priors_restormer_smoke \
+  --backend restormer \
+  --external_repo_root /root/autodl-tmp/external/Restormer \
+  --restormer_task Single_Image_Defocus_Deblurring \
+  --restormer_tile 720 \
+  --limit 2
+```
+
+## Main Runs
+
+Run the x1 NAFNet render-restoration prior branch:
+
+```bash
+cd /root/autodl-tmp/newsr/SOF
+SOURCE_IMAGES_SUBDIR=renders_lr_same_size \
+ENHANCEMENT_BACKEND=nafnet \
+NAFNET_ROOT=/root/autodl-tmp/external/NAFNet \
+EXTERNAL_RESTORATION_CONFIG=options/test/REDS/NAFNet-width64.yml \
+bash scripts/run_mipsplatting_render_restoration_prior_scratch_v0_kitchen.sh
+```
+
+Run the x1 Restormer render-restoration prior branch:
+
+```bash
+cd /root/autodl-tmp/newsr/SOF
+SOURCE_IMAGES_SUBDIR=renders_lr_same_size \
+ENHANCEMENT_BACKEND=restormer \
+RESTORMER_ROOT=/root/autodl-tmp/external/Restormer \
+RESTORMER_TASK=Single_Image_Defocus_Deblurring \
+RESTORMER_TILE=720 \
+bash scripts/run_mipsplatting_render_restoration_prior_scratch_v0_kitchen.sh
+```
+
+Run the canonical NoSR cleanup mainline:
+
+```bash
+cd /root/autodl-tmp/newsr/SOF
+bash scripts/run_mipsplatting_nosr_layerfreq_cleanup_v0_kitchen.sh
 ```
