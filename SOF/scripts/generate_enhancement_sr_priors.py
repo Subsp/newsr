@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 from typing import Iterable
 
@@ -43,6 +44,9 @@ _RESTORMER_TASKS = (
     "Gaussian_Gray_Denoising",
     "Gaussian_Color_Denoising",
 )
+_RESTORMER_DEFAULT_CHECKPOINTS = {
+    "Single_Image_Defocus_Deblurring": "Defocus_Deblurring/pretrained_models/single_image_defocus_deblurring.pth",
+}
 
 
 class BasePriorResolver:
@@ -208,6 +212,105 @@ class RestormerPriorResolver(BasePriorResolver):
         return len(selected), skipped, first_output
 
 
+class TorchScriptRestormerPriorResolver(BasePriorResolver):
+    scale = 1
+
+    def __init__(
+        self,
+        repo_root: Path,
+        checkpoint_path: Path,
+        device: str,
+        tile: int,
+        tile_overlap: int,
+    ) -> None:
+        import torch
+
+        self.repo_root = repo_root
+        self.checkpoint_path = checkpoint_path
+        self.device = device if not device.startswith("cuda") or torch.cuda.is_available() else "cpu"
+        self.tile = tile
+        self.tile_overlap = tile_overlap
+        self.task = "Single_Image_Defocus_Deblurring"
+        self._torch = torch
+        self._model = torch.jit.load(str(checkpoint_path), map_location=self.device).eval().to(self.device)
+
+    def process_path(self, src: Path, dst: Path) -> None:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tensor, original_size = self._load_tensor(src)
+        with self._torch.no_grad():
+            restored = self._forward_tensor(tensor)
+        self._save_tensor(restored, original_size, dst)
+
+    def _load_tensor(self, src: Path):
+        import numpy as np
+
+        with Image.open(src) as pil:
+            rgb = pil.convert("RGB")
+            arr = np.array(rgb)
+        tensor = (
+            self._torch.from_numpy(arr)
+            .permute(2, 0, 1)
+            .float()
+            .div(255.0)
+            .unsqueeze(0)
+            .to(self.device)
+        )
+        height, width = int(tensor.shape[-2]), int(tensor.shape[-1])
+        return tensor, (height, width)
+
+    def _forward_tensor(self, tensor):
+        _, _, height, width = tensor.shape
+        if self.tile <= 0 or (height <= self.tile and width <= self.tile):
+            return self._forward_padded(tensor)
+        return self._forward_tiled(tensor)
+
+    def _forward_padded(self, tensor):
+        import torch.nn.functional as F
+
+        _, _, height, width = tensor.shape
+        pad_h = (8 - height % 8) % 8
+        pad_w = (8 - width % 8) % 8
+        if pad_h or pad_w:
+            tensor = F.pad(tensor, (0, pad_w, 0, pad_h), mode="reflect")
+        output = self._model(tensor)
+        if isinstance(output, (list, tuple)):
+            output = output[0]
+        return output[..., :height, :width].clamp(0.0, 1.0)
+
+    def _forward_tiled(self, tensor):
+        _, channels, height, width = tensor.shape
+        tile = int(self.tile)
+        overlap = max(0, min(int(self.tile_overlap), tile - 1))
+        stride = max(1, tile - overlap)
+        y_starts = _tile_starts(height, tile, stride)
+        x_starts = _tile_starts(width, tile, stride)
+        output = self._torch.zeros((1, channels, height, width), device=self.device)
+        weight = self._torch.zeros((1, 1, height, width), device=self.device)
+        for y0 in y_starts:
+            for x0 in x_starts:
+                y1 = min(y0 + tile, height)
+                x1 = min(x0 + tile, width)
+                restored = self._forward_padded(tensor[..., y0:y1, x0:x1])
+                output[..., y0:y1, x0:x1] += restored[..., : y1 - y0, : x1 - x0]
+                weight[..., y0:y1, x0:x1] += 1.0
+        return (output / weight.clamp_min(1.0)).clamp(0.0, 1.0)
+
+    def _save_tensor(self, tensor, original_size: tuple[int, int], dst: Path) -> None:
+        import numpy as np
+
+        height, width = original_size
+        tensor = tensor[..., :height, :width].squeeze(0).detach().cpu()
+        arr = (
+            tensor.permute(1, 2, 0)
+            .mul(255.0)
+            .round()
+            .clamp(0, 255)
+            .byte()
+            .numpy()
+        )
+        Image.fromarray(np.ascontiguousarray(arr), mode="RGB").save(dst)
+
+
 def _default_device() -> str:
     try:
         import torch
@@ -287,6 +390,20 @@ def _parse_args() -> argparse.Namespace:
         default=_env_int("RESTORMER_TILE_OVERLAP", 32),
         help="Restormer tile overlap when --restormer_tile is enabled.",
     )
+    parser.add_argument(
+        "--restormer_checkpoint_mode",
+        choices=("auto", "demo", "torchscript"),
+        default=os.environ.get("RESTORMER_CHECKPOINT_MODE", "auto"),
+        help=(
+            "Restormer checkpoint mode. auto uses torchscript inference when the "
+            "checkpoint is a TorchScript archive, otherwise it calls Restormer's demo.py."
+        ),
+    )
+    parser.add_argument(
+        "--restormer_checkpoint_path",
+        default=os.environ.get("RESTORMER_CHECKPOINT_PATH", ""),
+        help="Optional explicit Restormer checkpoint path for torchscript/auto mode.",
+    )
     return parser.parse_args()
 
 
@@ -334,6 +451,16 @@ def _link_or_copy(src: Path, dst: Path) -> None:
         shutil.copy2(src, dst)
 
 
+def _tile_starts(size: int, tile: int, stride: int) -> list[int]:
+    if size <= tile:
+        return [0]
+    starts = list(range(0, max(size - tile, 0) + 1, stride))
+    last = size - tile
+    if starts[-1] != last:
+        starts.append(last)
+    return starts
+
+
 def _resolve_backend_root(args: argparse.Namespace, backend: str) -> Path:
     env_name = f"{backend.upper()}_ROOT"
     root = args.external_repo_root or os.environ.get(env_name, "")
@@ -346,6 +473,29 @@ def _resolve_backend_root(args: argparse.Namespace, backend: str) -> Path:
     if not resolved.is_dir():
         raise FileNotFoundError(f"{backend} repo root not found: {resolved}")
     return resolved
+
+
+def _resolve_restormer_checkpoint(root: Path, args: argparse.Namespace) -> Path | None:
+    checkpoint = args.restormer_checkpoint_path
+    if not checkpoint:
+        checkpoint = _RESTORMER_DEFAULT_CHECKPOINTS.get(args.restormer_task, "")
+    if not checkpoint:
+        return None
+    path = Path(checkpoint).expanduser()
+    if not path.is_absolute():
+        path = root / path
+    return path.resolve()
+
+
+def _is_torchscript_archive(path: Path) -> bool:
+    if not path.is_file() or not zipfile.is_zipfile(path):
+        return False
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = archive.namelist()
+    except zipfile.BadZipFile:
+        return False
+    return any("/code/" in name or name.startswith("code/") for name in names)
 
 
 def _resolve_relative_to_root(root: Path, value: str, env_name: str, default_rel: str) -> Path:
@@ -397,6 +547,26 @@ def _build_resolver(args: argparse.Namespace) -> BasePriorResolver:
         )
     if backend == "restormer":
         root = _resolve_backend_root(args, backend)
+        checkpoint = _resolve_restormer_checkpoint(root, args)
+        checkpoint_mode = args.restormer_checkpoint_mode
+        if checkpoint_mode == "torchscript" or (
+            checkpoint_mode == "auto"
+            and checkpoint is not None
+            and _is_torchscript_archive(checkpoint)
+        ):
+            if checkpoint is None or not checkpoint.is_file():
+                raise FileNotFoundError(f"Restormer TorchScript checkpoint not found: {checkpoint}")
+            print(
+                f"[enhancement-priors] use Restormer TorchScript checkpoint: {checkpoint}",
+                flush=True,
+            )
+            return TorchScriptRestormerPriorResolver(
+                repo_root=root,
+                checkpoint_path=checkpoint,
+                device=args.device,
+                tile=args.restormer_tile,
+                tile_overlap=args.restormer_tile_overlap,
+            )
         return RestormerPriorResolver(
             repo_root=root,
             python_bin=args.external_python,
@@ -438,6 +608,8 @@ def main() -> None:
         "external_config": str(getattr(resolver, "config_path", "")),
         "restormer_task": getattr(resolver, "task", ""),
         "restormer_tile": getattr(resolver, "tile", 0),
+        "restormer_checkpoint": str(getattr(resolver, "checkpoint_path", "")),
+        "restormer_checkpoint_mode": args.restormer_checkpoint_mode,
         "num_inputs": len(image_paths),
         "num_written": written,
         "num_skipped_existing": skipped,

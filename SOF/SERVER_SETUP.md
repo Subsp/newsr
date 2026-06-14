@@ -212,7 +212,10 @@ Download the NAFNet/Restormer pretrained checkpoints according to each upstream
 repo and update their option files if needed.
 
 If Google Drive times out for Restormer defocus deblurring, use the Hugging
-Face Space mirror and save the file to the path expected by Restormer's demo:
+Face Space mirror and save the TorchScript model to the standard checkpoint
+path. `generate_enhancement_sr_priors.py` defaults to
+`--restormer_checkpoint_mode auto`, detects this TorchScript archive, and runs
+it directly instead of calling Restormer's checkpoint-dict `demo.py` path.
 
 ```bash
 cd /root/autodl-tmp/external/Restormer
@@ -232,6 +235,20 @@ mkdir -p Defocus_Deblurring/pretrained_models
 wget -c \
   https://hf-mirror.com/spaces/swzamir/Restormer/resolve/main/single_image_defocus_deblurring.pt \
   -O Defocus_Deblurring/pretrained_models/single_image_defocus_deblurring.pth
+```
+
+To force the TorchScript path explicitly:
+
+```bash
+RESTORMER_CHECKPOINT_MODE=torchscript \
+python SOF/scripts/generate_enhancement_sr_priors.py \
+  --input_dir /root/autodl-tmp/kitchen/renders_lr_same_size \
+  --output_dir /root/autodl-tmp/kitchen/render_x1_priors_restormer_smoke \
+  --backend restormer \
+  --external_repo_root /root/autodl-tmp/external/Restormer \
+  --restormer_task Single_Image_Defocus_Deblurring \
+  --restormer_tile 720 \
+  --limit 2
 ```
 
 ## Smoke Checks

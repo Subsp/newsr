@@ -132,6 +132,9 @@ PRIOR_ONLY_RUN_TAG=mip30k_r1_renderx1_${ENHANCEMENT_BACKEND}_prioronly_scratch_v
 - Restormer runs selected frames in one batch call, writes into a task
   subdirectory internally, and the wrapper copies restored images back into the
   expected flat prior cache.
+- Restormer also supports Hugging Face TorchScript defocus weights through
+  `RESTORMER_CHECKPOINT_MODE=auto` or `torchscript`; this avoids depending on
+  Google Drive checkpoint-dict downloads.
 - NAFNet currently uses the official single-image `basicsr/demo.py` path for
   reliability. A batch runner can be added after the server environment is
   fixed.
