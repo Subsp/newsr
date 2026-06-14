@@ -211,6 +211,29 @@ to `PYTHONPATH`, so editable installation is not required.
 Download the NAFNet/Restormer pretrained checkpoints according to each upstream
 repo and update their option files if needed.
 
+If Google Drive times out for Restormer defocus deblurring, use the Hugging
+Face Space mirror and save the file to the path expected by Restormer's demo:
+
+```bash
+cd /root/autodl-tmp/external/Restormer
+mkdir -p Defocus_Deblurring/pretrained_models
+
+wget -c \
+  https://huggingface.co/spaces/swzamir/Restormer/resolve/main/single_image_defocus_deblurring.pt \
+  -O Defocus_Deblurring/pretrained_models/single_image_defocus_deblurring.pth
+```
+
+If direct Hugging Face access is slow from the server, try the common mirror:
+
+```bash
+cd /root/autodl-tmp/external/Restormer
+mkdir -p Defocus_Deblurring/pretrained_models
+
+wget -c \
+  https://hf-mirror.com/spaces/swzamir/Restormer/resolve/main/single_image_defocus_deblurring.pt \
+  -O Defocus_Deblurring/pretrained_models/single_image_defocus_deblurring.pth
+```
+
 ## Smoke Checks
 
 Check the prior generator CLI:
