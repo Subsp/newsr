@@ -239,6 +239,9 @@ def _build_triples(args: argparse.Namespace) -> tuple[list[tuple[str, Path, Path
         match_policy=str(args.match_policy),
         llffhold=int(args.llffhold),
     )
+    if int(args.limit) > 0:
+        selected_paths = selected_paths[: int(args.limit)]
+        selected_indices = selected_indices[: int(args.limit)]
     anchor_map, anchor_summary = _resolve_series_with_reference(
         label="anchor",
         paths=anchor_paths,

@@ -8,8 +8,16 @@ sharp edges and smooth regions are reasonable before adding losses.
 
 - `anchor_dir`: low-frequency direct x1 LR-GS render.
 - `sr_dir`: enhancement SR prior, typically prepared `fused_priors`.
-- `depth_dir`: external depth-prior frames. Depth jump is the main geometric edge cue.
+- `depth_dir`: mesh-aligned external depth-prior frames. Depth jump is the main geometric edge cue.
 - `reference_dir`: optional frame-name reference, usually `images_2`, used for LLFF train-subset alignment.
+
+Depth priors should be aligned to the gs2mesh/COLMAP camera depth domain before N-PSE.
+The mesh is only the scale/camera reference here; it is not treated as the edge oracle.
+Use `scripts/run_build_mesh_aligned_depth_prior_cache_v0_kitchen.sh` to create:
+
+```text
+.../_hrgsrefiner_assets/depth_prior_aligned_gs2mesh/<name>/aligned_depth
+```
 
 ## Outputs
 
@@ -30,11 +38,22 @@ The cache writes:
 
 ## Kitchen Smoke
 
-Set `DEPTH_PRIOR_DIR` to a frame-aligned depth-prior directory first.
+First align the raw external depth prior to gs2mesh:
 
 ```bash
 cd /root/autodl-tmp/newsr/SOF
-DEPTH_PRIOR_DIR=/root/autodl-tmp/kitchen/depth_prior_x1 \
+MESH_PATH=/path/to/gs2mesh_mesh.ply \
+DEPTH_PRIOR_DIR=/root/autodl-tmp/kitchen/raw_depth_prior_x1 \
+LIMIT=8 \
+OVERWRITE=1 \
+bash scripts/run_build_mesh_aligned_depth_prior_cache_v0_kitchen.sh
+```
+
+Then set `DEPTH_PRIOR_DIR` to the produced `aligned_depth` directory.
+
+```bash
+cd /root/autodl-tmp/newsr/SOF
+DEPTH_PRIOR_DIR=/root/autodl-tmp/kitchen/_hrgsrefiner_assets/depth_prior_aligned_gs2mesh/render_x1_depthprior_images_2_train_gs2mesh_aligned_v0/aligned_depth \
 LIMIT=8 \
 OVERWRITE=1 \
 bash scripts/run_build_npse_edge_trust_cache_v0_kitchen.sh
