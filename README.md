@@ -29,10 +29,15 @@ Supported same-size render-restoration wrapper:
 
 - `SOF/scripts/run_mipsplatting_render_restoration_prior_scratch_v0_kitchen.sh`
 
+Supported PSE-DC v0 surface/detail-carrier wrapper:
+
+- `SOF/scripts/run_mipsplatting_psedc_renderx1_restormer_v0_kitchen.sh`
+
 The detailed rationale and ownership split is documented in:
 
 - `SOF/MAINLINES_20260614.md`
 - `SOF/20260614_render_x1_restoration_prior_support_v0.md`
+- `SOF/20260614_piecewise_surface_edge_detail_carrier_design_v1.md`
 
 ## Repo contents
 
@@ -58,4 +63,5 @@ bash scripts/run_mipsplatting_nosr_layerfreq_cleanup_v0_kitchen.sh
 bash scripts/run_mipsplatting_prior_only_from_scratch_v0_kitchen.sh
 RUN_NOSR_AFTER=1 bash scripts/run_mipsplatting_enhancement_prior_scratch_v0_kitchen.sh
 SOURCE_IMAGES_SUBDIR=renders_lr_same_size ENHANCEMENT_BACKEND=nafnet bash scripts/run_mipsplatting_render_restoration_prior_scratch_v0_kitchen.sh
+bash scripts/run_mipsplatting_psedc_renderx1_restormer_v0_kitchen.sh
 ```

@@ -329,7 +329,41 @@ Useful diagnostic metrics:
 - SR hallucination is cross-view inconsistent:
   combine PSE-DC with prior masks and low-frequency agreement checks.
 
-## 12. Clean Method Statement
+## 12. Current Runnable v0 Mapping
+
+The first runnable PSE-DC entrypoint is:
+
+```text
+SOF/scripts/run_mipsplatting_psedc_renderx1_restormer_v0_kitchen.sh
+```
+
+This v0 is deliberately conservative:
+
+- It starts from the direct Restormer x1 prior-from-scratch checkpoint.
+- It uses the prepared Restormer `fused_priors` directly, without usable-mask
+  blending.
+- It builds the NoSR surface-state payload from the input checkpoint and the
+  existing cleaned mesh.
+- It sets `layer_frequency_surface_target=prior`, so surface-carrier HF is
+  pulled toward the Restormer prior.
+- It suppresses non-surface high-frequency uptake with NoSR's
+  `lambda_non_surface_hf` branch.
+- It enables `surface_normal_lock` to keep surface carriers from drifting along
+  mesh normals.
+- It disables densification/pruning by inheriting the fixed-topology NoSR
+  cleanup defaults.
+
+What v0 does not yet include:
+
+- explicit edge confidence in the payload;
+- edge-stopped carrier-neighbor continuity loss;
+- surface migration/thinness losses as default-on;
+- edge-aware densification.
+
+Those are the next PSE-DC increments after the direct carrier-routing baseline
+is measured.
+
+## 13. Clean Method Statement
 
 PSE-DC transforms mesh/depth information from a passive geometric target into
 an active detail-routing prior. Instead of asking all Gaussians to fit SR

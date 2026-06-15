@@ -319,3 +319,21 @@ Run the canonical NoSR cleanup mainline:
 cd /root/autodl-tmp/newsr/SOF
 bash scripts/run_mipsplatting_nosr_layerfreq_cleanup_v0_kitchen.sh
 ```
+
+Run PSE-DC v0 after the direct Restormer x1 prior-from-scratch baseline:
+
+```bash
+cd /root/autodl-tmp/newsr/SOF
+PREPARED_SR_PRIOR_NAME=render_x1_restormer_aligned_images_2_scratch_v0 \
+INPUT_RUN_TAG=mip30k_r1_renderx1_restormer_prioronly_scratch_v0 \
+INPUT_ITERATION=30000 \
+CLEANUP_ITERS=2000 \
+LOWFREQ_ANCHOR_MODE=directsrc_render \
+HF_RETENTION_PROFILE=preserve_v1 \
+FORCE_REBUILD_SURFACE_STATE=1 \
+bash scripts/run_mipsplatting_psedc_renderx1_restormer_v0_kitchen.sh
+```
+
+This v0 wrapper keeps the topology fixed, disables external prior masks, uses
+Restormer `fused_priors` as the surface-frequency target, and enables NoSR's
+mesh-derived surface carrier payload plus surface normal lock.
