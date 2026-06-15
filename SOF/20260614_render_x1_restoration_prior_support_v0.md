@@ -120,6 +120,7 @@ with x1-safe defaults:
 
 ```text
 PREPARE_IMAGES8=0
+DISABLE_PRIOR_USABLE_MASKS=1
 RAW_PRIOR_SUBDIR=render_x1_priors_${ENHANCEMENT_BACKEND}
 PREPARED_SR_PRIOR_NAME=render_x1_${ENHANCEMENT_BACKEND}_aligned_images_2_scratch_v0
 PRIOR_ONLY_RUN_TAG=mip30k_r1_renderx1_${ENHANCEMENT_BACKEND}_prioronly_scratch_v0
@@ -129,6 +130,9 @@ PRIOR_ONLY_RUN_TAG=mip30k_r1_renderx1_${ENHANCEMENT_BACKEND}_prioronly_scratch_v
 
 - The source render directory must contain one image per frame stem.
 - Output priors are saved as flat `<stem>.png` files.
+- The render-restoration wrapper disables usable masks by default, so
+  `fused_priors` are direct copies of the restored priors rather than
+  mask-blended prior/reference images.
 - Restormer runs selected frames in one batch call, writes into a task
   subdirectory internally, and the wrapper copies restored images back into the
   expected flat prior cache.

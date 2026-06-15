@@ -306,6 +306,7 @@ Run the x1 Restormer render-restoration prior branch:
 cd /root/autodl-tmp/newsr/SOF
 SOURCE_IMAGES_SUBDIR=renders_lr_same_size \
 ENHANCEMENT_BACKEND=restormer \
+DISABLE_PRIOR_USABLE_MASKS=1 \
 RESTORMER_ROOT=/root/autodl-tmp/external/Restormer \
 RESTORMER_TASK=Single_Image_Defocus_Deblurring \
 RESTORMER_TILE=720 \
