@@ -94,6 +94,8 @@ validate_prepared_priors() {
     )
     if [[ "${DISABLE_PRIOR_USABLE_MASKS}" != "1" ]]; then
       VALIDATE_ARGS+=(--mask_subdir "${SR_PRIOR_MASK_SUBDIR}")
+    else
+      VALIDATE_ARGS+=(--mask_subdir "")
     fi
     "${VALIDATE_ARGS[@]}"
   )
