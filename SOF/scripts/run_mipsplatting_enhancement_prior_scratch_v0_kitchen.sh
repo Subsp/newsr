@@ -54,6 +54,7 @@ MASK_THRESHOLD="${MASK_THRESHOLD:-0.12}"
 MASK_MODE="${MASK_MODE:-soft}"
 DISCREPANCY_FLOOR="${DISCREPANCY_FLOOR:-0.05}"
 DISABLE_PRIOR_USABLE_MASKS="${DISABLE_PRIOR_USABLE_MASKS:-0}"
+PRIOR_MATCH_POLICY="${PRIOR_MATCH_POLICY:-stem}"
 
 RUN_NOSR_AFTER="${RUN_NOSR_AFTER:-0}"
 NOSR_CLEANUP_ITERS="${NOSR_CLEANUP_ITERS:-2000}"
@@ -162,6 +163,7 @@ echo "[enhance-prior-scratch-v0] source images        : ${SCENE_ROOT}/${SOURCE_I
 echo "[enhance-prior-scratch-v0] raw prior dir        : ${RAW_PRIOR_DIR}"
 echo "[enhance-prior-scratch-v0] prepared prior root  : ${PREPARED_SR_PRIOR_ROOT}"
 echo "[enhance-prior-scratch-v0] external root        : ${EXTERNAL_RESTORATION_ROOT:-<backend env/default>}"
+echo "[enhance-prior-scratch-v0] prior match policy  : ${PRIOR_MATCH_POLICY}"
 echo "[enhance-prior-scratch-v0] scratch run tag      : ${PRIOR_ONLY_RUN_TAG}"
 echo "[enhance-prior-scratch-v0] iterations           : ${ITERATIONS}"
 echo "[enhance-prior-scratch-v0] run nosr after       : ${RUN_NOSR_AFTER}"
@@ -211,7 +213,7 @@ elif [[ ! -d "${PREPARED_PRIOR_IMAGE_DIR}" ]]; then
   PREPARED_INVALID_REASON="missing fused priors"
 elif [[ "${DISABLE_PRIOR_USABLE_MASKS}" != "1" && ! -d "${PREPARED_PRIOR_MASK_DIR}" ]]; then
   PREPARED_INVALID_REASON="missing usable masks"
-elif [[ ! -d "${PREPARED_PRIOR_ANCHOR_DIR}" ]]; then
+elif [[ "${DISABLE_PRIOR_USABLE_MASKS}" != "1" && ! -d "${PREPARED_PRIOR_ANCHOR_DIR}" ]]; then
   PREPARED_INVALID_REASON="missing aligned references"
 elif ! PREPARED_VALIDATE_OUTPUT="$(validate_prepared_priors 2>&1)"; then
   PREPARED_INVALID_REASON="validation failed: ${PREPARED_VALIDATE_OUTPUT}"
@@ -239,6 +241,7 @@ if [[ "${PREPARED_READY}" != "1" ]]; then
       --mask_threshold "${MASK_THRESHOLD}"
       --mask_mode "${MASK_MODE}"
       --discrepancy_floor "${DISCREPANCY_FLOOR}"
+      --match_policy "${PRIOR_MATCH_POLICY}"
       --copy_raw_priors
       --save_fused_priors
     )

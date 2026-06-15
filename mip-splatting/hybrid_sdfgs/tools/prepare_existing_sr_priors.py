@@ -37,6 +37,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--copy_raw_priors", action="store_true")
     parser.add_argument("--save_discrepancy_npz", action="store_true")
     parser.add_argument(
+        "--match_policy",
+        type=str,
+        default="stem",
+        choices=["stem", "order", "order_if_needed"],
+        help=(
+            "How to pair prior images with reference images. 'order_if_needed' "
+            "uses stem matching when possible, otherwise pairs sorted prior and "
+            "reference lists by order and writes outputs with reference stems."
+        ),
+    )
+    parser.add_argument(
         "--disable_usable_masks",
         action="store_true",
         help=(
@@ -54,8 +65,33 @@ def _collect_images(folder: Path) -> list[Path]:
     return images
 
 
-def _index_by_stem(folder: Path) -> dict[str, Path]:
-    return {p.stem: p for p in _collect_images(folder)}
+def _build_pairs(
+    prior_paths: list[Path],
+    reference_paths: list[Path],
+    match_policy: str,
+) -> tuple[list[tuple[str, Path, Path, str]], list[str], str]:
+    prior_by_stem = {p.stem: p for p in prior_paths}
+    ref_by_stem = {p.stem: p for p in reference_paths}
+    stem_matches = sorted(
+        (stem, prior_by_stem[stem], ref_by_stem[stem], "stem")
+        for stem in prior_by_stem.keys() & ref_by_stem.keys()
+    )
+
+    if match_policy == "stem" or (match_policy == "order_if_needed" and stem_matches):
+        missing_ref = sorted(stem for stem in prior_by_stem if stem not in ref_by_stem)
+        return stem_matches, missing_ref, "stem"
+
+    if len(prior_paths) != len(reference_paths):
+        raise ValueError(
+            f"Cannot use order matching with different counts: "
+            f"priors={len(prior_paths)} references={len(reference_paths)}"
+        )
+
+    pairs = [
+        (ref.stem, prior, ref, "order")
+        for prior, ref in zip(sorted(prior_paths), sorted(reference_paths), strict=True)
+    ]
+    return pairs, [], "order"
 
 
 def _load_rgb01(path: Path) -> np.ndarray:
@@ -139,8 +175,13 @@ def main() -> None:
     if not args.reference_dir.is_dir():
         raise FileNotFoundError(f"Reference dir not found: {args.reference_dir}")
 
-    prior_by_stem = _index_by_stem(args.prior_dir)
-    ref_by_stem = _index_by_stem(args.reference_dir)
+    prior_paths = _collect_images(args.prior_dir)
+    reference_paths = _collect_images(args.reference_dir)
+    pairs, missing_ref, resolved_match_policy = _build_pairs(
+        prior_paths=prior_paths,
+        reference_paths=reference_paths,
+        match_policy=str(args.match_policy),
+    )
 
     priors_dir = args.output_root / "priors"
     discrepancy_dir = args.output_root / "discrepancy"
@@ -167,14 +208,9 @@ def main() -> None:
         npz_dir.mkdir(parents=True, exist_ok=True)
 
     stats: list[dict[str, float | str]] = []
-    missing_ref: list[str] = []
 
-    for idx, (stem, prior_path) in enumerate(sorted(prior_by_stem.items()), start=1):
-        print(f"[existing-prior] {idx}/{len(prior_by_stem)} {prior_path.name}")
-        ref_path = ref_by_stem.get(stem)
-        if ref_path is None:
-            missing_ref.append(stem)
-            continue
+    for idx, (stem, prior_path, ref_path, pair_policy) in enumerate(pairs, start=1):
+        print(f"[existing-prior] {idx}/{len(pairs)} {prior_path.name} -> {stem}.png ({pair_policy})")
 
         if args.copy_raw_priors:
             shutil.copy2(prior_path, priors_dir / f"{stem}.png")
@@ -215,6 +251,9 @@ def main() -> None:
             {
                 "image_name": prior_path.name,
                 "stem": stem,
+                "source_prior_stem": prior_path.stem,
+                "reference_stem": ref_path.stem,
+                "match_policy": pair_policy,
                 "usable_mean": float(usable.mean()),
                 "discrepancy_mean": float(discrepancy.mean()),
                 "discrepancy_p90": float(np.percentile(discrepancy, 90.0)),
@@ -232,7 +271,10 @@ def main() -> None:
         "copy_raw_priors": bool(args.copy_raw_priors),
         "save_discrepancy_npz": bool(args.save_discrepancy_npz),
         "disable_usable_masks": bool(args.disable_usable_masks),
-        "num_priors": len(prior_by_stem),
+        "match_policy": str(args.match_policy),
+        "resolved_match_policy": resolved_match_policy,
+        "num_priors": len(prior_paths),
+        "num_references": len(reference_paths),
         "num_matched": len(stats),
         "missing_reference_count": len(missing_ref),
         "missing_reference_examples": missing_ref[:20],
