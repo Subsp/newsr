@@ -308,6 +308,7 @@ SOURCE_IMAGES_SUBDIR=renders_lr_same_size \
 ENHANCEMENT_BACKEND=restormer \
 DISABLE_PRIOR_USABLE_MASKS=1 \
 PRIOR_MATCH_POLICY=order_if_needed \
+PRIOR_LLFFHOLD=8 \
 RESTORMER_ROOT=/root/autodl-tmp/external/Restormer \
 RESTORMER_TASK=Single_Image_Defocus_Deblurring \
 RESTORMER_TILE=720 \

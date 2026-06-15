@@ -55,6 +55,7 @@ MASK_MODE="${MASK_MODE:-soft}"
 DISCREPANCY_FLOOR="${DISCREPANCY_FLOOR:-0.05}"
 DISABLE_PRIOR_USABLE_MASKS="${DISABLE_PRIOR_USABLE_MASKS:-0}"
 PRIOR_MATCH_POLICY="${PRIOR_MATCH_POLICY:-stem}"
+PRIOR_LLFFHOLD="${PRIOR_LLFFHOLD:-8}"
 
 RUN_NOSR_AFTER="${RUN_NOSR_AFTER:-0}"
 NOSR_CLEANUP_ITERS="${NOSR_CLEANUP_ITERS:-2000}"
@@ -164,6 +165,7 @@ echo "[enhance-prior-scratch-v0] raw prior dir        : ${RAW_PRIOR_DIR}"
 echo "[enhance-prior-scratch-v0] prepared prior root  : ${PREPARED_SR_PRIOR_ROOT}"
 echo "[enhance-prior-scratch-v0] external root        : ${EXTERNAL_RESTORATION_ROOT:-<backend env/default>}"
 echo "[enhance-prior-scratch-v0] prior match policy  : ${PRIOR_MATCH_POLICY}"
+echo "[enhance-prior-scratch-v0] prior llffhold      : ${PRIOR_LLFFHOLD}"
 echo "[enhance-prior-scratch-v0] scratch run tag      : ${PRIOR_ONLY_RUN_TAG}"
 echo "[enhance-prior-scratch-v0] iterations           : ${ITERATIONS}"
 echo "[enhance-prior-scratch-v0] run nosr after       : ${RUN_NOSR_AFTER}"
@@ -242,6 +244,7 @@ if [[ "${PREPARED_READY}" != "1" ]]; then
       --mask_mode "${MASK_MODE}"
       --discrepancy_floor "${DISCREPANCY_FLOOR}"
       --match_policy "${PRIOR_MATCH_POLICY}"
+      --llffhold "${PRIOR_LLFFHOLD}"
       --copy_raw_priors
       --save_fused_priors
     )

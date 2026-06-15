@@ -40,12 +40,19 @@ def _parse_args() -> argparse.Namespace:
         "--match_policy",
         type=str,
         default="stem",
-        choices=["stem", "order", "order_if_needed"],
+        choices=["stem", "order", "order_if_needed", "llff_train_order"],
         help=(
-            "How to pair prior images with reference images. 'order_if_needed' "
-            "uses stem matching when possible, otherwise pairs sorted prior and "
-            "reference lists by order and writes outputs with reference stems."
+            "How to pair prior images with reference images. 'order_if_needed' uses "
+            "stem matching when possible, then sorted full-order matching, then "
+            "LLFF train-order matching when the prior count equals the non-holdout "
+            "reference count. Outputs are written with reference stems."
         ),
+    )
+    parser.add_argument(
+        "--llffhold",
+        type=int,
+        default=8,
+        help="Holdout stride used for LLFF/Mip-NeRF360 train-order matching.",
     )
     parser.add_argument(
         "--disable_usable_masks",
@@ -69,7 +76,8 @@ def _build_pairs(
     prior_paths: list[Path],
     reference_paths: list[Path],
     match_policy: str,
-) -> tuple[list[tuple[str, Path, Path, str]], list[str], str]:
+    llffhold: int,
+) -> tuple[list[tuple[str, Path, Path, str]], list[str], list[str], str]:
     prior_by_stem = {p.stem: p for p in prior_paths}
     ref_by_stem = {p.stem: p for p in reference_paths}
     stem_matches = sorted(
@@ -77,9 +85,37 @@ def _build_pairs(
         for stem in prior_by_stem.keys() & ref_by_stem.keys()
     )
 
-    if match_policy == "stem" or (match_policy == "order_if_needed" and stem_matches):
+    if match_policy == "stem" or (
+        match_policy == "order_if_needed" and len(stem_matches) == len(prior_paths)
+    ):
         missing_ref = sorted(stem for stem in prior_by_stem if stem not in ref_by_stem)
-        return stem_matches, missing_ref, "stem"
+        skipped_ref = sorted(stem for stem in ref_by_stem if stem not in prior_by_stem)
+        return stem_matches, missing_ref, skipped_ref, "stem"
+
+    if match_policy == "llff_train_order" or (
+        match_policy == "order_if_needed"
+        and len(prior_paths) != len(reference_paths)
+        and llffhold > 0
+    ):
+        if llffhold <= 0:
+            raise ValueError(f"LLFF train-order matching requires llffhold > 0, got {llffhold}")
+        train_reference_paths = [
+            ref
+            for idx, ref in enumerate(sorted(reference_paths))
+            if idx % llffhold != 0
+        ]
+        if len(prior_paths) != len(train_reference_paths):
+            raise ValueError(
+                f"Cannot use LLFF train-order matching with these counts: "
+                f"priors={len(prior_paths)} train_references={len(train_reference_paths)} "
+                f"all_references={len(reference_paths)} llffhold={llffhold}"
+            )
+        pairs = [
+            (ref.stem, prior, ref, "llff_train_order")
+            for prior, ref in zip(sorted(prior_paths), train_reference_paths, strict=True)
+        ]
+        skipped_ref = [ref.stem for idx, ref in enumerate(sorted(reference_paths)) if idx % llffhold == 0]
+        return pairs, [], skipped_ref, "llff_train_order"
 
     if len(prior_paths) != len(reference_paths):
         raise ValueError(
@@ -91,7 +127,7 @@ def _build_pairs(
         (ref.stem, prior, ref, "order")
         for prior, ref in zip(sorted(prior_paths), sorted(reference_paths), strict=True)
     ]
-    return pairs, [], "order"
+    return pairs, [], [], "order"
 
 
 def _load_rgb01(path: Path) -> np.ndarray:
@@ -177,10 +213,11 @@ def main() -> None:
 
     prior_paths = _collect_images(args.prior_dir)
     reference_paths = _collect_images(args.reference_dir)
-    pairs, missing_ref, resolved_match_policy = _build_pairs(
+    pairs, missing_ref, skipped_ref, resolved_match_policy = _build_pairs(
         prior_paths=prior_paths,
         reference_paths=reference_paths,
         match_policy=str(args.match_policy),
+        llffhold=int(args.llffhold),
     )
 
     priors_dir = args.output_root / "priors"
@@ -273,11 +310,14 @@ def main() -> None:
         "disable_usable_masks": bool(args.disable_usable_masks),
         "match_policy": str(args.match_policy),
         "resolved_match_policy": resolved_match_policy,
+        "llffhold": int(args.llffhold),
         "num_priors": len(prior_paths),
         "num_references": len(reference_paths),
         "num_matched": len(stats),
         "missing_reference_count": len(missing_ref),
         "missing_reference_examples": missing_ref[:20],
+        "skipped_reference_count": len(skipped_ref),
+        "skipped_reference_examples": skipped_ref[:20],
         "usable_mean": None if not stats else float(np.mean([x["usable_mean"] for x in stats])),
         "discrepancy_mean": None if not stats else float(np.mean([x["discrepancy_mean"] for x in stats])),
         "frames": stats,

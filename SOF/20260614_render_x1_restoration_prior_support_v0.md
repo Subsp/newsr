@@ -122,6 +122,7 @@ with x1-safe defaults:
 PREPARE_IMAGES8=0
 DISABLE_PRIOR_USABLE_MASKS=1
 PRIOR_MATCH_POLICY=order_if_needed
+PRIOR_LLFFHOLD=8
 RAW_PRIOR_SUBDIR=render_x1_priors_${ENHANCEMENT_BACKEND}
 PREPARED_SR_PRIOR_NAME=render_x1_${ENHANCEMENT_BACKEND}_aligned_images_2_scratch_v0
 PRIOR_ONLY_RUN_TAG=mip30k_r1_renderx1_${ENHANCEMENT_BACKEND}_prioronly_scratch_v0
@@ -135,9 +136,10 @@ PRIOR_ONLY_RUN_TAG=mip30k_r1_renderx1_${ENHANCEMENT_BACKEND}_prioronly_scratch_v
   `fused_priors` are direct copies of the restored priors rather than
   mask-blended prior/reference images.
 - Direct x1 render prior stems can differ from `images_2` stems; the wrapper
-  therefore uses `PRIOR_MATCH_POLICY=order_if_needed`, falling back to sorted
-  order matching only when stem matching finds no pairs, and writing outputs
-  with reference frame stems.
+  therefore uses `PRIOR_MATCH_POLICY=order_if_needed`. It first tries stem
+  matching, then full sorted order matching, then LLFF/Mip-NeRF360 train-order
+  matching with `PRIOR_LLFFHOLD=8` when the prior count equals the non-holdout
+  reference count. Outputs are written with reference frame stems.
 - Restormer runs selected frames in one batch call, writes into a task
   subdirectory internally, and the wrapper copies restored images back into the
   expected flat prior cache.
