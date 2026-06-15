@@ -16,10 +16,11 @@ if str(REPO_ROOT) not in sys.path:
 from train_mip_to_sof_surface_v0 import load_cameras_for_split, normalize_image_name
 
 
-def list_render_images(render_root: Path) -> List[Path]:
+def list_render_images(render_root: Path, recursive: bool = False) -> List[Path]:
+    candidates = render_root.rglob("*") if recursive else render_root.iterdir()
     image_paths = [
         path
-        for path in sorted(render_root.rglob("*"))
+        for path in sorted(candidates)
         if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg"}
     ]
     if not image_paths:
@@ -51,6 +52,16 @@ def main() -> None:
     parser.add_argument("--max_views", type=int, default=0)
     parser.add_argument("--render_root", required=True)
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument(
+        "--recursive_render_scan",
+        action="store_true",
+        help="Scan render_root recursively. The default expects the flat render.py output directory.",
+    )
+    parser.add_argument(
+        "--allow_extra_renders",
+        action="store_true",
+        help="Allow extra render images and ignore sorted images beyond the camera count.",
+    )
     args = parser.parse_args()
 
     scene_root = Path(args.scene_root).expanduser().resolve()
@@ -62,11 +73,21 @@ def main() -> None:
     cameras = load_cameras_for_split(scene_root, model_path, str(args.images_subdir), str(args.split))
     selected_indices = select_uniform_indices(len(cameras), int(args.max_views))
     selected_cameras = [cameras[idx] for idx in selected_indices]
-    render_paths = list_render_images(render_root)
+    render_paths = list_render_images(render_root, recursive=bool(args.recursive_render_scan))
+    unused_render_paths: list[Path] = []
     if len(render_paths) == len(cameras):
         selected_render_paths = [render_paths[idx] for idx in selected_indices]
     elif len(render_paths) == len(selected_cameras):
         selected_render_paths = render_paths
+    elif len(render_paths) > len(cameras) and bool(args.allow_extra_renders):
+        usable_render_paths = render_paths[: len(cameras)]
+        selected_render_paths = [usable_render_paths[idx] for idx in selected_indices]
+        unused_render_paths = render_paths[len(cameras) :]
+        print(
+            "[prepare-named-mip-render-v0] extra render images ignored: "
+            f"using {len(usable_render_paths)}/{len(render_paths)} from {render_root}",
+            file=sys.stderr,
+        )
     else:
         raise RuntimeError(
             f"Render count mismatch under {render_root}: got {len(render_paths)} images "
@@ -94,6 +115,12 @@ def main() -> None:
         "split": str(args.split),
         "camera_count": int(len(cameras)),
         "selected_count": int(len(selected_cameras)),
+        "render_count": int(len(render_paths)),
+        "used_render_count": int(len(selected_render_paths)),
+        "unused_render_count": int(len(unused_render_paths)),
+        "unused_render_examples": [str(path) for path in unused_render_paths[:20]],
+        "recursive_render_scan": bool(args.recursive_render_scan),
+        "allow_extra_renders": bool(args.allow_extra_renders),
         "render_root": str(render_root),
         "output_dir": str(output_dir),
         "manifest": manifest,

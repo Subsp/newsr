@@ -226,7 +226,8 @@ if [[ "${LOWFREQ_ANCHOR_MODE}" == "mip_render" || "${LOWFREQ_ANCHOR_MODE}" == "d
       --images_subdir "${MIP_RENDER_CAMERA_IMAGES_SUBDIR}" \
       --split "${MIP_RENDER_SPLIT}" \
       --render_root "${MIP_RENDER_DIR}" \
-      --output_dir "${NAMED_MIP_RENDER_DIR}"
+      --output_dir "${NAMED_MIP_RENDER_DIR}" \
+      --allow_extra_renders
   )
   echo "[nosr-srprior-lrmesh-v0] prepare mip-render COLMAP alias: ${LOWFREQ_ALIAS_DIR}"
   (
