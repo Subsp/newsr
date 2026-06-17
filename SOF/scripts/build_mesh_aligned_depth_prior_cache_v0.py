@@ -32,6 +32,10 @@ DEFAULT_DEPTH_KEYS = ("depth", "depth_hr", "pred", "prediction", "arr_0")
 RESAMPLING = getattr(Image, "Resampling", Image)
 
 
+def normalize_image_name(image_name: str) -> str:
+    return Path(str(image_name)).stem
+
+
 @dataclass
 class SimpleCamera:
     R: np.ndarray
