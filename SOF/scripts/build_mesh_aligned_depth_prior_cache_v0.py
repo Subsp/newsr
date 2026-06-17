@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import math
 import os
 import sys
 import uuid
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
 import numpy as np
+import trimesh
 from PIL import Image
 from tqdm import tqdm
 
@@ -19,15 +23,6 @@ SOF_ROOT = Path(__file__).resolve().parents[1]
 if str(SOF_ROOT) not in sys.path:
     sys.path.insert(0, str(SOF_ROOT))
 
-from prepare_mesh_depth_tsdf_regulation_v0 import (  # noqa: E402
-    build_open3d_raycast_scene,
-    render_mesh_depth_raycast,
-    render_mesh_depth_sample_zbuffer,
-)
-from select_mesh_outside_gaussians_v0 import load_triangle_mesh  # noqa: E402
-from train_mip_to_sof_surface_v0 import load_cameras_for_split  # noqa: E402
-from utils.prior_injection import normalize_image_name  # noqa: E402
-
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 ARRAY_EXTS = {".npy", ".npz", ".pt", ".pth"}
@@ -35,6 +30,196 @@ DEPTH_EXTS = IMAGE_EXTS | ARRAY_EXTS
 DEFAULT_DEPTH_SUBDIRS = ("depth", "depth_hr", "pred", "prediction", "depths", "mono_depth", "")
 DEFAULT_DEPTH_KEYS = ("depth", "depth_hr", "pred", "prediction", "arr_0")
 RESAMPLING = getattr(Image, "Resampling", Image)
+
+
+@dataclass
+class SimpleCamera:
+    R: np.ndarray
+    T: np.ndarray
+    FoVx: float
+    FoVy: float
+    image_name: str
+    image_width: int
+    image_height: int
+    focal_x: float
+    focal_y: float
+    camera_center: np.ndarray
+
+
+def _load_colmap_loader_module():
+    module_path = SOF_ROOT / "scene" / "colmap_loader.py"
+    spec = importlib.util.spec_from_file_location("_sof_colmap_loader_light", module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Failed to load COLMAP helper from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_COLMAP = _load_colmap_loader_module()
+
+
+def _focal2fov(focal: float, pixels: int) -> float:
+    return 2.0 * math.atan(float(pixels) / (2.0 * float(focal)))
+
+
+def _fov2focal(fov: float, pixels: int) -> float:
+    return float(pixels) / (2.0 * math.tan(float(fov) / 2.0))
+
+
+def _camera_center_from_rt(R: np.ndarray, T: np.ndarray) -> np.ndarray:
+    rt = np.zeros((4, 4), dtype=np.float32)
+    rt[:3, :3] = np.asarray(R, dtype=np.float32).T
+    rt[:3, 3] = np.asarray(T, dtype=np.float32)
+    rt[3, 3] = 1.0
+    c2w = np.linalg.inv(rt)
+    return c2w[:3, 3].astype(np.float32, copy=False)
+
+
+def _resolve_colmap_image_path(images_folder: Path, image_name: str) -> Path:
+    raw = images_folder / Path(image_name).name
+    if raw.is_file():
+        return raw
+    stem = raw.stem
+    for ext in (".png", ".jpg", ".jpeg", ".JPG", ".PNG"):
+        candidate = images_folder / f"{stem}{ext}"
+        if candidate.is_file():
+            return candidate
+    return raw
+
+
+def _read_colmap_cameras(scene_root: Path, images_subdir: str, llffhold: int, split: str) -> list[SimpleCamera]:
+    sparse_root = scene_root / "sparse" / "0"
+    try:
+        extrinsics = _COLMAP.read_extrinsics_binary(str(sparse_root / "images.bin"))
+        intrinsics = _COLMAP.read_intrinsics_binary(str(sparse_root / "cameras.bin"))
+    except Exception:
+        extrinsics = _COLMAP.read_extrinsics_text(str(sparse_root / "images.txt"))
+        intrinsics = _COLMAP.read_intrinsics_text(str(sparse_root / "cameras.txt"))
+
+    images_folder = scene_root / str(images_subdir)
+    cameras: list[SimpleCamera] = []
+    for key in extrinsics:
+        extr = extrinsics[key]
+        intr = intrinsics[extr.camera_id]
+        if intr.model == "SIMPLE_PINHOLE":
+            focal_x = float(intr.params[0])
+            focal_y = float(intr.params[0])
+        elif intr.model == "PINHOLE":
+            focal_x = float(intr.params[0])
+            focal_y = float(intr.params[1])
+        else:
+            raise ValueError(f"Unsupported COLMAP camera model: {intr.model}")
+
+        image_path = _resolve_colmap_image_path(images_folder, str(extr.name))
+        if not image_path.is_file():
+            raise FileNotFoundError(f"COLMAP image not found under {images_folder}: {extr.name}")
+        with Image.open(image_path) as image:
+            width, height = image.size
+
+        fov_x = _focal2fov(focal_x, int(intr.width))
+        fov_y = _focal2fov(focal_y, int(intr.height))
+        R = np.asarray(_COLMAP.qvec2rotmat(extr.qvec), dtype=np.float32).T
+        T = np.asarray(extr.tvec, dtype=np.float32)
+        cameras.append(
+            SimpleCamera(
+                R=R,
+                T=T,
+                FoVx=float(fov_x),
+                FoVy=float(fov_y),
+                image_name=image_path.stem,
+                image_width=int(width),
+                image_height=int(height),
+                focal_x=float(_fov2focal(fov_x, int(width))),
+                focal_y=float(_fov2focal(fov_y, int(height))),
+                camera_center=_camera_center_from_rt(R, T),
+            )
+        )
+
+    cameras = sorted(cameras, key=lambda cam: cam.image_name)
+    split_l = str(split).lower()
+    if split_l == "train":
+        return [cam for idx, cam in enumerate(cameras) if idx % int(llffhold) != 0]
+    if split_l == "test":
+        return [cam for idx, cam in enumerate(cameras) if idx % int(llffhold) == 0]
+    if split_l == "both":
+        return cameras
+    raise ValueError(f"Unsupported camera split: {split}")
+
+
+def load_cameras_for_split(scene_root: Path, images_subdir: str, split: str, llffhold: int) -> list[SimpleCamera]:
+    if (scene_root / "sparse").exists():
+        return _read_colmap_cameras(scene_root, images_subdir, llffhold, split)
+    raise RuntimeError(f"Only COLMAP scenes are supported by this lightweight depth-align script: {scene_root}")
+
+
+def load_triangle_mesh(mesh_path: str) -> trimesh.Trimesh:
+    mesh_obj = trimesh.load_mesh(mesh_path, process=False)
+    if isinstance(mesh_obj, trimesh.Trimesh):
+        return mesh_obj
+    if hasattr(mesh_obj, "dump"):
+        dumped = mesh_obj.dump(concatenate=True)
+        if isinstance(dumped, trimesh.Trimesh):
+            return dumped
+    raise ValueError(f"Failed to load a triangle mesh from {mesh_path}")
+
+
+def build_open3d_raycast_scene(mesh: trimesh.Trimesh):
+    import open3d as o3d
+
+    vertices = np.asarray(mesh.vertices, dtype=np.float32)
+    faces = np.asarray(mesh.faces, dtype=np.int32)
+    legacy = o3d.geometry.TriangleMesh()
+    legacy.vertices = o3d.utility.Vector3dVector(vertices.astype(np.float64))
+    legacy.triangles = o3d.utility.Vector3iVector(faces)
+    tensor_mesh = o3d.t.geometry.TriangleMesh.from_legacy(legacy)
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(tensor_mesh)
+    return scene
+
+
+def render_mesh_depth_raycast(
+    scene,
+    cam: SimpleCamera,
+    *,
+    downsample: int,
+    ray_chunk: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    import open3d as o3d
+
+    down = max(int(downsample), 1)
+    width = int(math.ceil(float(cam.image_width) / float(down)))
+    height = int(math.ceil(float(cam.image_height) / float(down)))
+    jj, ii = np.meshgrid(np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32))
+    x = (jj + 0.5) * float(down) - 0.5
+    y = (ii + 0.5) * float(down) - 0.5
+    dirs_cam = np.stack(
+        [
+            (x - float(cam.image_width) * 0.5) / float(cam.focal_x),
+            (y - float(cam.image_height) * 0.5) / float(cam.focal_y),
+            np.ones_like(x, dtype=np.float32),
+        ],
+        axis=-1,
+    ).reshape(-1, 3)
+    dirs_world = dirs_cam @ np.asarray(cam.R, dtype=np.float32).T
+    origins = np.repeat(np.asarray(cam.camera_center, dtype=np.float32).reshape(1, 3), dirs_world.shape[0], axis=0)
+    rays_np = np.concatenate([origins, dirs_world.astype(np.float32, copy=False)], axis=1).astype(np.float32, copy=False)
+
+    depth = np.full((rays_np.shape[0],), np.inf, dtype=np.float32)
+    face_ids = np.full((rays_np.shape[0],), -1, dtype=np.int64)
+    chunk = max(int(ray_chunk), 1)
+    invalid_primitive = np.iinfo(np.uint32).max
+    for begin in range(0, rays_np.shape[0], chunk):
+        end = min(begin + chunk, rays_np.shape[0])
+        result = scene.cast_rays(o3d.core.Tensor(rays_np[begin:end], dtype=o3d.core.Dtype.Float32))
+        t_hit = result["t_hit"].numpy().astype(np.float32, copy=False)
+        primitive = result["primitive_ids"].numpy().astype(np.uint64, copy=False)
+        hit = np.isfinite(t_hit) & (primitive != invalid_primitive)
+        depth_chunk = depth[begin:end]
+        face_chunk = face_ids[begin:end]
+        depth_chunk[hit] = t_hit[hit]
+        face_chunk[hit] = primitive[hit].astype(np.int64, copy=False)
+    return depth.reshape(height, width), face_ids.reshape(height, width)
 
 
 def _parse_csv(value: str | None, default: Sequence[str]) -> list[str]:
@@ -63,6 +248,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output_root", type=Path, required=True)
     parser.add_argument("--images_subdir", default="images_2")
     parser.add_argument("--split", choices=("train", "test", "both"), default="train")
+    parser.add_argument("--llffhold", type=int, default=8)
     parser.add_argument("--limit", type=int, default=0, help="Optional first-N camera limit for smoke runs.")
     parser.add_argument("--depth_subdirs", default="auto")
     parser.add_argument("--depth_keys", default="auto")
@@ -534,7 +720,10 @@ def _process_frame(
             ray_chunk=int(args.raycast_chunk),
         )
     else:
-        mesh_depth, face_ids = render_mesh_depth_sample_zbuffer(mesh, cam, args)
+        raise NotImplementedError(
+            "sample_zbuffer is intentionally disabled in the lightweight depth-align script; "
+            "use --mesh_depth_mode raycast."
+        )
 
     mesh_depth = np.asarray(mesh_depth, dtype=np.float32)
     mesh_valid = np.isfinite(mesh_depth) & (mesh_depth > float(args.depth_min))
@@ -655,7 +844,7 @@ def main() -> None:
 
     mesh = load_triangle_mesh(str(mesh_path))
     scene = build_open3d_raycast_scene(mesh) if str(args.mesh_depth_mode) == "raycast" else None
-    cameras = load_cameras_for_split(scene_root, model_path, str(args.images_subdir), str(args.split))
+    cameras = load_cameras_for_split(scene_root, str(args.images_subdir), str(args.split), int(args.llffhold))
     if int(args.limit) > 0:
         cameras = cameras[: int(args.limit)]
 
