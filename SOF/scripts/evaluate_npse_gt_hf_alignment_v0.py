@@ -41,6 +41,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mask_dir", type=Path, default=None, help="Optional soft mask dir, e.g. trust_edge.")
     parser.add_argument("--anchor_dir", type=Path, default=None, help="Optional anchor image dir for residual-HF metrics.")
     parser.add_argument("--output_dir", required=True, type=Path)
+    parser.add_argument(
+        "--match_policy",
+        choices=("stem", "order", "order_if_needed", "llff_train_order"),
+        default="order_if_needed",
+        help="How to align GT/candidate/mask frames when stems differ.",
+    )
+    parser.add_argument("--llffhold", type=int, default=8)
     parser.add_argument("--highpass_kernel", type=int, default=15)
     parser.add_argument("--mask_power", type=float, default=1.0)
     parser.add_argument("--hard_mask_threshold", type=float, default=0.05)
@@ -65,6 +72,32 @@ def _index_images(root: Path) -> Dict[str, Path]:
     for path in _iter_images(root):
         index.setdefault(path.stem, path)
     return index
+
+
+def _extract_trailing_int(stem: str) -> Optional[int]:
+    digits = []
+    for ch in reversed(str(stem)):
+        if not ch.isdigit():
+            break
+        digits.append(ch)
+    if not digits:
+        return None
+    return int("".join(reversed(digits)))
+
+
+def _sort_key_from_stem(stem: str) -> Tuple[int, int, str]:
+    idx = _extract_trailing_int(stem)
+    if idx is None:
+        return (1, 0, str(stem))
+    return (0, idx, str(stem))
+
+
+def _sorted_index_items(index: Dict[str, Path]) -> List[Tuple[str, Path]]:
+    return sorted(index.items(), key=lambda item: _sort_key_from_stem(item[0]))
+
+
+def _sample_keys(index: Dict[str, Path], n: int = 5) -> List[str]:
+    return [stem for stem, _path in _sorted_index_items(index)[:n]]
 
 
 def _parse_candidate_specs(specs: List[str]) -> List[Tuple[str, Path]]:
@@ -319,29 +352,165 @@ def _nanmean(values: List[float]) -> float:
     return float(arr.mean())
 
 
+def _build_stem_pairs(
+    *,
+    gt_index: Dict[str, Path],
+    candidate_index: Dict[str, Path],
+    mask_index: Dict[str, Path],
+    anchor_index: Dict[str, Path],
+) -> List[Dict[str, Optional[Path]]]:
+    stems = set(gt_index.keys()) & set(candidate_index.keys())
+    if mask_index:
+        stems &= set(mask_index.keys())
+    pairs: List[Dict[str, Optional[Path]]] = []
+    for stem in sorted(stems, key=_sort_key_from_stem):
+        pairs.append(
+            {
+                "stem": stem,
+                "gt_path": gt_index[stem],
+                "candidate_path": candidate_index[stem],
+                "mask_path": mask_index.get(stem) if mask_index else None,
+                "anchor_path": anchor_index.get(stem) if anchor_index else None,
+            }
+        )
+    return pairs
+
+
+def _build_order_pairs(
+    *,
+    gt_index: Dict[str, Path],
+    candidate_index: Dict[str, Path],
+    mask_index: Dict[str, Path],
+    anchor_index: Dict[str, Path],
+    llff_train: bool,
+    llffhold: int,
+) -> List[Dict[str, Optional[Path]]]:
+    gt_items = _sorted_index_items(gt_index)
+    if llff_train:
+        hold = max(int(llffhold), 1)
+        gt_items = [item for idx, item in enumerate(gt_items) if idx % hold != 0]
+
+    candidate_items = _sorted_index_items(candidate_index)
+    mask_items = _sorted_index_items(mask_index) if mask_index else []
+    anchor_items = _sorted_index_items(anchor_index) if anchor_index else []
+
+    pair_count = min(len(gt_items), len(candidate_items))
+    if mask_items:
+        pair_count = min(pair_count, len(mask_items))
+    pairs: List[Dict[str, Optional[Path]]] = []
+    for idx in range(pair_count):
+        gt_stem, gt_path = gt_items[idx]
+        candidate_stem, candidate_path = candidate_items[idx]
+        mask_path = mask_items[idx][1] if mask_items else None
+        anchor_path = anchor_index.get(gt_stem)
+        if anchor_path is None and idx < len(anchor_items):
+            anchor_path = anchor_items[idx][1]
+        pairs.append(
+            {
+                "stem": gt_stem,
+                "gt_path": gt_path,
+                "candidate_path": candidate_path,
+                "mask_path": mask_path,
+                "anchor_path": anchor_path,
+                "candidate_stem": candidate_stem,
+                "mask_stem": mask_items[idx][0] if mask_items else "",
+                "anchor_stem": anchor_path.stem if anchor_path is not None else "",
+            }
+        )
+    return pairs
+
+
+def _build_pairs_for_candidate(
+    *,
+    gt_index: Dict[str, Path],
+    candidate_index: Dict[str, Path],
+    mask_index: Dict[str, Path],
+    anchor_index: Dict[str, Path],
+    match_policy: str,
+    llffhold: int,
+) -> Tuple[List[Dict[str, Optional[Path]]], str]:
+    policy = str(match_policy)
+    if policy in {"stem", "order_if_needed"}:
+        pairs = _build_stem_pairs(
+            gt_index=gt_index,
+            candidate_index=candidate_index,
+            mask_index=mask_index,
+            anchor_index=anchor_index,
+        )
+        if pairs or policy == "stem":
+            return pairs, "stem"
+    if policy == "llff_train_order":
+        return (
+            _build_order_pairs(
+                gt_index=gt_index,
+                candidate_index=candidate_index,
+                mask_index=mask_index,
+                anchor_index=anchor_index,
+                llff_train=True,
+                llffhold=llffhold,
+            ),
+            "llff_train_order",
+        )
+    return (
+        _build_order_pairs(
+            gt_index=gt_index,
+            candidate_index=candidate_index,
+            mask_index=mask_index,
+            anchor_index=anchor_index,
+            llff_train=False,
+            llffhold=llffhold,
+        ),
+        "order",
+    )
+
+
+def _empty_match_error(
+    *,
+    gt_index: Dict[str, Path],
+    candidate_indices: Dict[str, Dict[str, Path]],
+    mask_index: Dict[str, Path],
+    match_policy: str,
+    llffhold: int,
+) -> str:
+    parts = [
+        "No matched frames across GT, candidates, and mask.",
+        f"match_policy={match_policy} llffhold={llffhold}",
+        f"gt_count={len(gt_index)} gt_sample={_sample_keys(gt_index)}",
+    ]
+    if mask_index:
+        parts.append(f"mask_count={len(mask_index)} mask_sample={_sample_keys(mask_index)}")
+    for name, index in candidate_indices.items():
+        common = len(set(gt_index.keys()) & set(index.keys()))
+        parts.append(
+            f"candidate={name} count={len(index)} common_gt_stems={common} sample={_sample_keys(index)}"
+        )
+    return "\n".join(parts)
+
+
 def _process_candidate(
     *,
     name: str,
-    candidate_index: Dict[str, Path],
-    gt_index: Dict[str, Path],
-    mask_index: Dict[str, Path],
-    anchor_index: Dict[str, Path],
-    stems: List[str],
+    pairs: List[Dict[str, Optional[Path]]],
     args: argparse.Namespace,
 ) -> Tuple[List[Dict[str, object]], Dict[str, float]]:
     rows: List[Dict[str, object]] = []
     debug_written = 0
     debug_dir = args.output_dir / "debug" / name
 
-    for stem in stems:
-        gt_path = gt_index[stem]
-        candidate_path = candidate_index[stem]
+    for pair in pairs:
+        stem = str(pair["stem"])
+        gt_path = pair["gt_path"]
+        candidate_path = pair["candidate_path"]
+        mask_path = pair.get("mask_path")
+        anchor_path = pair.get("anchor_path")
+        if gt_path is None or candidate_path is None:
+            continue
         gt_image = _load_rgb01(gt_path)
         size = (gt_image.shape[1], gt_image.shape[0])
         candidate_image = _load_rgb01(candidate_path, size=size)
         mask = np.ones((gt_image.shape[0], gt_image.shape[1]), dtype=np.float32)
-        if mask_index:
-            mask = _load_gray01(mask_index[stem], size=size)
+        if mask_path is not None:
+            mask = _load_gray01(mask_path, size=size)
         if float(args.mask_power) != 1.0:
             mask = np.power(np.clip(mask, 0.0, 1.0), max(float(args.mask_power), 0.0)).astype(np.float32)
         else:
@@ -355,17 +524,17 @@ def _process_candidate(
             "stem": stem,
             "gt_path": str(gt_path),
             "candidate_path": str(candidate_path),
-            "mask_path": str(mask_index[stem]) if mask_index else "",
+            "mask_path": str(mask_path) if mask_path is not None else "",
             "mask_mean": float(mask.mean()),
             "mask_hard_ratio": float((mask >= float(args.hard_mask_threshold)).mean()),
             "mask_soft_sum": float(mask.sum()),
         }
         row.update(_metric_pack(candidate_hp, gt_hp, mask, float(args.active_gt_percentile), "abs_hf"))
 
-        if stem in anchor_index:
-            anchor_image = _load_rgb01(anchor_index[stem], size=size)
+        if anchor_path is not None:
+            anchor_image = _load_rgb01(anchor_path, size=size)
             anchor_hp = _highpass(anchor_image, int(args.highpass_kernel))
-            row["anchor_path"] = str(anchor_index[stem])
+            row["anchor_path"] = str(anchor_path)
             row.update(
                 _metric_pack(
                     candidate_hp - anchor_hp,
@@ -419,29 +588,46 @@ def main() -> None:
     anchor_index = _index_images(args.anchor_dir) if args.anchor_dir else {}
 
     candidate_indices = {name: _index_images(path) for name, path in candidates}
-    stems = set(gt_index.keys())
-    for index in candidate_indices.values():
-        stems &= set(index.keys())
-    if mask_index:
-        stems &= set(mask_index.keys())
-    stems_list = sorted(stems)
-    if int(args.limit) > 0:
-        stems_list = stems_list[: int(args.limit)]
-    if not stems_list:
-        raise RuntimeError("No common stems across GT, candidates, and mask.")
+    pairs_by_candidate: Dict[str, List[Dict[str, Optional[Path]]]] = {}
+    match_policy_by_candidate: Dict[str, str] = {}
+    for name, _path in candidates:
+        pairs, resolved_policy = _build_pairs_for_candidate(
+            gt_index=gt_index,
+            candidate_index=candidate_indices[name],
+            mask_index=mask_index,
+            anchor_index=anchor_index,
+            match_policy=str(args.match_policy),
+            llffhold=int(args.llffhold),
+        )
+        if int(args.limit) > 0:
+            pairs = pairs[: int(args.limit)]
+        pairs_by_candidate[name] = pairs
+        match_policy_by_candidate[name] = resolved_policy
+
+    if not any(pairs_by_candidate.values()):
+        raise RuntimeError(
+            _empty_match_error(
+                gt_index=gt_index,
+                candidate_indices=candidate_indices,
+                mask_index=mask_index,
+                match_policy=str(args.match_policy),
+                llffhold=int(args.llffhold),
+            )
+        )
 
     all_rows: List[Dict[str, object]] = []
     summary_by_candidate: Dict[str, Dict[str, float]] = {}
     for name, _path in candidates:
+        pairs = pairs_by_candidate[name]
+        if not pairs:
+            print(f"[npse-hf-align-v0] skip {name}: no matched frames")
+            continue
         rows, summary = _process_candidate(
             name=name,
-            candidate_index=candidate_indices[name],
-            gt_index=gt_index,
-            mask_index=mask_index,
-            anchor_index=anchor_index,
-            stems=stems_list,
+            pairs=pairs,
             args=args,
         )
+        summary["frames"] = float(len(rows))
         all_rows.extend(rows)
         summary_by_candidate[name] = summary
 
@@ -459,10 +645,13 @@ def main() -> None:
         "anchor_dir": str(args.anchor_dir) if args.anchor_dir else None,
         "candidates": {name: str(path) for name, path in candidates},
         "highpass_kernel": int(args.highpass_kernel),
+        "match_policy": str(args.match_policy),
+        "llffhold": int(args.llffhold),
+        "resolved_match_policy_by_candidate": match_policy_by_candidate,
         "mask_power": float(args.mask_power),
         "hard_mask_threshold": float(args.hard_mask_threshold),
         "active_gt_percentile": float(args.active_gt_percentile),
-        "num_common_frames": len(stems_list),
+        "num_frames_by_candidate": {name: len(pairs) for name, pairs in pairs_by_candidate.items()},
         "summary": summary_by_candidate,
         "per_frame_csv": str(csv_path),
         "debug_dir": str(args.output_dir / "debug"),
@@ -470,7 +659,7 @@ def main() -> None:
     summary_path = args.output_dir / "summary.json"
     summary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-    print("[npse-hf-align-v0] frames:", len(stems_list))
+    print("[npse-hf-align-v0] match_policy:", args.match_policy)
     print("[npse-hf-align-v0] output:", args.output_dir)
     for name, summary in summary_by_candidate.items():
         abs_corr = summary.get("abs_hf_corr_luma", float("nan"))
@@ -480,7 +669,8 @@ def main() -> None:
         delta_l1 = summary.get("delta_hf_l1_rgb", float("nan"))
         delta_energy = summary.get("delta_hf_energy_ratio", float("nan"))
         print(
-            f"  {name}: abs_corr={abs_corr:.4f} abs_l1={abs_l1:.6f} abs_energy={abs_energy:.3f} "
+            f"  {name}: frames={int(summary.get('frames', 0))} "
+            f"abs_corr={abs_corr:.4f} abs_l1={abs_l1:.6f} abs_energy={abs_energy:.3f} "
             f"delta_corr={delta_corr:.4f} delta_l1={delta_l1:.6f} delta_energy={delta_energy:.3f}"
         )
     print("[npse-hf-align-v0] summary:", summary_path)
