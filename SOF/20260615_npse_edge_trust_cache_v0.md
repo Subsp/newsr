@@ -73,3 +73,19 @@ Inspect `debug_overlay`, `edge_type`, `continuous_mask`, `residual_raw`, and
 In the default `GEOMETRY_CONFIRM_MODE=sr_confirmed`, a depth jump alone is not enough
 to become a red geometry edge. Depth-only jumps are marked blue and receive only a weak
 barrier, because gs2mesh-aligned depth can inherit LR-GS clutter or mesh holes.
+
+## NoSR Anchor Probe
+
+To test whether NoSR's cleaned GS field gives a better low-frequency anchor, run:
+
+```bash
+cd /root/autodl-tmp/newsr/SOF
+DEPTH_PRIOR_DIR=/root/autodl-tmp/kitchen/_hrgsrefiner_assets/depth_prior_aligned_gs2mesh/render_x1_depthprior_images_2_train_gs2mesh_aligned_v0/aligned_depth \
+LIMIT=8 \
+OVERWRITE=1 \
+bash scripts/run_build_npse_edge_trust_cache_v0_kitchen_nosr_anchor.sh
+```
+
+This changes only the anchor render. If red/blue still track clutter, the next
+probe should regenerate `DEPTH_PRIOR_DIR` using a NoSR-derived mesh rather than
+the vanilla gs2mesh mesh.
