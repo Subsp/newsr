@@ -44,7 +44,7 @@ def _parse_args() -> argparse.Namespace:
         default="stem",
         help=(
             "How to map inputs to output stems. With --reference_dir, llff_train_order "
-            "uses idx % llffhold != 0 reference frames."
+            "uses idx %% llffhold != 0 reference frames."
         ),
     )
     parser.add_argument("--llffhold", type=int, default=8)
@@ -60,6 +60,40 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sr_edge_percentile", type=float, default=92.0)
     parser.add_argument("--geometry_edge_threshold", type=float, default=0.55)
     parser.add_argument("--sr_edge_threshold", type=float, default=0.55)
+    parser.add_argument(
+        "--geometry_confirm_mode",
+        choices=("depth_only", "sr_confirmed"),
+        default="sr_confirmed",
+        help=(
+            "depth_only keeps the original v0 behavior. sr_confirmed promotes a depth jump "
+            "to a red geometry edge only when an SR structural edge also supports it; "
+            "depth-only jumps are marked uncertain and receive weak barrier weight."
+        ),
+    )
+    parser.add_argument(
+        "--depth_sr_confirm_threshold",
+        type=float,
+        default=0.35,
+        help="Minimum normalized SR structural edge required to confirm a depth jump as geometry.",
+    )
+    parser.add_argument(
+        "--depth_only_edge_weight",
+        type=float,
+        default=0.15,
+        help="Visualization/fusion weight for depth-only unconfirmed jumps.",
+    )
+    parser.add_argument(
+        "--depth_only_barrier_weight",
+        type=float,
+        default=0.20,
+        help="Weak propagation barrier for unconfirmed depth-only jumps.",
+    )
+    parser.add_argument(
+        "--geometry_barrier_weight",
+        type=float,
+        default=1.0,
+        help="Barrier weight for SR-confirmed geometry depth jumps.",
+    )
     parser.add_argument("--sr_barrier_weight", type=float, default=0.25)
     parser.add_argument("--edge_band_radius", type=int, default=1)
     parser.add_argument("--trust_lowfreq_tau", type=float, default=0.12)
@@ -542,9 +576,17 @@ def _process_frame(
     trust_cons = np.exp(-consistency / max(float(args.trust_consistency_tau), 1e-6))
     trust_sr = np.clip(trust_low * trust_cons, 0.0, 1.0).astype(np.float32)
 
-    geo = edge_depth >= float(args.geometry_edge_threshold)
+    geo_candidate = edge_depth >= float(args.geometry_edge_threshold)
+    sr_support = edge_sr >= float(args.depth_sr_confirm_threshold)
+    if str(args.geometry_confirm_mode) == "sr_confirmed":
+        geo = geo_candidate & sr_support
+        depth_only_uncertain = geo_candidate & (~sr_support)
+    else:
+        geo = geo_candidate
+        depth_only_uncertain = np.zeros_like(geo, dtype=bool)
     sr_strong = edge_sr >= float(args.sr_edge_threshold)
-    uncertain = sr_strong & (~geo) & (trust_sr < float(args.uncertain_trust_threshold))
+    uncertain_sr = sr_strong & (~geo) & (trust_sr < float(args.uncertain_trust_threshold))
+    uncertain = uncertain_sr | depth_only_uncertain
     appearance = sr_strong & (~geo) & (~uncertain)
 
     edge_type = np.zeros_like(edge_depth, dtype=np.uint8)
@@ -552,8 +594,20 @@ def _process_frame(
     edge_type[appearance] = 2
     edge_type[uncertain] = 3
 
-    edge_fused = np.clip(np.maximum(edge_depth, edge_sr * trust_sr), 0.0, 1.0)
-    barrier = np.clip(np.maximum(edge_depth, edge_sr * trust_sr * float(args.sr_barrier_weight)), 0.0, 1.0)
+    edge_depth_confirmed = np.clip(
+        edge_depth * geo.astype(np.float32)
+        + edge_depth * depth_only_uncertain.astype(np.float32) * float(args.depth_only_edge_weight),
+        0.0,
+        1.0,
+    )
+    edge_fused = np.clip(np.maximum(edge_depth_confirmed, edge_sr * trust_sr), 0.0, 1.0)
+    depth_barrier = np.clip(
+        edge_depth * geo.astype(np.float32) * float(args.geometry_barrier_weight)
+        + edge_depth * depth_only_uncertain.astype(np.float32) * float(args.depth_only_barrier_weight),
+        0.0,
+        1.0,
+    )
+    barrier = np.clip(np.maximum(depth_barrier, edge_sr * trust_sr * float(args.sr_barrier_weight)), 0.0, 1.0)
     edge_seed = np.maximum(geo.astype(np.float32), appearance.astype(np.float32))
     edge_band = _max_filter(edge_seed, int(args.edge_band_radius))
     continuous_mask = ((edge_band < 0.5) & (trust_sr > 0.05)).astype(np.float32)
@@ -567,7 +621,7 @@ def _process_frame(
     )
     residual_npse = residual_npse * continuous_mask[..., None] + residual_raw * (1.0 - continuous_mask[..., None])
 
-    trust_edge = np.clip(np.maximum(edge_depth, edge_sr * trust_sr), 0.0, 1.0) * edge_band
+    trust_edge = edge_fused * edge_band
     edge_residual = np.clip(
         residual_raw,
         -float(args.edge_residual_clip),
@@ -576,8 +630,10 @@ def _process_frame(
     edge_target = np.clip(anchor + edge_residual, 0.0, 1.0)
 
     _save_gray01(dirs["edge_depth"] / f"{stem}.png", edge_depth)
+    _save_gray01(dirs["edge_depth_confirmed"] / f"{stem}.png", edge_depth_confirmed)
     _save_gray01(dirs["edge_sr"] / f"{stem}.png", edge_sr)
     _save_gray01(dirs["edge_fused"] / f"{stem}.png", edge_fused)
+    _save_gray01(dirs["depth_only_uncertain"] / f"{stem}.png", depth_only_uncertain.astype(np.float32))
     _save_gray01(dirs["barrier"] / f"{stem}.png", barrier)
     _save_gray01(dirs["trust_sr"] / f"{stem}.png", trust_sr)
     _save_gray01(dirs["continuous_mask"] / f"{stem}.png", continuous_mask)
@@ -600,9 +656,12 @@ def _process_frame(
         residual_raw=residual_raw.astype(np.float16),
         residual_npse=residual_npse.astype(np.float16),
         edge_depth=edge_depth.astype(np.float16),
+        edge_depth_confirmed=edge_depth_confirmed.astype(np.float16),
         edge_sr=edge_sr.astype(np.float16),
         edge_fused=edge_fused.astype(np.float16),
         edge_type=edge_type,
+        geometry_edge_candidate=geo_candidate.astype(np.uint8),
+        depth_only_uncertain=depth_only_uncertain.astype(np.uint8),
         barrier=barrier.astype(np.float16),
         trust_sr=trust_sr.astype(np.float16),
         continuous_mask=continuous_mask.astype(np.float16),
@@ -623,7 +682,9 @@ def _process_frame(
         "trust_sr_mean": float(trust_sr.mean()),
         "continuous_ratio": float(continuous_mask.mean()),
         "edge_band_ratio": float(edge_band.mean()),
+        "geometry_candidate_ratio": float(geo_candidate.mean()),
         "geometry_edge_ratio": float(geo.mean()),
+        "depth_only_uncertain_ratio": float(depth_only_uncertain.mean()),
         "appearance_edge_ratio": float(appearance.mean()),
         "uncertain_edge_ratio": float(uncertain.mean()),
         "npz": str(npz_path),
@@ -655,8 +716,10 @@ def main() -> None:
         name: args.output_root / name
         for name in (
             "edge_depth",
+            "edge_depth_confirmed",
             "edge_sr",
             "edge_fused",
+            "depth_only_uncertain",
             "edge_type",
             "barrier",
             "trust_sr",
@@ -706,6 +769,11 @@ def main() -> None:
         "sr_edge_percentile": float(args.sr_edge_percentile),
         "geometry_edge_threshold": float(args.geometry_edge_threshold),
         "sr_edge_threshold": float(args.sr_edge_threshold),
+        "geometry_confirm_mode": str(args.geometry_confirm_mode),
+        "depth_sr_confirm_threshold": float(args.depth_sr_confirm_threshold),
+        "depth_only_edge_weight": float(args.depth_only_edge_weight),
+        "depth_only_barrier_weight": float(args.depth_only_barrier_weight),
+        "geometry_barrier_weight": float(args.geometry_barrier_weight),
         "match_summary": match_summary,
         "num_requested": len(triples),
         "num_written": len(frames),
@@ -714,7 +782,9 @@ def main() -> None:
             "trust_sr_mean": None if not frames else float(np.mean([f["trust_sr_mean"] for f in frames])),
             "continuous_ratio_mean": None if not frames else float(np.mean([f["continuous_ratio"] for f in frames])),
             "edge_band_ratio_mean": None if not frames else float(np.mean([f["edge_band_ratio"] for f in frames])),
+            "geometry_candidate_ratio_mean": None if not frames else float(np.mean([f["geometry_candidate_ratio"] for f in frames])),
             "geometry_edge_ratio_mean": None if not frames else float(np.mean([f["geometry_edge_ratio"] for f in frames])),
+            "depth_only_uncertain_ratio_mean": None if not frames else float(np.mean([f["depth_only_uncertain_ratio"] for f in frames])),
             "appearance_edge_ratio_mean": None if not frames else float(np.mean([f["appearance_edge_ratio"] for f in frames])),
             "uncertain_edge_ratio_mean": None if not frames else float(np.mean([f["uncertain_edge_ratio"] for f in frames])),
         },

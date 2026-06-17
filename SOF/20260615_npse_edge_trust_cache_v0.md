@@ -23,10 +23,12 @@ Use `scripts/run_build_mesh_aligned_depth_prior_cache_v0_kitchen.sh` to create:
 
 The cache writes:
 
-- `edge_depth`: sharp geometry cue from depth-prior jumps.
+- `edge_depth`: raw sharp cue from depth-prior jumps.
+- `edge_depth_confirmed`: geometry edge strength after SR-structure confirmation.
 - `edge_sr`: structural edge cue from the SR prior.
 - `edge_fused`: fused edge probability used for visualization.
-- `edge_type`: black continuous, red geometry edge, yellow appearance edge, blue uncertain SR edge.
+- `edge_type`: black continuous, red SR-confirmed geometry edge, yellow appearance edge, blue uncertain edge.
+- `depth_only_uncertain`: depth-only jumps that were not confirmed by SR structure.
 - `barrier`: propagation barrier. Continuous residual diffusion should not cross strong barriers.
 - `trust_sr`: SR-prior reliability from low-frequency agreement and local residual consistency.
 - `continuous_mask`: smooth-region mask where neighborhood residual diffusion is allowed.
@@ -67,3 +69,7 @@ Expected output root:
 
 Inspect `debug_overlay`, `edge_type`, `continuous_mask`, `residual_raw`, and
 `residual_npse` before wiring the cache into training.
+
+In the default `GEOMETRY_CONFIRM_MODE=sr_confirmed`, a depth jump alone is not enough
+to become a red geometry edge. Depth-only jumps are marked blue and receive only a weak
+barrier, because gs2mesh-aligned depth can inherit LR-GS clutter or mesh holes.
