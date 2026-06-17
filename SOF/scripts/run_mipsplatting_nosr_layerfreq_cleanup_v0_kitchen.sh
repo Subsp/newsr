@@ -87,6 +87,29 @@ EXTERNAL_PRIOR_EXTS="${EXTERNAL_PRIOR_EXTS:-png,jpg,jpeg,webp}"
 PRIOR_CONSISTENCY_THRESHOLD="${PRIOR_CONSISTENCY_THRESHOLD:-0.20}"
 PRIOR_MIN_VALID_RATIO="${PRIOR_MIN_VALID_RATIO:-0.30}"
 
+PRIOR_EDGE_DIR="${PRIOR_EDGE_DIR:-}"
+PRIOR_EDGE_MASK_DIR="${PRIOR_EDGE_MASK_DIR:-}"
+LAMBDA_PRIOR_EDGE="${LAMBDA_PRIOR_EDGE:-0.0}"
+PRIOR_EDGE_LOSS_MODE="${PRIOR_EDGE_LOSS_MODE:-detail_v1}"
+PRIOR_EDGE_FROM_ITER="${PRIOR_EDGE_FROM_ITER:-${INPUT_ITERATION}}"
+PRIOR_EDGE_MIN_PIXELS="${PRIOR_EDGE_MIN_PIXELS:-32}"
+PRIOR_EDGE_BLEND_ALPHA="${PRIOR_EDGE_BLEND_ALPHA:-1.0}"
+PRIOR_EDGE_DETAIL_BLUR_KERNEL="${PRIOR_EDGE_DETAIL_BLUR_KERNEL:-9}"
+PRIOR_EDGE_DETAIL_ALPHA="${PRIOR_EDGE_DETAIL_ALPHA:-0.45}"
+PRIOR_EDGE_DETAIL_ALPHA_FINAL="${PRIOR_EDGE_DETAIL_ALPHA_FINAL:--1.0}"
+PRIOR_EDGE_DETAIL_WARMUP_ITERS="${PRIOR_EDGE_DETAIL_WARMUP_ITERS:-0}"
+PRIOR_EDGE_DETAIL_WEIGHT="${PRIOR_EDGE_DETAIL_WEIGHT:-1.0}"
+PRIOR_EDGE_LOWFREQ_WEIGHT="${PRIOR_EDGE_LOWFREQ_WEIGHT:-0.0}"
+PRIOR_EDGE_GRAD_WEIGHT="${PRIOR_EDGE_GRAD_WEIGHT:-0.0}"
+PRIOR_EDGE_LOWFREQ_THRESHOLD="${PRIOR_EDGE_LOWFREQ_THRESHOLD:-0.08}"
+PRIOR_EDGE_LOWFREQ_ANCHOR="${PRIOR_EDGE_LOWFREQ_ANCHOR:-render}"
+PRIOR_EDGE_DETAIL_MIN_GAIN="${PRIOR_EDGE_DETAIL_MIN_GAIN:-0.0}"
+PRIOR_EDGE_CONFIDENCE_POWER="${PRIOR_EDGE_CONFIDENCE_POWER:-1.5}"
+PRIOR_EDGE_UPDATE_SCALE="${PRIOR_EDGE_UPDATE_SCALE:-0.75}"
+PRIOR_EDGE_TOUCH_MIN_RADIUS_PX="${PRIOR_EDGE_TOUCH_MIN_RADIUS_PX:-1.0}"
+PRIOR_EDGE_TOUCH_RADIUS_SCALE="${PRIOR_EDGE_TOUCH_RADIUS_SCALE:-0.35}"
+PRIOR_EDGE_TOUCH_MAX_RADIUS_PX="${PRIOR_EDGE_TOUCH_MAX_RADIUS_PX:-8.0}"
+
 SURFACE_NORMAL_LOCK="${SURFACE_NORMAL_LOCK:-1}"
 SURFACE_NORMAL_LOCK_NORMAL_KEY="${SURFACE_NORMAL_LOCK_NORMAL_KEY:-anchor_normal}"
 SURFACE_NORMAL_LOCK_ANCHOR_KEY="${SURFACE_NORMAL_LOCK_ANCHOR_KEY:-anchor_xyz}"
@@ -151,6 +174,19 @@ echo "[nosr-layerfreq-cleanup-v0] iter schedule     : ${INPUT_ITERATION} -> ${FI
 echo "[nosr-layerfreq-cleanup-v0] layer freq        : ns=${LAMBDA_NON_SURFACE_HF} surf=${LAMBDA_SURFACE_HF_CLOSURE} start_hf=${LAMBDA_SURFACE_START_HF_PRESERVE} scale=${SURFACE_HF_UPDATE_SCALE} target=${LAYER_FREQUENCY_SURFACE_TARGET} dynamic_roots=${LAYER_FREQUENCY_DYNAMIC_ROOTS}"
 if [[ -n "${EXTERNAL_PRIOR_ROOT}" ]]; then
   echo "[nosr-layerfreq-cleanup-v0] external prior   : root=${EXTERNAL_PRIOR_ROOT} subdir=${EXTERNAL_PRIOR_SUBDIR} mask=${EXTERNAL_PRIOR_MASK_SUBDIR:-none}"
+fi
+if [[ -n "${PRIOR_EDGE_DIR}" || -n "${PRIOR_EDGE_MASK_DIR}" ]]; then
+  if [[ -z "${PRIOR_EDGE_DIR}" || -z "${PRIOR_EDGE_MASK_DIR}" ]]; then
+    echo "[nosr-layerfreq-cleanup-v0] PRIOR_EDGE_DIR and PRIOR_EDGE_MASK_DIR must be set together." >&2
+    exit 1
+  fi
+  for path in "${PRIOR_EDGE_DIR}" "${PRIOR_EDGE_MASK_DIR}"; do
+    if [[ ! -d "${path}" ]]; then
+      echo "[nosr-layerfreq-cleanup-v0] required NPSE edge prior dir not found: ${path}" >&2
+      exit 1
+    fi
+  done
+  echo "[nosr-layerfreq-cleanup-v0] prior edge      : target=${PRIOR_EDGE_DIR} mask=${PRIOR_EDGE_MASK_DIR} lambda=${LAMBDA_PRIOR_EDGE} mode=${PRIOR_EDGE_LOSS_MODE}"
 fi
 if [[ "${LAMBDA_SURFACE_START_HF_PRESERVE}" != "0" && "${LAMBDA_SURFACE_START_HF_PRESERVE}" != "0.0" ]]; then
   echo "[nosr-layerfreq-cleanup-v0] start HF preserve: checkpoint=${LAYER_FREQUENCY_START_HF_CHECKPOINT} lf_kernel=${LAYER_FREQUENCY_START_HF_LOWFREQ_KERNEL} lf_thr=${LAYER_FREQUENCY_START_HF_LOWFREQ_THRESHOLD} energy_thr=${LAYER_FREQUENCY_START_HF_ENERGY_THRESHOLD} power=${LAYER_FREQUENCY_START_HF_MASK_POWER} protect_ns=${LAYER_FREQUENCY_START_HF_PROTECT_NON_SURFACE}"
@@ -220,6 +256,32 @@ if [[ "${FORCE_RERUN}" == "1" || ! -f "${CHECKPOINT_PATH}" ]]; then
     --layer_frequency_until_iter "${LAYER_FREQUENCY_UNTIL_ITER}"
     --layer_frequency_log_interval "${LAYER_FREQUENCY_LOG_INTERVAL}"
   )
+  if [[ -n "${PRIOR_EDGE_DIR}" || -n "${PRIOR_EDGE_MASK_DIR}" ]]; then
+    TRAIN_ARGS+=(
+      --prior_edge_dir "${PRIOR_EDGE_DIR}"
+      --prior_edge_mask_dir "${PRIOR_EDGE_MASK_DIR}"
+      --lambda_prior_edge "${LAMBDA_PRIOR_EDGE}"
+      --prior_edge_loss_mode "${PRIOR_EDGE_LOSS_MODE}"
+      --prior_edge_blend_alpha "${PRIOR_EDGE_BLEND_ALPHA}"
+      --prior_edge_min_pixels "${PRIOR_EDGE_MIN_PIXELS}"
+      --prior_edge_from_iter "${PRIOR_EDGE_FROM_ITER}"
+      --prior_edge_touch_min_radius_px "${PRIOR_EDGE_TOUCH_MIN_RADIUS_PX}"
+      --prior_edge_touch_radius_scale "${PRIOR_EDGE_TOUCH_RADIUS_SCALE}"
+      --prior_edge_touch_max_radius_px "${PRIOR_EDGE_TOUCH_MAX_RADIUS_PX}"
+      --prior_edge_detail_blur_kernel "${PRIOR_EDGE_DETAIL_BLUR_KERNEL}"
+      --prior_edge_detail_alpha "${PRIOR_EDGE_DETAIL_ALPHA}"
+      --prior_edge_detail_alpha_final "${PRIOR_EDGE_DETAIL_ALPHA_FINAL}"
+      --prior_edge_detail_warmup_iters "${PRIOR_EDGE_DETAIL_WARMUP_ITERS}"
+      --prior_edge_detail_weight "${PRIOR_EDGE_DETAIL_WEIGHT}"
+      --prior_edge_lowfreq_weight "${PRIOR_EDGE_LOWFREQ_WEIGHT}"
+      --prior_edge_grad_weight "${PRIOR_EDGE_GRAD_WEIGHT}"
+      --prior_edge_lowfreq_threshold "${PRIOR_EDGE_LOWFREQ_THRESHOLD}"
+      --prior_edge_lowfreq_anchor "${PRIOR_EDGE_LOWFREQ_ANCHOR}"
+      --prior_edge_detail_min_gain "${PRIOR_EDGE_DETAIL_MIN_GAIN}"
+      --prior_edge_confidence_power "${PRIOR_EDGE_CONFIDENCE_POWER}"
+      --prior_edge_update_scale "${PRIOR_EDGE_UPDATE_SCALE}"
+    )
+  fi
   if [[ -n "${EXTERNAL_PRIOR_ROOT}" ]]; then
     TRAIN_ARGS+=(
       --external_prior_root "${EXTERNAL_PRIOR_ROOT}"
