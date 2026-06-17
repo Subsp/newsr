@@ -27,10 +27,13 @@ The cache writes:
 - `edge_depth_confirmed`: geometry edge strength after SR-structure confirmation.
 - `edge_sr`: structural edge cue from the SR prior.
 - `edge_fused`: fused edge probability used for visualization.
+- `edge_position`: the actual edge-position seed used to build the edge band.
+- `edge_band`: dilated edge-position band used by edge targets and continuous masks.
 - `edge_type`: black continuous, red SR-confirmed geometry edge, yellow appearance edge, blue uncertain edge.
 - `depth_only_uncertain`: depth-only jumps that were not confirmed by SR structure.
 - `barrier`: propagation barrier. Continuous residual diffusion should not cross strong barriers.
 - `trust_sr`: SR-prior reliability from low-frequency agreement and local residual consistency.
+- `trust_edge`: conservative edge-target injection weight.
 - `continuous_mask`: smooth-region mask where neighborhood residual diffusion is allowed.
 - `residual_raw`: signed visualization of `HP(SR) - HP(anchor)`.
 - `residual_npse`: edge-stopped neighborhood propagated residual.
@@ -73,6 +76,15 @@ Inspect `debug_overlay`, `edge_type`, `continuous_mask`, `residual_raw`, and
 In the default `GEOMETRY_CONFIRM_MODE=sr_confirmed`, a depth jump alone is not enough
 to become a red geometry edge. Depth-only jumps are marked blue and receive only a weak
 barrier, because gs2mesh-aligned depth can inherit LR-GS clutter or mesh holes.
+
+By default the kitchen wrapper uses `EDGE_POSITION_MODE=appearance`, so yellow
+SR-structure edges provide the edge locations. Red/blue remain diagnostics and
+barrier hints rather than the primary source of edge position.
+
+For fidelity-first edge targets, the wrapper defaults to `EDGE_TARGET_MODE=fidelity`
+and `EDGE_RESIDUAL_CLIP=0.08`. This keeps the anchor low-frequency image unchanged
+and injects only trust-gated high-frequency residuals inside the yellow-derived
+edge band.
 
 ## NoSR Anchor Probe
 
