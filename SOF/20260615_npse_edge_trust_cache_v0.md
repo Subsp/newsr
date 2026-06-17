@@ -33,6 +33,8 @@ The cache writes:
 - `depth_only_uncertain`: depth-only jumps that were not confirmed by SR structure.
 - `barrier`: propagation barrier. Continuous residual diffusion should not cross strong barriers.
 - `trust_sr`: SR-prior reliability from low-frequency agreement and local residual consistency.
+- `trust_edge_raw`: edge-target weight before optional direction gating.
+- `edge_direction_gate`: optional non-oracle gate from anchor/SR/residual gradient-direction agreement.
 - `trust_edge`: conservative edge-target injection weight.
 - `continuous_mask`: smooth-region mask where neighborhood residual diffusion is allowed.
 - `residual_raw`: signed visualization of `HP(SR) - HP(anchor)`.
@@ -85,6 +87,20 @@ For fidelity-first edge targets, the wrapper defaults to `EDGE_TARGET_MODE=fidel
 and `EDGE_RESIDUAL_CLIP=0.08`. This keeps the anchor low-frequency image unchanged
 and injects only trust-gated high-frequency residuals inside the yellow-derived
 edge band.
+
+The direction-gated probe is enabled explicitly, so the original yellow-fidelity
+cache remains reproducible:
+
+```bash
+DEPTH_PRIOR_DIR=/root/autodl-tmp/kitchen/_hrgsrefiner_assets/depth_prior_aligned_gs2mesh/render_x1_depthprior_images_2_train_gs2mesh_aligned_v0/aligned_depth \
+OUTPUT_NAME=render_x1_restormer_depthprior_npse_yellow_fidelity_dirgate_v0 \
+EDGE_TARGET_DIRECTION_GATE=anchor_sr_residual_gradient \
+OVERWRITE=1 \
+bash scripts/run_build_npse_edge_trust_cache_v0_kitchen.sh
+```
+
+This does not use GT. GT high-frequency alignment is only an offline diagnostic
+for deciding whether the gate is worth training with.
 
 ## NoSR Anchor Probe
 

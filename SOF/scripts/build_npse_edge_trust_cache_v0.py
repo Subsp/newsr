@@ -130,6 +130,46 @@ def _parse_args() -> argparse.Namespace:
         default=0.05,
         help="Drop very weak edge-target weights in fidelity mode.",
     )
+    parser.add_argument(
+        "--edge_target_direction_gate",
+        choices=("none", "anchor_sr_gradient", "anchor_sr_residual_gradient"),
+        default="none",
+        help=(
+            "Optional non-oracle direction gate for fidelity edge targets. "
+            "anchor_sr_gradient keeps SR edges whose gradient direction agrees with the anchor. "
+            "anchor_sr_residual_gradient also checks the injected residual gradient."
+        ),
+    )
+    parser.add_argument(
+        "--edge_target_direction_min_cos",
+        type=float,
+        default=0.0,
+        help="Cosine threshold used by the edge-target direction gate.",
+    )
+    parser.add_argument(
+        "--edge_target_direction_floor",
+        type=float,
+        default=0.20,
+        help="Minimum multiplier for enabled direction gates; keeps the gate conservative.",
+    )
+    parser.add_argument(
+        "--edge_target_direction_power",
+        type=float,
+        default=1.0,
+        help="Power applied to the direction gate before floor blending.",
+    )
+    parser.add_argument(
+        "--edge_target_residual_direction_weight",
+        type=float,
+        default=0.50,
+        help="Residual-gradient contribution for anchor_sr_residual_gradient mode.",
+    )
+    parser.add_argument(
+        "--edge_target_direction_blur",
+        type=int,
+        default=3,
+        help="Optional box blur kernel for smoothing the direction gate.",
+    )
     parser.add_argument("--edge_residual_clip", type=float, default=0.08)
     parser.add_argument("--residual_vis_scale", type=float, default=4.0)
     parser.add_argument("--limit", type=int, default=0)
@@ -463,6 +503,76 @@ def _gradient_magnitude(x: np.ndarray) -> np.ndarray:
     return np.sqrt(gx * gx + gy * gy).astype(np.float32)
 
 
+def _gradient_xy(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    x = x.astype(np.float32)
+    gx = np.zeros_like(x, dtype=np.float32)
+    gy = np.zeros_like(x, dtype=np.float32)
+    gx[:, 1:-1] = 0.5 * (x[:, 2:] - x[:, :-2])
+    gx[:, 0] = x[:, 1] - x[:, 0]
+    gx[:, -1] = x[:, -1] - x[:, -2]
+    gy[1:-1, :] = 0.5 * (x[2:, :] - x[:-2, :])
+    gy[0, :] = x[1, :] - x[0, :]
+    gy[-1, :] = x[-1, :] - x[-2, :]
+    return gx.astype(np.float32), gy.astype(np.float32)
+
+
+def _gradient_direction_gate(
+    gx_a: np.ndarray,
+    gy_a: np.ndarray,
+    gx_b: np.ndarray,
+    gy_b: np.ndarray,
+    *,
+    min_cos: float,
+) -> np.ndarray:
+    mag_a = np.sqrt(gx_a * gx_a + gy_a * gy_a)
+    mag_b = np.sqrt(gx_b * gx_b + gy_b * gy_b)
+    cos = (gx_a * gx_b + gy_a * gy_b) / np.maximum(mag_a * mag_b, 1e-8)
+    lo = min(max(float(min_cos), -1.0), 0.999)
+    gate = np.clip((cos - lo) / max(1.0 - lo, 1e-6), 0.0, 1.0)
+    strength = np.minimum(
+        _normalize_by_percentile(mag_a, 90.0),
+        _normalize_by_percentile(mag_b, 90.0),
+    )
+    return np.clip(gate * strength, 0.0, 1.0).astype(np.float32)
+
+
+def _compute_edge_direction_gate(
+    anchor: np.ndarray,
+    sr: np.ndarray,
+    residual_raw: np.ndarray,
+    args: argparse.Namespace,
+) -> np.ndarray:
+    mode = str(args.edge_target_direction_gate)
+    h, w = anchor.shape[:2]
+    if mode == "none":
+        return np.ones((h, w), dtype=np.float32)
+
+    min_cos = float(args.edge_target_direction_min_cos)
+    anchor_luma = _luma(anchor)
+    sr_luma = _luma(sr)
+    residual_luma = _luma(residual_raw)
+    agx, agy = _gradient_xy(anchor_luma)
+    sgx, sgy = _gradient_xy(sr_luma)
+    rgx, rgy = _gradient_xy(residual_luma)
+
+    anchor_sr_gate = _gradient_direction_gate(agx, agy, sgx, sgy, min_cos=min_cos)
+    gate = anchor_sr_gate
+    if mode == "anchor_sr_residual_gradient":
+        residual_sr_gate = _gradient_direction_gate(rgx, rgy, sgx, sgy, min_cos=min_cos)
+        residual_weight = np.clip(float(args.edge_target_residual_direction_weight), 0.0, 1.0)
+        gate = anchor_sr_gate * ((1.0 - residual_weight) + residual_weight * residual_sr_gate)
+
+    blur_kernel = int(args.edge_target_direction_blur)
+    if blur_kernel > 1:
+        gate = _box_blur(gate, blur_kernel)
+    power = max(float(args.edge_target_direction_power), 0.0)
+    if power != 1.0:
+        gate = np.clip(gate, 0.0, 1.0) ** power
+    floor = np.clip(float(args.edge_target_direction_floor), 0.0, 1.0)
+    gate = floor + (1.0 - floor) * np.clip(gate, 0.0, 1.0)
+    return gate.astype(np.float32, copy=False)
+
+
 def _normalize_by_percentile(x: np.ndarray, percentile: float) -> np.ndarray:
     vals = x[np.isfinite(x)]
     vals = vals[vals > 1e-8]
@@ -669,6 +779,15 @@ def _process_frame(
         ).astype(np.float32, copy=False)
     else:
         trust_edge = edge_fused * edge_band
+    trust_edge_raw = trust_edge.astype(np.float32, copy=True)
+    edge_direction_gate = _compute_edge_direction_gate(anchor, sr, residual_raw, args)
+    if str(args.edge_target_direction_gate) != "none":
+        trust_edge = (trust_edge * edge_direction_gate).astype(np.float32, copy=False)
+        trust_edge = np.where(
+            trust_edge >= float(args.edge_target_min_weight),
+            trust_edge,
+            np.zeros_like(trust_edge, dtype=np.float32),
+        ).astype(np.float32, copy=False)
     edge_residual = np.clip(
         residual_raw,
         -float(args.edge_residual_clip),
@@ -685,6 +804,8 @@ def _process_frame(
     _save_gray01(dirs["depth_only_uncertain"] / f"{stem}.png", depth_only_uncertain.astype(np.float32))
     _save_gray01(dirs["barrier"] / f"{stem}.png", barrier)
     _save_gray01(dirs["trust_sr"] / f"{stem}.png", trust_sr)
+    _save_gray01(dirs["trust_edge_raw"] / f"{stem}.png", trust_edge_raw)
+    _save_gray01(dirs["edge_direction_gate"] / f"{stem}.png", edge_direction_gate)
     _save_gray01(dirs["trust_edge"] / f"{stem}.png", trust_edge)
     _save_gray01(dirs["continuous_mask"] / f"{stem}.png", continuous_mask)
     _save_rgb01(dirs["edge_type"] / f"{stem}.png", _edge_type_rgb(edge_type))
@@ -715,6 +836,8 @@ def _process_frame(
         depth_only_uncertain=depth_only_uncertain.astype(np.uint8),
         barrier=barrier.astype(np.float16),
         trust_sr=trust_sr.astype(np.float16),
+        trust_edge_raw=trust_edge_raw.astype(np.float16),
+        edge_direction_gate=edge_direction_gate.astype(np.float16),
         trust_edge=trust_edge.astype(np.float16),
         continuous_mask=continuous_mask.astype(np.float16),
         edge_band=edge_band.astype(np.float16),
@@ -732,6 +855,8 @@ def _process_frame(
         "edge_sr_mean": float(edge_sr.mean()),
         "edge_fused_mean": float(edge_fused.mean()),
         "trust_sr_mean": float(trust_sr.mean()),
+        "trust_edge_raw_mean": float(trust_edge_raw.mean()),
+        "edge_direction_gate_mean": float(edge_direction_gate.mean()),
         "trust_edge_mean": float(trust_edge.mean()),
         "continuous_ratio": float(continuous_mask.mean()),
         "edge_position_ratio": float(edge_seed.mean()),
@@ -779,6 +904,8 @@ def main() -> None:
             "edge_type",
             "barrier",
             "trust_sr",
+            "trust_edge_raw",
+            "edge_direction_gate",
             "trust_edge",
             "continuous_mask",
             "residual_raw",
@@ -835,6 +962,12 @@ def main() -> None:
         "edge_target_mode": str(args.edge_target_mode),
         "edge_target_trust_power": float(args.edge_target_trust_power),
         "edge_target_min_weight": float(args.edge_target_min_weight),
+        "edge_target_direction_gate": str(args.edge_target_direction_gate),
+        "edge_target_direction_min_cos": float(args.edge_target_direction_min_cos),
+        "edge_target_direction_floor": float(args.edge_target_direction_floor),
+        "edge_target_direction_power": float(args.edge_target_direction_power),
+        "edge_target_residual_direction_weight": float(args.edge_target_residual_direction_weight),
+        "edge_target_direction_blur": int(args.edge_target_direction_blur),
         "edge_residual_clip": float(args.edge_residual_clip),
         "match_summary": match_summary,
         "num_requested": len(triples),
@@ -842,6 +975,8 @@ def main() -> None:
         "frames": frames,
         "summary_stats": {
             "trust_sr_mean": None if not frames else float(np.mean([f["trust_sr_mean"] for f in frames])),
+            "trust_edge_raw_mean": None if not frames else float(np.mean([f["trust_edge_raw_mean"] for f in frames])),
+            "edge_direction_gate_mean": None if not frames else float(np.mean([f["edge_direction_gate_mean"] for f in frames])),
             "trust_edge_mean": None if not frames else float(np.mean([f["trust_edge_mean"] for f in frames])),
             "continuous_ratio_mean": None if not frames else float(np.mean([f["continuous_ratio"] for f in frames])),
             "edge_position_ratio_mean": None if not frames else float(np.mean([f["edge_position_ratio"] for f in frames])),
