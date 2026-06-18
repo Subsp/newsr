@@ -36,7 +36,7 @@ from utils.general_utils import build_rotation, safe_state
 from utils.image_utils import psnr
 from utils.loss_utils import l1_loss, ssim
 from utils.camera_utils import loadCam
-from utils.sh_utils import RGB2SH
+from utils.sh_utils import C0, RGB2SH
 
 from hybrid_sdfgs.losses import (
     linearized_signed_distance,
@@ -2222,6 +2222,10 @@ def compute_prior_local_surface_neighborhood_loss(
     continuous_touch_mask,
     surface_payload,
     *,
+    viewpoint_cam=None,
+    render_image=None,
+    prior_image=None,
+    prior_mask=None,
     surface_mask=None,
     edge_touch_mask=None,
     update_mask=None,
@@ -2235,6 +2239,10 @@ def compute_prior_local_surface_neighborhood_loss(
     scale_weight: float = 0.02,
     thin_weight: float = 0.05,
     thin_ratio: float = 0.35,
+    residual_weight: float = 0.0,
+    residual_clip: float = 0.03,
+    residual_confidence_power: float = 1.0,
+    residual_min_weight: float = 0.05,
 ):
     metrics = {}
     if continuous_touch_mask is None or surface_payload is None:
@@ -2278,6 +2286,60 @@ def compute_prior_local_surface_neighborhood_loss(
     max_samples = max(int(max_samples), int(min_gaussians))
     if int(ids.numel()) > max_samples:
         ids = ids[torch.randperm(int(ids.numel()), device=device)[:max_samples]]
+
+    residual_sh = None
+    residual_confidence = None
+    if (
+        float(residual_weight) > 0.0
+        and viewpoint_cam is not None
+        and render_image is not None
+        and prior_image is not None
+        and prior_mask is not None
+    ):
+        mask_hw = prior_mask
+        if mask_hw.ndim == 3 and mask_hw.shape[0] == 1:
+            mask_hw = mask_hw[0]
+        if mask_hw.ndim != 2:
+            raise ValueError(f"prior local surface mask must be [H,W] or [1,H,W], got {tuple(prior_mask.shape)}")
+        mask_hw = mask_hw.to(device=device, dtype=torch.float32)
+        R = torch.as_tensor(viewpoint_cam.R, device=device, dtype=torch.float32)
+        T = torch.as_tensor(viewpoint_cam.T, device=device, dtype=torch.float32)
+        xyz = gaussians.get_xyz.detach()[ids].to(dtype=torch.float32)
+        xyz_cam = xyz @ R + T.unsqueeze(0)
+        z = xyz_cam[:, 2]
+        x = xyz_cam[:, 0] / torch.clamp_min(z, 1e-6) * float(viewpoint_cam.focal_x) + float(viewpoint_cam.image_width) / 2.0
+        y = xyz_cam[:, 1] / torch.clamp_min(z, 1e-6) * float(viewpoint_cam.focal_y) + float(viewpoint_cam.image_height) / 2.0
+        xi = torch.round(x).to(dtype=torch.int64)
+        yi = torch.round(y).to(dtype=torch.int64)
+        valid_projected = (
+            (z > 1e-6)
+            & (xi >= 0)
+            & (xi < int(viewpoint_cam.image_width))
+            & (yi >= 0)
+            & (yi < int(viewpoint_cam.image_height))
+        )
+        if torch.any(valid_projected):
+            ids = ids[valid_projected]
+            xi = xi[valid_projected]
+            yi = yi[valid_projected]
+            pixel_conf = mask_hw[yi, xi].clamp(0.0, 1.0)
+            if float(residual_confidence_power) != 1.0:
+                pixel_conf = pixel_conf.pow(max(float(residual_confidence_power), 0.0))
+            valid_conf = pixel_conf >= float(residual_min_weight)
+            if torch.any(valid_conf):
+                ids = ids[valid_conf]
+                xi = xi[valid_conf]
+                yi = yi[valid_conf]
+                pixel_conf = pixel_conf[valid_conf]
+                residual_rgb = (
+                    prior_image.detach().to(device=device, dtype=torch.float32)[:, yi, xi]
+                    - render_image.detach().to(device=device, dtype=torch.float32)[:, yi, xi]
+                ).transpose(0, 1)
+                residual_rgb = residual_rgb.clamp(min=-float(residual_clip), max=float(residual_clip))
+                residual_sh = residual_rgb / float(C0)
+                residual_confidence = pixel_conf
+        metrics["local_surface_residual_samples"] = 0.0 if residual_sh is None else float(int(ids.numel()))
+
     sample_count = int(ids.numel())
     metrics["local_surface_sampled"] = float(sample_count)
     if sample_count < max(int(min_gaussians), 2):
@@ -2328,6 +2390,29 @@ def compute_prior_local_surface_neighborhood_loss(
         return (pair * weights).sum() / active_weight.clamp_min(1e-8)
 
     total_loss = None
+    if residual_sh is not None and residual_confidence is not None and float(residual_weight) > 0.0:
+        neighbor_conf = residual_confidence[nn_pos]
+        transport_weights = weights * neighbor_conf
+        denom = residual_confidence + transport_weights.sum(dim=1)
+        valid_transport = denom > 0.0
+        if torch.any(valid_transport):
+            transported_delta = (
+                residual_sh * residual_confidence[:, None]
+                + (residual_sh[nn_pos] * transport_weights[..., None]).sum(dim=1)
+            ) / denom.clamp_min(1e-8)[:, None]
+            dc = gaussians._features_dc.reshape(total, -1)[ids]
+            target_dc = dc.detach() + transported_delta.detach()
+            residual_l1 = torch.abs(dc - target_dc).mean(dim=1)
+            residual_loss = (
+                residual_l1[valid_transport] * residual_confidence[valid_transport]
+            ).sum() / residual_confidence[valid_transport].sum().clamp_min(1e-8)
+            total_loss = float(residual_weight) * residual_loss
+            metrics["local_surface_residual"] = float(residual_loss.detach().item())
+            metrics["local_surface_residual_abs"] = float(
+                residual_sh.detach().abs().mean().mul(float(C0)).item()
+            )
+            metrics["local_surface_residual_conf"] = float(residual_confidence.detach().mean().item())
+
     if float(color_weight) > 0.0:
         color = gaussians._features_dc.reshape(total, -1)[ids]
         color_loss = _pair_l1(color)
@@ -7027,6 +7112,10 @@ def training(
                     gaussians,
                     continuous_touch_mask,
                     prior_local_surface_payload,
+                    viewpoint_cam=camera_for_sof_prior,
+                    render_image=render_for_sof_prior,
+                    prior_image=local_prior_image,
+                    prior_mask=local_prior_mask,
                     surface_mask=local_surface_mask,
                     edge_touch_mask=edge_touch_mask_for_local_surface,
                     update_mask=local_surface_update_mask,
@@ -7040,6 +7129,10 @@ def training(
                     scale_weight=float(hybrid_args.prior_local_surface_scale_weight),
                     thin_weight=float(hybrid_args.prior_local_surface_thin_weight),
                     thin_ratio=float(hybrid_args.prior_local_surface_thin_ratio),
+                    residual_weight=float(hybrid_args.prior_local_surface_residual_weight),
+                    residual_clip=float(hybrid_args.prior_local_surface_residual_clip),
+                    residual_confidence_power=float(hybrid_args.prior_local_surface_residual_confidence_power),
+                    residual_min_weight=float(hybrid_args.prior_local_surface_residual_min_weight),
                 )
                 prior_metrics.update(local_surface_metrics)
                 if loss_local_surface is not None:
@@ -7783,6 +7876,8 @@ def training(
                     prior_parts.append(f"l3d_count={int(prior_metrics['local_surface_count'])}")
                 if "local_surface_pairs" in prior_metrics:
                     prior_parts.append(f"l3d_pairs={int(prior_metrics['local_surface_pairs'])}")
+                if "local_surface_residual" in prior_metrics:
+                    prior_parts.append(f"l3d_res={prior_metrics['local_surface_residual']:.6f}")
                 if "sof_edge" in prior_metrics:
                     prior_parts.append(f"edge={prior_metrics['sof_edge']:.6f}")
                 if "sof_edge_alpha" in prior_metrics:
@@ -8288,6 +8383,10 @@ def training_report(
                 "local_surface_radius",
                 "local_surface_normal_cos",
                 "local_surface_color",
+                "local_surface_residual",
+                "local_surface_residual_abs",
+                "local_surface_residual_conf",
+                "local_surface_residual_samples",
                 "local_surface_opacity",
                 "local_surface_scale",
                 "local_surface_thin",
@@ -8751,6 +8850,10 @@ def make_parser():
     parser.add_argument("--prior_local_surface_scale_weight", type=float, default=0.02)
     parser.add_argument("--prior_local_surface_thin_weight", type=float, default=0.05)
     parser.add_argument("--prior_local_surface_thin_ratio", type=float, default=0.35)
+    parser.add_argument("--prior_local_surface_residual_weight", type=float, default=0.0)
+    parser.add_argument("--prior_local_surface_residual_clip", type=float, default=0.03)
+    parser.add_argument("--prior_local_surface_residual_confidence_power", type=float, default=1.0)
+    parser.add_argument("--prior_local_surface_residual_min_weight", type=float, default=0.05)
     parser.add_argument("--prior_local_surface_touch_min_radius_px", type=float, default=1.0)
     parser.add_argument("--prior_local_surface_touch_radius_scale", type=float, default=0.35)
     parser.add_argument("--prior_local_surface_touch_max_radius_px", type=float, default=8.0)
