@@ -1015,6 +1015,7 @@ class GaussianModel:
         protect_source_tag=None,
         protect_recent_iters: int = 0,
         current_iteration: int = 0,
+        prune_enabled: bool = True,
     ):
         candidate_mask = self._normalize_candidate_mask(candidate_mask, label="densify prune candidate mask")
         grads = self.xyz_gradient_accum / self.denom
@@ -1045,21 +1046,22 @@ class GaussianModel:
         )
         split = self._xyz.shape[0]
 
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
-        if max_screen_size:
-            big_points_vs = self.max_radii2D > max_screen_size
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
-            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
-        if candidate_mask is not None:
-            prune_mask = torch.logical_and(prune_mask, candidate_mask)
-        if protect_source_tag is not None and int(protect_recent_iters) > 0:
-            protect_mask = self._source_tag == int(protect_source_tag)
-            protect_mask = protect_mask & (self._edge_touch_iter >= 0)
-            protect_mask = protect_mask & (
-                (int(current_iteration) - self._edge_touch_iter) < int(protect_recent_iters)
-            )
-            prune_mask = torch.logical_and(prune_mask, ~protect_mask)
-        self.prune_points(prune_mask)
+        if bool(prune_enabled):
+            prune_mask = (self.get_opacity < min_opacity).squeeze()
+            if max_screen_size:
+                big_points_vs = self.max_radii2D > max_screen_size
+                big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+                prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+            if candidate_mask is not None:
+                prune_mask = torch.logical_and(prune_mask, candidate_mask)
+            if protect_source_tag is not None and int(protect_recent_iters) > 0:
+                protect_mask = self._source_tag == int(protect_source_tag)
+                protect_mask = protect_mask & (self._edge_touch_iter >= 0)
+                protect_mask = protect_mask & (
+                    (int(current_iteration) - self._edge_touch_iter) < int(protect_recent_iters)
+                )
+                prune_mask = torch.logical_and(prune_mask, ~protect_mask)
+            self.prune_points(prune_mask)
         prune = self._xyz.shape[0]
         # torch.cuda.empty_cache()
         return clone - before, split - clone, split - prune

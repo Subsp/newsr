@@ -222,6 +222,8 @@ DENSIFY_FROM_ITER="${DENSIFY_FROM_ITER:-999999999}"
 DENSIFY_UNTIL_ITER="${DENSIFY_UNTIL_ITER:-0}"
 DENSIFICATION_INTERVAL="${DENSIFICATION_INTERVAL:-1000000}"
 DENSIFY_GRAD_THRESHOLD="${DENSIFY_GRAD_THRESHOLD:-0.0002}"
+DENSIFY_MIN_OPACITY="${DENSIFY_MIN_OPACITY:-0.005}"
+DENSIFY_GLOBAL_PRUNE_ENABLE="${DENSIFY_GLOBAL_PRUNE_ENABLE:-1}"
 OPACITY_RESET_INTERVAL="${OPACITY_RESET_INTERVAL:-1000000}"
 
 CHECKPOINT_PATH="${MODEL_DIR}/chkpnt${FINAL_ITER}.pth"
@@ -324,7 +326,7 @@ fi
 if [[ "${LAMBDA_SURFACE_START_HF_PRESERVE}" != "0" && "${LAMBDA_SURFACE_START_HF_PRESERVE}" != "0.0" ]]; then
   echo "[nosr-layerfreq-cleanup-v0] start HF preserve: checkpoint=${LAYER_FREQUENCY_START_HF_CHECKPOINT} lf_kernel=${LAYER_FREQUENCY_START_HF_LOWFREQ_KERNEL} lf_thr=${LAYER_FREQUENCY_START_HF_LOWFREQ_THRESHOLD} energy_thr=${LAYER_FREQUENCY_START_HF_ENERGY_THRESHOLD} power=${LAYER_FREQUENCY_START_HF_MASK_POWER} protect_ns=${LAYER_FREQUENCY_START_HF_PROTECT_NON_SURFACE}"
 fi
-echo "[nosr-layerfreq-cleanup-v0] densify/prune     : from=${DENSIFY_FROM_ITER} until=${DENSIFY_UNTIL_ITER} interval=${DENSIFICATION_INTERVAL}"
+echo "[nosr-layerfreq-cleanup-v0] densify/prune     : from=${DENSIFY_FROM_ITER} until=${DENSIFY_UNTIL_ITER} interval=${DENSIFICATION_INTERVAL} grad=${DENSIFY_GRAD_THRESHOLD} min_opacity=${DENSIFY_MIN_OPACITY} global_prune=${DENSIFY_GLOBAL_PRUNE_ENABLE}"
 
 echo
 echo "[1/4] build row-aligned surface-state payload for input checkpoint"
@@ -368,6 +370,8 @@ if [[ "${FORCE_RERUN}" == "1" || ! -f "${CHECKPOINT_PATH}" ]]; then
     --densify_until_iter "${DENSIFY_UNTIL_ITER}"
     --densification_interval "${DENSIFICATION_INTERVAL}"
     --densify_grad_threshold "${DENSIFY_GRAD_THRESHOLD}"
+    --densify_min_opacity "${DENSIFY_MIN_OPACITY}"
+    --densify_global_prune_enable "${DENSIFY_GLOBAL_PRUNE_ENABLE}"
     --opacity_reset_interval "${OPACITY_RESET_INTERVAL}"
     --layer_frequency_mask_payload "${SURFACE_STATE_PAYLOAD}"
     --layer_frequency_non_surface_key "${LAYER_FREQUENCY_NON_SURFACE_KEY}"

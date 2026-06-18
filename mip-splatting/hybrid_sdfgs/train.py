@@ -7957,9 +7957,9 @@ def training(
                         prior_metrics["hf_seed_densify_hold"] = 1.0
                     if not hold_prior_densify_for_seed_bootstrap:
                         size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                        gaussians.densify_and_prune(
+                        densify_clone, densify_split, densify_prune = gaussians.densify_and_prune(
                             opt.densify_grad_threshold,
-                            0.005,
+                            float(hybrid_args.densify_min_opacity),
                             scene.cameras_extent,
                             size_threshold,
                             candidate_mask=densify_candidate_mask,
@@ -7970,7 +7970,12 @@ def training(
                             ),
                             protect_recent_iters=recent_prior_protect_iters,
                             current_iteration=iteration,
+                            prune_enabled=bool(hybrid_args.densify_global_prune_enable),
                         )
+                        prior_metrics["densify_clone"] = float(densify_clone)
+                        prior_metrics["densify_split"] = float(densify_split)
+                        prior_metrics["densify_prune"] = float(densify_prune)
+                        prior_metrics["densify_net"] = float(densify_clone + densify_split - densify_prune)
                         compute_3d_filter_with_surface_filter(
                             gaussians,
                             cameras=train_cameras,
@@ -8391,6 +8396,14 @@ def training(
                         "bubble_decay="
                         f"{int(prior_metrics['bubble_cleanup_post_count'])}"
                         f"@{prior_metrics.get('bubble_cleanup_post_decay', 1.0):.2f}"
+                    )
+                if "densify_net" in prior_metrics:
+                    prior_parts.append(
+                        "densify="
+                        f"+{int(prior_metrics.get('densify_clone', 0))}/"
+                        f"+{int(prior_metrics.get('densify_split', 0))}/"
+                        f"-{int(prior_metrics.get('densify_prune', 0))}"
+                        f" net={int(prior_metrics['densify_net'])}"
                     )
                 if "hf_seed_gate_prior_pack" in prior_metrics:
                     prior_parts.append(f"seed_pack={int(prior_metrics['hf_seed_gate_prior_pack'])}")
@@ -8890,6 +8903,10 @@ def training_report(
                 "hf_lowfreq_cleanup_decay",
                 "hf_lowfreq_cleanup_opacity_after",
                 "hf_lowfreq_cleanup_pruned",
+                "densify_clone",
+                "densify_split",
+                "densify_prune",
+                "densify_net",
                 "hf_seed_unique_ids",
                 "hf_seed_clone_ratio",
                 "hf_seed_scale_geom_median",
@@ -9335,6 +9352,8 @@ def make_parser():
     parser.add_argument("--prior_edge_shape_thin_ratio", type=float, default=0.35)
     parser.add_argument("--prior_edge_shape_line_ratio", type=float, default=0.60)
     parser.add_argument("--prior_edge_shape_max_axis", type=float, default=0.0)
+    parser.add_argument("--densify_min_opacity", type=float, default=0.005)
+    parser.add_argument("--densify_global_prune_enable", type=int, default=1)
     parser.add_argument("--prior_hf_seed_enable", action="store_true")
     parser.add_argument("--prior_hf_seed_from_iter", type=int, default=0)
     parser.add_argument("--prior_hf_seed_until_iter", type=int, default=0)
