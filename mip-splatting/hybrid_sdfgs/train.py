@@ -541,6 +541,134 @@ def _gather_scalar_map_on_pixels(map_chw, pixels_xy):
     return samples[:, 0]
 
 
+def _build_ray_fan_pixel_offsets(
+    ray_count: int,
+    radius_px: float,
+    *,
+    include_center: bool,
+    device,
+    dtype,
+):
+    ray_count = max(1, int(ray_count))
+    radius_px = max(0.0, float(radius_px))
+    offsets = []
+    if bool(include_center):
+        offsets.append([0.0, 0.0])
+    if len(offsets) >= ray_count or radius_px <= 0.0:
+        return torch.tensor(offsets[:ray_count] or [[0.0, 0.0]], device=device, dtype=dtype)
+
+    remaining = ray_count - len(offsets)
+    ring = 1
+    while remaining > 0:
+        points_this_ring = min(8 * ring, remaining)
+        ring_radius = radius_px * float(ring)
+        for i in range(points_this_ring):
+            angle = (2.0 * math.pi * float(i)) / float(points_this_ring)
+            offsets.append([math.cos(angle) * ring_radius, math.sin(angle) * ring_radius])
+        remaining = ray_count - len(offsets)
+        ring += 1
+    return torch.tensor(offsets[:ray_count], device=device, dtype=dtype)
+
+
+def _expand_prior_seed_pixels_with_ray_fan(
+    prior_feature_pack,
+    pixels_xy,
+    guidance_vals,
+    *,
+    max_points: int,
+    ray_count: int,
+    radius_px: float,
+    include_center: bool,
+    guidance_min_ratio: float,
+    mask_threshold: float,
+):
+    metrics = {}
+    guidance_map = None if prior_feature_pack is None else prior_feature_pack.get("guidance")
+    if guidance_map is None or pixels_xy is None or guidance_vals is None:
+        return pixels_xy, guidance_vals, metrics
+    if int(ray_count) <= 1:
+        return pixels_xy, guidance_vals, metrics
+    if guidance_map.ndim != 3 or guidance_map.shape[0] != 1:
+        return pixels_xy, guidance_vals, metrics
+
+    device = pixels_xy.device
+    dtype = pixels_xy.dtype
+    center_count = int(pixels_xy.shape[0])
+    offsets = _build_ray_fan_pixel_offsets(
+        ray_count,
+        radius_px,
+        include_center=include_center,
+        device=device,
+        dtype=dtype,
+    )
+    expanded = pixels_xy[:, None, :] + offsets[None, :, :]
+    expanded = expanded.reshape(-1, 2)
+    center_guidance = guidance_vals.reshape(-1, 1).expand(-1, offsets.shape[0]).reshape(-1)
+
+    h = int(guidance_map.shape[1])
+    w = int(guidance_map.shape[2])
+    in_bounds = (
+        (expanded[:, 0] >= 0.0)
+        & (expanded[:, 0] <= float(w - 1))
+        & (expanded[:, 1] >= 0.0)
+        & (expanded[:, 1] <= float(h - 1))
+    )
+    if not torch.any(in_bounds):
+        metrics.update(
+            {
+                "hf_seed_ray_fan_centers": float(center_count),
+                "hf_seed_ray_fan_candidates": 0.0,
+                "hf_seed_ray_fan_kept": 0.0,
+            }
+        )
+        return pixels_xy, guidance_vals, metrics
+
+    expanded = expanded[in_bounds]
+    center_guidance = center_guidance[in_bounds]
+    sampled_guidance = _gather_scalar_map_on_pixels(guidance_map, expanded)
+    if sampled_guidance is None:
+        return pixels_xy, guidance_vals, metrics
+
+    keep = torch.isfinite(sampled_guidance) & (sampled_guidance > 0.0)
+    min_ratio = max(0.0, float(guidance_min_ratio))
+    if min_ratio > 0.0:
+        keep = keep & (sampled_guidance >= center_guidance * min_ratio)
+
+    seed_mask = prior_feature_pack.get("mask")
+    if seed_mask is not None and float(mask_threshold) > 0.0:
+        mask_values = _gather_scalar_map_on_pixels(seed_mask, expanded)
+        if mask_values is not None:
+            keep = keep & torch.isfinite(mask_values) & (mask_values >= float(mask_threshold))
+
+    if not torch.any(keep):
+        metrics.update(
+            {
+                "hf_seed_ray_fan_centers": float(center_count),
+                "hf_seed_ray_fan_candidates": float(int(expanded.shape[0])),
+                "hf_seed_ray_fan_kept": 0.0,
+            }
+        )
+        return pixels_xy, guidance_vals, metrics
+
+    expanded = expanded[keep]
+    sampled_guidance = sampled_guidance[keep]
+    if int(max_points) > 0 and int(expanded.shape[0]) > int(max_points):
+        vals, idx = torch.topk(sampled_guidance.reshape(-1), k=int(max_points), largest=True, sorted=False)
+        expanded = expanded[idx]
+        sampled_guidance = vals
+
+    metrics.update(
+        {
+            "hf_seed_ray_fan_centers": float(center_count),
+            "hf_seed_ray_fan_requested": float(int(ray_count)),
+            "hf_seed_ray_fan_candidates": float(int(in_bounds.sum().detach().item())),
+            "hf_seed_ray_fan_kept": float(int(expanded.shape[0])),
+            "hf_seed_ray_fan_multiplier": float(int(expanded.shape[0]) / max(center_count, 1)),
+        }
+    )
+    return expanded.contiguous(), sampled_guidance.contiguous(), metrics
+
+
 def _unproject_pixels_with_camera_z(camera, pixels_xy, depth_z):
     if pixels_xy is None or depth_z is None or pixels_xy.numel() == 0:
         return None
@@ -752,6 +880,12 @@ def _build_prior_residual_seed_births(
     jitter_scale,
     color_residual_gain,
     original_only,
+    ray_fan_enable=False,
+    ray_fan_rays=1,
+    ray_fan_radius_px=1.0,
+    ray_fan_include_center=True,
+    ray_fan_guidance_min_ratio=0.35,
+    ray_fan_mask_threshold=0.20,
 ):
     metrics = {
         "hf_seed_threshold": float(guidance_threshold),
@@ -776,17 +910,21 @@ def _build_prior_residual_seed_births(
             metrics["hf_seed_threshold_candidates"] = float(
                 (flat_guidance >= float(guidance_threshold)).sum().detach().item()
             )
+    ray_fan_rays_eff = max(1, int(ray_fan_rays)) if bool(ray_fan_enable) else 1
+    center_budget = int(max_points)
+    if ray_fan_rays_eff > 1:
+        center_budget = max(1, int(math.ceil(float(max_points) / float(ray_fan_rays_eff))))
     if float(guidance_threshold) > 0.0:
         pixels_xy, guidance_vals = _extract_thresholded_sr_pixels(
             guidance_map=guidance_map,
             threshold=float(guidance_threshold),
-            max_points=int(max_points),
+            max_points=int(center_budget),
         )
     else:
         min_guidance = max(float(torch.finfo(guidance_map.dtype).eps), 1e-8)
         pixels_xy, guidance_vals = _extract_2d_sr_proposals(
             guidance_map=guidance_map,
-            topk=int(max_points),
+            topk=int(center_budget),
             min_value=min_guidance,
         )
     if pixels_xy is None or guidance_vals is None or pixels_xy.shape[0] == 0:
@@ -798,6 +936,23 @@ def _build_prior_residual_seed_births(
     dtype = gaussians.get_xyz.dtype
     pixels_xy = pixels_xy.to(device=device, dtype=dtype)
     guidance_vals = guidance_vals.to(device=device, dtype=dtype).reshape(-1)
+    if ray_fan_rays_eff > 1:
+        pixels_xy, guidance_vals, ray_fan_metrics = _expand_prior_seed_pixels_with_ray_fan(
+            prior_feature_pack,
+            pixels_xy,
+            guidance_vals,
+            max_points=int(max_points),
+            ray_count=ray_fan_rays_eff,
+            radius_px=float(ray_fan_radius_px),
+            include_center=bool(ray_fan_include_center),
+            guidance_min_ratio=float(ray_fan_guidance_min_ratio),
+            mask_threshold=float(ray_fan_mask_threshold),
+        )
+        metrics.update(ray_fan_metrics)
+        if pixels_xy is None or guidance_vals is None or int(pixels_xy.shape[0]) <= 0:
+            metrics["hf_seed_empty_ray_fan"] = 1.0
+            return None, metrics
+        metrics["hf_seed_selected_pixels"] = float(int(pixels_xy.shape[0]))
 
     touched_now = None
     if hasattr(gaussians, "_edge_touched") and hasattr(gaussians, "_edge_touch_iter"):
@@ -7909,6 +8064,12 @@ def training(
                         jitter_scale=float(hybrid_args.prior_hf_seed_jitter_scale),
                         color_residual_gain=float(hybrid_args.prior_hf_seed_color_residual_gain),
                         original_only=bool(hybrid_args.prior_hf_seed_original_only),
+                        ray_fan_enable=bool(hybrid_args.prior_hf_seed_ray_fan_enable),
+                        ray_fan_rays=int(hybrid_args.prior_hf_seed_ray_fan_rays),
+                        ray_fan_radius_px=float(hybrid_args.prior_hf_seed_ray_fan_radius_px),
+                        ray_fan_include_center=bool(hybrid_args.prior_hf_seed_ray_fan_include_center),
+                        ray_fan_guidance_min_ratio=float(hybrid_args.prior_hf_seed_ray_fan_guidance_min_ratio),
+                        ray_fan_mask_threshold=float(hybrid_args.prior_hf_seed_ray_fan_mask_threshold),
                     )
                     if seed_metrics:
                         prior_metrics.update(seed_metrics)
@@ -8141,6 +8302,10 @@ def training(
                     prior_parts.append(f"seed_px={int(prior_metrics['hf_seed_threshold_candidates'])}")
                 if "hf_seed_selected_pixels" in prior_metrics:
                     prior_parts.append(f"seed_sel={int(prior_metrics['hf_seed_selected_pixels'])}")
+                if "hf_seed_ray_fan_multiplier" in prior_metrics:
+                    prior_parts.append(f"fan={prior_metrics['hf_seed_ray_fan_multiplier']:.2f}")
+                if "hf_seed_ray_fan_kept" in prior_metrics:
+                    prior_parts.append(f"fan_keep={int(prior_metrics['hf_seed_ray_fan_kept'])}")
                 if "hf_seed_render_depth_ratio" in prior_metrics:
                     prior_parts.append(f"seed_zr={prior_metrics['hf_seed_render_depth_ratio']:.2f}")
                 if "hf_seed_provider_dist_mean" in prior_metrics:
@@ -8686,6 +8851,11 @@ def training_report(
                 "hf_seed_shape_orient_conf_mean",
                 "hf_seed_shape_orient_conf_p90",
                 "hf_seed_shape_mode_id",
+                "hf_seed_ray_fan_centers",
+                "hf_seed_ray_fan_requested",
+                "hf_seed_ray_fan_candidates",
+                "hf_seed_ray_fan_kept",
+                "hf_seed_ray_fan_multiplier",
                 "hf_recent_imprint",
                 "hf_recent_imprint_count",
                 "hf_recent_imprint_visible",
@@ -9182,6 +9352,12 @@ def make_parser():
     parser.add_argument("--prior_hf_seed_jitter_scale", type=float, default=0.15)
     parser.add_argument("--prior_hf_seed_color_residual_gain", type=float, default=1.0)
     parser.add_argument("--prior_hf_seed_guidance_threshold", type=float, default=0.0)
+    parser.add_argument("--prior_hf_seed_ray_fan_enable", action="store_true")
+    parser.add_argument("--prior_hf_seed_ray_fan_rays", type=int, default=1)
+    parser.add_argument("--prior_hf_seed_ray_fan_radius_px", type=float, default=1.0)
+    parser.add_argument("--prior_hf_seed_ray_fan_include_center", type=int, default=1)
+    parser.add_argument("--prior_hf_seed_ray_fan_guidance_min_ratio", type=float, default=0.35)
+    parser.add_argument("--prior_hf_seed_ray_fan_mask_threshold", type=float, default=0.20)
     parser.add_argument("--prior_hf_seed_first_cycle_only", action="store_true")
     parser.add_argument("--prior_hf_seed_original_only", action="store_true")
     parser.add_argument("--prior_hf_seed_prune_protect_iters", type=int, default=0)
