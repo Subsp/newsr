@@ -233,6 +233,35 @@ DENSIFY_MIN_OPACITY="${DENSIFY_MIN_OPACITY:-0.005}"
 DENSIFY_GLOBAL_PRUNE_ENABLE="${DENSIFY_GLOBAL_PRUNE_ENABLE:-1}"
 OPACITY_RESET_INTERVAL="${OPACITY_RESET_INTERVAL:-1000000}"
 
+is_nonzero() {
+  case "${1:-0}" in
+    ""|0|0.0|0.00|0.000|0.0000|0.00000|0.000000)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+NEED_LAYER_FREQUENCY=0
+if is_nonzero "${LAMBDA_NON_SURFACE_HF}" \
+  || is_nonzero "${LAMBDA_NON_SURFACE_RGB_ENERGY}" \
+  || is_nonzero "${LAMBDA_NON_SURFACE_ALPHA_HF}" \
+  || is_nonzero "${LAMBDA_NON_SURFACE_ALPHA_MASS}" \
+  || is_nonzero "${LAMBDA_SURFACE_HF_CLOSURE}" \
+  || is_nonzero "${LAMBDA_SURFACE_START_HF_PRESERVE}"; then
+  NEED_LAYER_FREQUENCY=1
+fi
+NEED_LOCAL_SURFACE=0
+if is_nonzero "${LAMBDA_PRIOR_LOCAL_SURFACE}"; then
+  NEED_LOCAL_SURFACE=1
+fi
+NEED_SURFACE_STATE=0
+if [[ "${NEED_LAYER_FREQUENCY}" == "1" || "${SURFACE_NORMAL_LOCK}" == "1" || "${NEED_LOCAL_SURFACE}" == "1" ]]; then
+  NEED_SURFACE_STATE=1
+fi
+
 CHECKPOINT_PATH="${MODEL_DIR}/chkpnt${FINAL_ITER}.pth"
 RESULTS_JSON="${MODEL_DIR}/results_psnr_ssim.json"
 COMPARE_JSON="${COMPARE_JSON:-${MODEL_DIR}/nosr_cleanup_compare_vs_input.json}"
@@ -279,7 +308,11 @@ echo "[nosr-layerfreq-cleanup-v0] start checkpoint  : ${START_CHECKPOINT}"
 echo "[nosr-layerfreq-cleanup-v0] input ply         : ${INPUT_POINT_CLOUD_PLY}"
 echo "[nosr-layerfreq-cleanup-v0] surface mesh      : ${MESH_PATH}"
 echo "[nosr-layerfreq-cleanup-v0] surface profile   : ${SURFACE_STATE_PROFILE}"
-echo "[nosr-layerfreq-cleanup-v0] surface payload   : ${SURFACE_STATE_PAYLOAD}"
+if [[ "${NEED_SURFACE_STATE}" == "1" ]]; then
+  echo "[nosr-layerfreq-cleanup-v0] surface payload   : ${SURFACE_STATE_PAYLOAD}"
+else
+  echo "[nosr-layerfreq-cleanup-v0] surface payload   : skipped (no layerfreq/local-surface/normal-lock consumer)"
+fi
 echo "[nosr-layerfreq-cleanup-v0] train target      : ${TRAIN_IMAGES_SUBDIR}"
 echo "[nosr-layerfreq-cleanup-v0] output model      : ${MODEL_DIR}"
 echo "[nosr-layerfreq-cleanup-v0] iter schedule     : ${INPUT_ITERATION} -> ${FINAL_ITER}"
@@ -346,7 +379,9 @@ echo "[nosr-layerfreq-cleanup-v0] densify/prune     : from=${DENSIFY_FROM_ITER} 
 
 echo
 echo "[1/4] build row-aligned surface-state payload for input checkpoint"
-if [[ "${FORCE_REBUILD_SURFACE_STATE}" == "1" || ! -f "${SURFACE_STATE_PAYLOAD}" ]]; then
+if [[ "${NEED_SURFACE_STATE}" != "1" ]]; then
+  echo "[nosr-layerfreq-cleanup-v0] skip surface-state payload build"
+elif [[ "${FORCE_REBUILD_SURFACE_STATE}" == "1" || ! -f "${SURFACE_STATE_PAYLOAD}" ]]; then
   (
     cd "${SOF_ROOT}"
     PYTHON_BIN="${PYTHON_BIN}" \
@@ -360,7 +395,7 @@ else
   echo "[nosr-layerfreq-cleanup-v0] reuse surface-state payload: ${SURFACE_STATE_PAYLOAD}"
 fi
 
-if [[ ! -f "${SURFACE_STATE_PAYLOAD}" ]]; then
+if [[ "${NEED_SURFACE_STATE}" == "1" && ! -f "${SURFACE_STATE_PAYLOAD}" ]]; then
   echo "[nosr-layerfreq-cleanup-v0] surface-state payload was not created: ${SURFACE_STATE_PAYLOAD}" >&2
   exit 1
 fi
@@ -390,30 +425,34 @@ if [[ "${FORCE_RERUN}" == "1" || ! -f "${CHECKPOINT_PATH}" ]]; then
     --densify_global_prune_enable "${DENSIFY_GLOBAL_PRUNE_ENABLE}"
     --opacity_reset_interval "${OPACITY_RESET_INTERVAL}"
     --optimize_source_tag "${OPTIMIZE_SOURCE_TAG}"
-    --layer_frequency_mask_payload "${SURFACE_STATE_PAYLOAD}"
-    --layer_frequency_non_surface_key "${LAYER_FREQUENCY_NON_SURFACE_KEY}"
-    --layer_frequency_surface_key "${LAYER_FREQUENCY_SURFACE_KEY}"
-    --layer_frequency_surface_target "${LAYER_FREQUENCY_SURFACE_TARGET}"
-    --lambda_non_surface_hf "${LAMBDA_NON_SURFACE_HF}"
-    --lambda_non_surface_rgb_energy "${LAMBDA_NON_SURFACE_RGB_ENERGY}"
-    --lambda_non_surface_alpha_hf "${LAMBDA_NON_SURFACE_ALPHA_HF}"
-    --lambda_non_surface_alpha_mass "${LAMBDA_NON_SURFACE_ALPHA_MASS}"
-    --lambda_surface_hf_closure "${LAMBDA_SURFACE_HF_CLOSURE}"
-    --lambda_surface_start_hf_preserve "${LAMBDA_SURFACE_START_HF_PRESERVE}"
-    --layer_frequency_start_hf_checkpoint "${LAYER_FREQUENCY_START_HF_CHECKPOINT}"
-    --layer_frequency_start_hf_lowfreq_kernel "${LAYER_FREQUENCY_START_HF_LOWFREQ_KERNEL}"
-    --layer_frequency_start_hf_lowfreq_threshold "${LAYER_FREQUENCY_START_HF_LOWFREQ_THRESHOLD}"
-    --layer_frequency_start_hf_energy_threshold "${LAYER_FREQUENCY_START_HF_ENERGY_THRESHOLD}"
-    --layer_frequency_start_hf_mask_power "${LAYER_FREQUENCY_START_HF_MASK_POWER}"
-    --surface_hf_update_scale "${SURFACE_HF_UPDATE_SCALE}"
-    --layer_frequency_from_iter "${LAYER_FREQUENCY_FROM_ITER}"
-    --layer_frequency_until_iter "${LAYER_FREQUENCY_UNTIL_ITER}"
-    --layer_frequency_log_interval "${LAYER_FREQUENCY_LOG_INTERVAL}"
     --prior_loss_mode "${PRIOR_LOSS_MODE}"
     --prior_l1_weight "${PRIOR_L1_WEIGHT}"
     --prior_hf_weight "${PRIOR_HF_WEIGHT}"
     --prior_delta_clip "${PRIOR_DELTA_CLIP}"
   )
+  if [[ "${NEED_LAYER_FREQUENCY}" == "1" ]]; then
+    TRAIN_ARGS+=(
+      --layer_frequency_mask_payload "${SURFACE_STATE_PAYLOAD}"
+      --layer_frequency_non_surface_key "${LAYER_FREQUENCY_NON_SURFACE_KEY}"
+      --layer_frequency_surface_key "${LAYER_FREQUENCY_SURFACE_KEY}"
+      --layer_frequency_surface_target "${LAYER_FREQUENCY_SURFACE_TARGET}"
+      --lambda_non_surface_hf "${LAMBDA_NON_SURFACE_HF}"
+      --lambda_non_surface_rgb_energy "${LAMBDA_NON_SURFACE_RGB_ENERGY}"
+      --lambda_non_surface_alpha_hf "${LAMBDA_NON_SURFACE_ALPHA_HF}"
+      --lambda_non_surface_alpha_mass "${LAMBDA_NON_SURFACE_ALPHA_MASS}"
+      --lambda_surface_hf_closure "${LAMBDA_SURFACE_HF_CLOSURE}"
+      --lambda_surface_start_hf_preserve "${LAMBDA_SURFACE_START_HF_PRESERVE}"
+      --layer_frequency_start_hf_checkpoint "${LAYER_FREQUENCY_START_HF_CHECKPOINT}"
+      --layer_frequency_start_hf_lowfreq_kernel "${LAYER_FREQUENCY_START_HF_LOWFREQ_KERNEL}"
+      --layer_frequency_start_hf_lowfreq_threshold "${LAYER_FREQUENCY_START_HF_LOWFREQ_THRESHOLD}"
+      --layer_frequency_start_hf_energy_threshold "${LAYER_FREQUENCY_START_HF_ENERGY_THRESHOLD}"
+      --layer_frequency_start_hf_mask_power "${LAYER_FREQUENCY_START_HF_MASK_POWER}"
+      --surface_hf_update_scale "${SURFACE_HF_UPDATE_SCALE}"
+      --layer_frequency_from_iter "${LAYER_FREQUENCY_FROM_ITER}"
+      --layer_frequency_until_iter "${LAYER_FREQUENCY_UNTIL_ITER}"
+      --layer_frequency_log_interval "${LAYER_FREQUENCY_LOG_INTERVAL}"
+    )
+  fi
   if [[ -n "${PRIOR_EDGE_DIR}" || -n "${PRIOR_EDGE_MASK_DIR}" ]]; then
     TRAIN_ARGS+=(
       --prior_edge_dir "${PRIOR_EDGE_DIR}"
@@ -581,10 +620,10 @@ if [[ "${FORCE_RERUN}" == "1" || ! -f "${CHECKPOINT_PATH}" ]]; then
       --prior_hf_lowfreq_cleanup_max_prune_count "${PRIOR_HF_LOWFREQ_CLEANUP_MAX_PRUNE_COUNT}"
     )
   fi
-  if [[ "${LAYER_FREQUENCY_DYNAMIC_ROOTS}" == "1" ]]; then
+  if [[ "${NEED_LAYER_FREQUENCY}" == "1" && "${LAYER_FREQUENCY_DYNAMIC_ROOTS}" == "1" ]]; then
     TRAIN_ARGS+=(--layer_frequency_dynamic_roots)
   fi
-  if [[ "${LAYER_FREQUENCY_START_HF_PROTECT_NON_SURFACE}" == "1" ]]; then
+  if [[ "${NEED_LAYER_FREQUENCY}" == "1" && "${LAYER_FREQUENCY_START_HF_PROTECT_NON_SURFACE}" == "1" ]]; then
     TRAIN_ARGS+=(--layer_frequency_start_hf_protect_non_surface)
   fi
   if [[ "${SURFACE_NORMAL_LOCK}" == "1" ]]; then
@@ -654,7 +693,11 @@ else
 fi
 
 echo
-echo "[done] surface payload : ${SURFACE_STATE_PAYLOAD}"
+if [[ "${NEED_SURFACE_STATE}" == "1" ]]; then
+  echo "[done] surface payload : ${SURFACE_STATE_PAYLOAD}"
+else
+  echo "[done] surface payload : skipped"
+fi
 echo "[done] model dir       : ${MODEL_DIR}"
 echo "[done] checkpoint      : ${CHECKPOINT_PATH}"
 echo "[done] metrics         : ${RESULTS_JSON}"
