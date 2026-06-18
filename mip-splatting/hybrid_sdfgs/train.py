@@ -3473,6 +3473,16 @@ class GaussianSubsetView:
         self.base_gaussians = base_gaussians
         self.subset_mask = subset_mask
 
+    def _current_subset_mask(self):
+        total = int(self.base_gaussians.get_xyz.shape[0])
+        if int(self.subset_mask.shape[0]) == total:
+            return self.subset_mask.to(device=self.base_gaussians.get_xyz.device, dtype=torch.bool)
+        return _expand_root_aligned_mask(
+            self.subset_mask,
+            self.base_gaussians,
+            label="GaussianSubsetView subset mask",
+        )
+
     @property
     def active_sh_degree(self):
         return self.base_gaussians.active_sh_degree
@@ -3483,41 +3493,41 @@ class GaussianSubsetView:
 
     @property
     def get_xyz(self):
-        return self.base_gaussians.get_xyz[self.subset_mask]
+        return self.base_gaussians.get_xyz[self._current_subset_mask()]
 
     @property
     def filter_3D(self):
-        return self.base_gaussians.filter_3D[self.subset_mask]
+        return self.base_gaussians.filter_3D[self._current_subset_mask()]
 
     @property
     def get_scaling(self):
-        return self.base_gaussians.get_scaling[self.subset_mask]
+        return self.base_gaussians.get_scaling[self._current_subset_mask()]
 
     @property
     def get_opacity(self):
-        return self.base_gaussians.get_opacity[self.subset_mask]
+        return self.base_gaussians.get_opacity[self._current_subset_mask()]
 
     @property
     def get_features(self):
-        return self.base_gaussians.get_features[self.subset_mask]
+        return self.base_gaussians.get_features[self._current_subset_mask()]
 
     @property
     def get_opacity_with_3D_filter(self):
-        return self.base_gaussians.get_opacity_with_3D_filter[self.subset_mask]
+        return self.base_gaussians.get_opacity_with_3D_filter[self._current_subset_mask()]
 
     @property
     def get_scaling_with_3D_filter(self):
-        return self.base_gaussians.get_scaling_with_3D_filter[self.subset_mask]
+        return self.base_gaussians.get_scaling_with_3D_filter[self._current_subset_mask()]
 
     @property
     def get_rotation(self):
-        return self.base_gaussians.get_rotation[self.subset_mask]
+        return self.base_gaussians.get_rotation[self._current_subset_mask()]
 
     def get_covariance(self, scaling_modifier=1):
-        return self.base_gaussians.get_covariance(scaling_modifier)[self.subset_mask]
+        return self.base_gaussians.get_covariance(scaling_modifier)[self._current_subset_mask()]
 
     def get_view2gaussian(self, viewmatrix):
-        return self.base_gaussians.get_view2gaussian(viewmatrix)[self.subset_mask]
+        return self.base_gaussians.get_view2gaussian(viewmatrix)[self._current_subset_mask()]
 
 
 class LayerFrequencyRegularizer:
