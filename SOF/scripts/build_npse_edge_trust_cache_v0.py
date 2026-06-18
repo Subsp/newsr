@@ -172,6 +172,16 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--edge_residual_clip", type=float, default=0.08)
     parser.add_argument("--residual_vis_scale", type=float, default=4.0)
+    parser.add_argument(
+        "--asset_profile",
+        choices=("full", "train", "train_no_npz"),
+        default="full",
+        help=(
+            "full writes all diagnostic/debug assets. train writes only training "
+            "targets/masks plus npz. train_no_npz writes only image training "
+            "targets/masks and is useful when disk space is tight."
+        ),
+    )
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -797,58 +807,80 @@ def _process_frame(
     ) * trust_edge[..., None]
     edge_target = np.clip(anchor + edge_residual, 0.0, 1.0)
 
-    _save_gray01(dirs["edge_depth"] / f"{stem}.png", edge_depth)
-    _save_gray01(dirs["edge_depth_confirmed"] / f"{stem}.png", edge_depth_confirmed)
-    _save_gray01(dirs["edge_sr"] / f"{stem}.png", edge_sr)
-    _save_gray01(dirs["edge_fused"] / f"{stem}.png", edge_fused)
-    _save_gray01(dirs["edge_position"] / f"{stem}.png", edge_seed)
-    _save_gray01(dirs["edge_band"] / f"{stem}.png", edge_band)
-    _save_gray01(dirs["depth_only_uncertain"] / f"{stem}.png", depth_only_uncertain.astype(np.float32))
-    _save_gray01(dirs["barrier"] / f"{stem}.png", barrier)
-    _save_gray01(dirs["trust_sr"] / f"{stem}.png", trust_sr)
-    _save_gray01(dirs["trust_edge_raw"] / f"{stem}.png", trust_edge_raw)
-    _save_gray01(dirs["edge_direction_gate"] / f"{stem}.png", edge_direction_gate)
-    _save_gray01(dirs["trust_edge"] / f"{stem}.png", trust_edge)
-    _save_gray01(dirs["continuous_mask"] / f"{stem}.png", continuous_mask)
-    _save_gray01(dirs["trust_continuous"] / f"{stem}.png", trust_continuous)
-    _save_rgb01(dirs["edge_type"] / f"{stem}.png", _edge_type_rgb(edge_type))
-    _save_rgb01(
-        dirs["residual_raw"] / f"{stem}.png",
-        np.clip(0.5 + residual_raw * float(args.residual_vis_scale), 0.0, 1.0),
-    )
-    _save_rgb01(
-        dirs["residual_npse"] / f"{stem}.png",
-        np.clip(0.5 + residual_npse * float(args.residual_vis_scale), 0.0, 1.0),
-    )
-    _save_rgb01(dirs["edge_target"] / f"{stem}.png", edge_target)
-    _save_rgb01(dirs["continuous_target"] / f"{stem}.png", continuous_target)
-    _save_rgb01(dirs["debug_overlay"] / f"{stem}.png", _overlay_edges(sr, edge_fused, trust_sr))
+    if "edge_depth" in dirs:
+        _save_gray01(dirs["edge_depth"] / f"{stem}.png", edge_depth)
+    if "edge_depth_confirmed" in dirs:
+        _save_gray01(dirs["edge_depth_confirmed"] / f"{stem}.png", edge_depth_confirmed)
+    if "edge_sr" in dirs:
+        _save_gray01(dirs["edge_sr"] / f"{stem}.png", edge_sr)
+    if "edge_fused" in dirs:
+        _save_gray01(dirs["edge_fused"] / f"{stem}.png", edge_fused)
+    if "edge_position" in dirs:
+        _save_gray01(dirs["edge_position"] / f"{stem}.png", edge_seed)
+    if "edge_band" in dirs:
+        _save_gray01(dirs["edge_band"] / f"{stem}.png", edge_band)
+    if "depth_only_uncertain" in dirs:
+        _save_gray01(dirs["depth_only_uncertain"] / f"{stem}.png", depth_only_uncertain.astype(np.float32))
+    if "barrier" in dirs:
+        _save_gray01(dirs["barrier"] / f"{stem}.png", barrier)
+    if "trust_sr" in dirs:
+        _save_gray01(dirs["trust_sr"] / f"{stem}.png", trust_sr)
+    if "trust_edge_raw" in dirs:
+        _save_gray01(dirs["trust_edge_raw"] / f"{stem}.png", trust_edge_raw)
+    if "edge_direction_gate" in dirs:
+        _save_gray01(dirs["edge_direction_gate"] / f"{stem}.png", edge_direction_gate)
+    if "trust_edge" in dirs:
+        _save_gray01(dirs["trust_edge"] / f"{stem}.png", trust_edge)
+    if "continuous_mask" in dirs:
+        _save_gray01(dirs["continuous_mask"] / f"{stem}.png", continuous_mask)
+    if "trust_continuous" in dirs:
+        _save_gray01(dirs["trust_continuous"] / f"{stem}.png", trust_continuous)
+    if "edge_type" in dirs:
+        _save_rgb01(dirs["edge_type"] / f"{stem}.png", _edge_type_rgb(edge_type))
+    if "residual_raw" in dirs:
+        _save_rgb01(
+            dirs["residual_raw"] / f"{stem}.png",
+            np.clip(0.5 + residual_raw * float(args.residual_vis_scale), 0.0, 1.0),
+        )
+    if "residual_npse" in dirs:
+        _save_rgb01(
+            dirs["residual_npse"] / f"{stem}.png",
+            np.clip(0.5 + residual_npse * float(args.residual_vis_scale), 0.0, 1.0),
+        )
+    if "edge_target" in dirs:
+        _save_rgb01(dirs["edge_target"] / f"{stem}.png", edge_target)
+    if "continuous_target" in dirs:
+        _save_rgb01(dirs["continuous_target"] / f"{stem}.png", continuous_target)
+    if "debug_overlay" in dirs:
+        _save_rgb01(dirs["debug_overlay"] / f"{stem}.png", _overlay_edges(sr, edge_fused, trust_sr))
 
-    npz_path = dirs["npz"] / f"{stem}.npz"
-    npz_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        npz_path,
-        residual_raw=residual_raw.astype(np.float16),
-        residual_npse=residual_npse.astype(np.float16),
-        edge_depth=edge_depth.astype(np.float16),
-        edge_depth_confirmed=edge_depth_confirmed.astype(np.float16),
-        edge_sr=edge_sr.astype(np.float16),
-        edge_fused=edge_fused.astype(np.float16),
-        edge_position=edge_seed.astype(np.float16),
-        edge_type=edge_type,
-        geometry_edge_candidate=geo_candidate.astype(np.uint8),
-        depth_only_uncertain=depth_only_uncertain.astype(np.uint8),
-        barrier=barrier.astype(np.float16),
-        trust_sr=trust_sr.astype(np.float16),
-        trust_edge_raw=trust_edge_raw.astype(np.float16),
-        edge_direction_gate=edge_direction_gate.astype(np.float16),
-        trust_edge=trust_edge.astype(np.float16),
-        continuous_mask=continuous_mask.astype(np.float16),
-        trust_continuous=trust_continuous.astype(np.float16),
-        edge_band=edge_band.astype(np.float16),
-        edge_target=edge_target.astype(np.float16),
-        continuous_target=continuous_target.astype(np.float16),
-    )
+    npz_path = None
+    if "npz" in dirs:
+        npz_path = dirs["npz"] / f"{stem}.npz"
+        npz_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            npz_path,
+            residual_raw=residual_raw.astype(np.float16),
+            residual_npse=residual_npse.astype(np.float16),
+            edge_depth=edge_depth.astype(np.float16),
+            edge_depth_confirmed=edge_depth_confirmed.astype(np.float16),
+            edge_sr=edge_sr.astype(np.float16),
+            edge_fused=edge_fused.astype(np.float16),
+            edge_position=edge_seed.astype(np.float16),
+            edge_type=edge_type,
+            geometry_edge_candidate=geo_candidate.astype(np.uint8),
+            depth_only_uncertain=depth_only_uncertain.astype(np.uint8),
+            barrier=barrier.astype(np.float16),
+            trust_sr=trust_sr.astype(np.float16),
+            trust_edge_raw=trust_edge_raw.astype(np.float16),
+            edge_direction_gate=edge_direction_gate.astype(np.float16),
+            trust_edge=trust_edge.astype(np.float16),
+            continuous_mask=continuous_mask.astype(np.float16),
+            trust_continuous=trust_continuous.astype(np.float16),
+            edge_band=edge_band.astype(np.float16),
+            edge_target=edge_target.astype(np.float16),
+            continuous_target=continuous_target.astype(np.float16),
+        )
 
     return {
         "stem": stem,
@@ -873,7 +905,7 @@ def _process_frame(
         "depth_only_uncertain_ratio": float(depth_only_uncertain.mean()),
         "appearance_edge_ratio": float(appearance.mean()),
         "uncertain_edge_ratio": float(uncertain.mean()),
-        "npz": str(npz_path),
+        "npz": None if npz_path is None else str(npz_path),
     }
 
 
@@ -898,39 +930,58 @@ def main() -> None:
     if not triples:
         raise RuntimeError("No matched frames to process.")
 
-    output_dirs = {
-        name: args.output_root / name
-        for name in (
-            "edge_depth",
-            "edge_depth_confirmed",
-            "edge_sr",
-            "edge_fused",
-            "edge_position",
-            "edge_band",
-            "depth_only_uncertain",
-            "edge_type",
-            "barrier",
-            "trust_sr",
-            "trust_edge_raw",
-            "edge_direction_gate",
-            "trust_edge",
-            "continuous_mask",
-            "trust_continuous",
-            "residual_raw",
-            "residual_npse",
-            "edge_target",
-            "continuous_target",
-            "debug_overlay",
-            "npz",
-        )
-    }
+    full_asset_names = (
+        "edge_depth",
+        "edge_depth_confirmed",
+        "edge_sr",
+        "edge_fused",
+        "edge_position",
+        "edge_band",
+        "depth_only_uncertain",
+        "edge_type",
+        "barrier",
+        "trust_sr",
+        "trust_edge_raw",
+        "edge_direction_gate",
+        "trust_edge",
+        "continuous_mask",
+        "trust_continuous",
+        "residual_raw",
+        "residual_npse",
+        "edge_target",
+        "continuous_target",
+        "debug_overlay",
+        "npz",
+    )
+    train_asset_names = (
+        "edge_target",
+        "trust_edge",
+        "continuous_target",
+        "trust_continuous",
+        "npz",
+    )
+    train_no_npz_asset_names = (
+        "edge_target",
+        "trust_edge",
+        "continuous_target",
+        "trust_continuous",
+    )
+    if str(args.asset_profile) == "full":
+        asset_names = full_asset_names
+    elif str(args.asset_profile) == "train":
+        asset_names = train_asset_names
+    else:
+        asset_names = train_no_npz_asset_names
+    output_dirs = {name: args.output_root / name for name in asset_names}
     for path in output_dirs.values():
         path.mkdir(parents=True, exist_ok=True)
 
     frames: list[dict[str, object]] = []
     for idx, (stem, anchor_path, sr_path, depth_path) in enumerate(triples, start=1):
-        npz_path = output_dirs["npz"] / f"{stem}.npz"
-        if npz_path.exists() and not bool(args.overwrite):
+        required_outputs = [path / f"{stem}.png" for name, path in output_dirs.items() if name != "npz"]
+        if "npz" in output_dirs:
+            required_outputs.append(output_dirs["npz"] / f"{stem}.npz")
+        if required_outputs and all(path.exists() for path in required_outputs) and not bool(args.overwrite):
             print(f"[npse-cache-v0] skip existing {idx}/{len(triples)} {stem}")
             continue
         print(f"[npse-cache-v0] {idx}/{len(triples)} {stem}")
@@ -978,6 +1029,7 @@ def main() -> None:
         "edge_target_residual_direction_weight": float(args.edge_target_residual_direction_weight),
         "edge_target_direction_blur": int(args.edge_target_direction_blur),
         "edge_residual_clip": float(args.edge_residual_clip),
+        "asset_profile": str(args.asset_profile),
         "match_summary": match_summary,
         "num_requested": len(triples),
         "num_written": len(frames),
