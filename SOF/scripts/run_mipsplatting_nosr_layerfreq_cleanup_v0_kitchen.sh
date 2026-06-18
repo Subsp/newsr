@@ -162,6 +162,8 @@ PRIOR_EDGE_SHAPE_MAX_AXIS="${PRIOR_EDGE_SHAPE_MAX_AXIS:-0.0}"
 PRIOR_EDGE_TOUCH_MIN_RADIUS_PX="${PRIOR_EDGE_TOUCH_MIN_RADIUS_PX:-1.0}"
 PRIOR_EDGE_TOUCH_RADIUS_SCALE="${PRIOR_EDGE_TOUCH_RADIUS_SCALE:-0.35}"
 PRIOR_EDGE_TOUCH_MAX_RADIUS_PX="${PRIOR_EDGE_TOUCH_MAX_RADIUS_PX:-8.0}"
+OPTIMIZE_SOURCE_TAG="${OPTIMIZE_SOURCE_TAG:-all}"
+PRIOR_ONLY_EDGE_FINETUNE="${PRIOR_ONLY_EDGE_FINETUNE:-0}"
 
 PRIOR_HF_SEED_ENABLE="${PRIOR_HF_SEED_ENABLE:-0}"
 PRIOR_HF_SEED_SOURCE="${PRIOR_HF_SEED_SOURCE:-external}"
@@ -318,6 +320,7 @@ if [[ -n "${PRIOR_EDGE_DIR}" || -n "${PRIOR_EDGE_MASK_DIR}" ]]; then
   fi
   echo "[nosr-layerfreq-cleanup-v0] prior edge      : target=${PRIOR_EDGE_DIR} mask=${PRIOR_EDGE_MASK_DIR} lambda=${LAMBDA_PRIOR_EDGE} mode=${PRIOR_EDGE_LOSS_MODE}"
   echo "[nosr-layerfreq-cleanup-v0] edge carrier    : anchor=${PRIOR_EDGE_ANCHOR_DIR:-render-detach} contrast=${PRIOR_EDGE_CONTRAST_WEIGHT} hf_clip=${PRIOR_EDGE_HF_RESIDUAL_CLIP} shape=${LAMBDA_PRIOR_EDGE_SHAPE} thin=${PRIOR_EDGE_SHAPE_THIN_RATIO} line=${PRIOR_EDGE_SHAPE_LINE_RATIO}"
+  echo "[nosr-layerfreq-cleanup-v0] edge ownership  : optimize_source=${OPTIMIZE_SOURCE_TAG} prior_only=${PRIOR_ONLY_EDGE_FINETUNE}"
 fi
 if [[ "${PRIOR_HF_SEED_ENABLE}" == "1" ]]; then
   if [[ "${PRIOR_HF_SEED_SOURCE}" == "external" && -z "${EXTERNAL_PRIOR_ROOT}" ]]; then
@@ -386,6 +389,7 @@ if [[ "${FORCE_RERUN}" == "1" || ! -f "${CHECKPOINT_PATH}" ]]; then
     --densify_min_opacity "${DENSIFY_MIN_OPACITY}"
     --densify_global_prune_enable "${DENSIFY_GLOBAL_PRUNE_ENABLE}"
     --opacity_reset_interval "${OPACITY_RESET_INTERVAL}"
+    --optimize_source_tag "${OPTIMIZE_SOURCE_TAG}"
     --layer_frequency_mask_payload "${SURFACE_STATE_PAYLOAD}"
     --layer_frequency_non_surface_key "${LAYER_FREQUENCY_NON_SURFACE_KEY}"
     --layer_frequency_surface_key "${LAYER_FREQUENCY_SURFACE_KEY}"
@@ -446,6 +450,9 @@ if [[ "${FORCE_RERUN}" == "1" || ! -f "${CHECKPOINT_PATH}" ]]; then
       --prior_edge_shape_line_ratio "${PRIOR_EDGE_SHAPE_LINE_RATIO}"
       --prior_edge_shape_max_axis "${PRIOR_EDGE_SHAPE_MAX_AXIS}"
     )
+    if [[ "${PRIOR_ONLY_EDGE_FINETUNE}" == "1" ]]; then
+      TRAIN_ARGS+=(--prior_only_edge_finetune)
+    fi
   fi
   if [[ -n "${PRIOR_LOCAL_DIR}" || -n "${PRIOR_LOCAL_MASK_DIR}" ]]; then
     TRAIN_ARGS+=(
