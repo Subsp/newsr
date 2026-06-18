@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import tempfile
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -49,13 +49,7 @@ def _save_gray01(path: Path, gray: np.ndarray) -> None:
 
 def _atomic_save(image: Image.Image, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        dir=str(path.parent),
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        delete=False,
-    ) as handle:
-        tmp_path = Path(handle.name)
+    tmp_path = path.with_name(f".{path.stem}.{uuid.uuid4().hex}{path.suffix}")
     try:
         image.save(tmp_path)
         os.replace(tmp_path, path)
