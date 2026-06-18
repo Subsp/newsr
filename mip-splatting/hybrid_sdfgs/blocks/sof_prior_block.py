@@ -350,6 +350,10 @@ class SOFPriorBlock:
         visibility_filter: Optional[torch.Tensor] = None,
         radii: Optional[torch.Tensor] = None,
         depth_min: float = 1e-6,
+        min_radius_px: Optional[float] = None,
+        radius_scale: Optional[float] = None,
+        max_radius_px: Optional[float] = None,
+        mask_threshold: float = 0.5,
     ) -> Optional[torch.Tensor]:
         image_mask_hw = _normalize_mask_hw(
             image_mask,
@@ -358,7 +362,7 @@ class SOFPriorBlock:
         )
         if image_mask_hw is None:
             return None
-        image_mask_bool = image_mask_hw > 0.5
+        image_mask_bool = image_mask_hw > float(mask_threshold)
         xyz = gaussians.get_xyz.detach()
         if xyz.numel() == 0:
             return torch.zeros((0,), dtype=torch.bool, device=xyz.device)
@@ -385,8 +389,24 @@ class SOFPriorBlock:
         mask_values = image_mask_bool[yi[valid_idx], xi[valid_idx]]
         touched[valid_idx] = mask_values
 
+        min_radius = (
+            float(self.cfg.prior_edge_touch_min_radius_px)
+            if min_radius_px is None
+            else float(min_radius_px)
+        )
+        scale_radius = (
+            float(self.cfg.prior_edge_touch_radius_scale)
+            if radius_scale is None
+            else float(radius_scale)
+        )
+        max_radius = (
+            float(self.cfg.prior_edge_touch_max_radius_px)
+            if max_radius_px is None
+            else float(max_radius_px)
+        )
+
         if radii is None:
-            touch_radius = int(round(float(self.cfg.prior_edge_touch_min_radius_px)))
+            touch_radius = int(round(min_radius))
             if touch_radius > 0:
                 dilated_mask = _dilate_binary_mask(image_mask_bool, touch_radius)
                 touched[valid_idx] |= dilated_mask[yi[valid_idx], xi[valid_idx]]
@@ -395,9 +415,9 @@ class SOFPriorBlock:
         radii = radii.detach().to(device=xyz.device, dtype=torch.float32)
         valid_radii = torch.ceil(
             torch.clamp(
-                radii[valid_idx] * float(self.cfg.prior_edge_touch_radius_scale),
-                min=float(self.cfg.prior_edge_touch_min_radius_px),
-                max=float(self.cfg.prior_edge_touch_max_radius_px),
+                radii[valid_idx] * scale_radius,
+                min=min_radius,
+                max=max_radius,
             )
         ).to(dtype=torch.int64)
         max_radius = int(valid_radii.max().item()) if valid_radii.numel() > 0 else 0

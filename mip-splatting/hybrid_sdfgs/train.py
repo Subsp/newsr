@@ -2152,6 +2152,211 @@ def compute_prior_edge_carrier_shape_loss(
     return shape_loss, metrics
 
 
+def _payload_tensor_to_cuda(payload, key: str, total_gaussians: int, *, shape_tail=None, dtype=torch.float32):
+    value = payload.get(key)
+    if value is None:
+        raise KeyError(f"Surface-neighborhood payload missing '{key}'")
+    if not torch.is_tensor(value):
+        value = torch.as_tensor(value)
+    if shape_tail is not None:
+        value = value.reshape(-1, *shape_tail)
+    else:
+        value = value.reshape(-1)
+    if int(value.shape[0]) != int(total_gaussians):
+        raise ValueError(
+            f"Surface-neighborhood payload '{key}' length mismatch: "
+            f"{int(value.shape[0])} vs {int(total_gaussians)}"
+        )
+    return value.to(device="cuda", dtype=dtype)
+
+
+def load_prior_local_surface_payload(path: str, total_gaussians: int):
+    if not path:
+        return None
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Local surface-neighborhood payload not found: {path}")
+    payload = torch.load(path, map_location="cpu")
+    anchors = _payload_tensor_to_cuda(
+        payload,
+        "anchor_xyz",
+        total_gaussians,
+        shape_tail=(3,),
+        dtype=torch.float32,
+    )
+    normals = _normalize_3d(
+        _payload_tensor_to_cuda(
+            payload,
+            "anchor_normal",
+            total_gaussians,
+            shape_tail=(3,),
+            dtype=torch.float32,
+        )
+    )
+    class_id = payload.get("class_id")
+    if class_id is not None:
+        if not torch.is_tensor(class_id):
+            class_id = torch.as_tensor(class_id)
+        class_id = class_id.reshape(-1)
+        if int(class_id.shape[0]) != int(total_gaussians):
+            raise ValueError(
+                "Local surface-neighborhood class_id length mismatch: "
+                f"{int(class_id.shape[0])} vs {int(total_gaussians)}"
+            )
+        class_id = class_id.to(device="cuda", dtype=torch.int64)
+        surface_mask = (class_id == 1) | (class_id == 4)
+    else:
+        surface_mask = load_gaussian_update_mask_payload(
+            path,
+            "surface_candidate",
+            total_gaussians=total_gaussians,
+        )
+    return {
+        "anchors": anchors,
+        "normals": normals,
+        "surface_mask": surface_mask.to(device="cuda", dtype=torch.bool).reshape(-1),
+    }
+
+
+def compute_prior_local_surface_neighborhood_loss(
+    gaussians,
+    continuous_touch_mask,
+    surface_payload,
+    *,
+    surface_mask=None,
+    edge_touch_mask=None,
+    update_mask=None,
+    min_gaussians: int = 128,
+    max_samples: int = 2048,
+    knn: int = 4,
+    normal_min_cos: float = 0.85,
+    radius_scale: float = 2.5,
+    color_weight: float = 1.0,
+    opacity_weight: float = 0.05,
+    scale_weight: float = 0.02,
+    thin_weight: float = 0.05,
+    thin_ratio: float = 0.35,
+):
+    metrics = {}
+    if continuous_touch_mask is None or surface_payload is None:
+        return None, metrics
+    total = int(gaussians.get_xyz.shape[0])
+    device = gaussians.get_xyz.device
+    selected = continuous_touch_mask.to(device=device, dtype=torch.bool).reshape(-1)
+    if int(selected.shape[0]) != total:
+        raise ValueError(f"Continuous touch mask length mismatch: {int(selected.shape[0])} vs {total}")
+
+    payload_surface = surface_payload.get("surface_mask")
+    if payload_surface is not None:
+        payload_surface = payload_surface.to(device=device, dtype=torch.bool).reshape(-1)
+        if int(payload_surface.shape[0]) != total:
+            raise ValueError(
+                f"Local surface payload mask length mismatch: {int(payload_surface.shape[0])} vs {total}"
+            )
+        selected = selected & payload_surface
+    if surface_mask is not None:
+        surface_mask = surface_mask.to(device=device, dtype=torch.bool).reshape(-1)
+        if int(surface_mask.shape[0]) != total:
+            raise ValueError(f"Local surface mask length mismatch: {int(surface_mask.shape[0])} vs {total}")
+        selected = selected & surface_mask
+    if edge_touch_mask is not None:
+        edge_touch_mask = edge_touch_mask.to(device=device, dtype=torch.bool).reshape(-1)
+        if int(edge_touch_mask.shape[0]) != total:
+            raise ValueError(f"Local edge exclusion mask length mismatch: {int(edge_touch_mask.shape[0])} vs {total}")
+        selected = selected & (~edge_touch_mask)
+    if update_mask is not None:
+        update_mask = update_mask.to(device=device, dtype=torch.bool).reshape(-1)
+        if int(update_mask.shape[0]) != total:
+            raise ValueError(f"Local surface update mask length mismatch: {int(update_mask.shape[0])} vs {total}")
+        selected = selected & update_mask
+
+    selected_count = int(selected.sum().item())
+    metrics["local_surface_count"] = float(selected_count)
+    if selected_count < int(min_gaussians):
+        return None, metrics
+
+    ids = torch.nonzero(selected, as_tuple=False).reshape(-1)
+    max_samples = max(int(max_samples), int(min_gaussians))
+    if int(ids.numel()) > max_samples:
+        ids = ids[torch.randperm(int(ids.numel()), device=device)[:max_samples]]
+    sample_count = int(ids.numel())
+    metrics["local_surface_sampled"] = float(sample_count)
+    if sample_count < max(int(min_gaussians), 2):
+        return None, metrics
+
+    anchors = surface_payload["anchors"].to(device=device, dtype=torch.float32)[ids]
+    normals = _normalize_3d(surface_payload["normals"].to(device=device, dtype=torch.float32)[ids])
+    dist = torch.cdist(anchors, anchors)
+    dist.fill_diagonal_(float("inf"))
+    k = min(max(int(knn), 1), sample_count - 1)
+    nn_dist, nn_pos = torch.topk(dist, k=k, dim=1, largest=False)
+    valid = torch.isfinite(nn_dist)
+
+    neighbor_normals = normals[nn_pos]
+    normal_cos = torch.abs(torch.sum(normals[:, None, :] * neighbor_normals, dim=-1)).clamp(0.0, 1.0)
+    valid = valid & (normal_cos >= float(normal_min_cos))
+
+    radius = None
+    finite_dist = nn_dist[valid]
+    if finite_dist.numel() > 0 and float(radius_scale) > 0.0:
+        radius = finite_dist.detach().median().clamp_min(1e-6) * float(radius_scale)
+        valid = valid & (nn_dist <= radius)
+    if radius is None:
+        radius = finite_dist.detach().median().clamp_min(1e-6) if finite_dist.numel() > 0 else None
+    if radius is None:
+        return None, metrics
+
+    weights = torch.where(
+        valid,
+        torch.exp(-nn_dist / radius.clamp_min(1e-6)) * normal_cos,
+        torch.zeros_like(nn_dist),
+    )
+    active_weight = weights.sum()
+    if float(active_weight.item()) <= 0.0:
+        metrics["local_surface_pairs"] = 0.0
+        return None, metrics
+    metrics["local_surface_pairs"] = float((weights > 0).sum().detach().item())
+    metrics["local_surface_radius"] = float(radius.detach().item())
+    metrics["local_surface_normal_cos"] = float(
+        (normal_cos * (weights > 0).to(dtype=normal_cos.dtype)).sum().detach().item()
+        / max(float((weights > 0).sum().detach().item()), 1.0)
+    )
+
+    def _pair_l1(values: torch.Tensor) -> torch.Tensor:
+        center = values[:, None, :]
+        neighbor = values[nn_pos]
+        pair = torch.abs(center - neighbor).mean(dim=-1)
+        return (pair * weights).sum() / active_weight.clamp_min(1e-8)
+
+    total_loss = None
+    if float(color_weight) > 0.0:
+        color = gaussians._features_dc.reshape(total, -1)[ids]
+        color_loss = _pair_l1(color)
+        total_loss = float(color_weight) * color_loss
+        metrics["local_surface_color"] = float(color_loss.detach().item())
+    if float(opacity_weight) > 0.0:
+        opacity = gaussians.get_opacity.reshape(total, -1)[ids]
+        opacity_loss = _pair_l1(opacity)
+        total_loss = opacity_loss * float(opacity_weight) if total_loss is None else total_loss + opacity_loss * float(opacity_weight)
+        metrics["local_surface_opacity"] = float(opacity_loss.detach().item())
+    scales = gaussians.get_scaling.clamp(min=1e-8)
+    if float(scale_weight) > 0.0:
+        scale_loss = _pair_l1(torch.log(scales[ids]))
+        total_loss = scale_loss * float(scale_weight) if total_loss is None else total_loss + scale_loss * float(scale_weight)
+        metrics["local_surface_scale"] = float(scale_loss.detach().item())
+    if float(thin_weight) > 0.0:
+        sorted_scales, _ = torch.sort(scales[ids], dim=1)
+        thin = sorted_scales[:, 0] / sorted_scales[:, 1].clamp(min=1e-8)
+        thin_loss = torch.clamp(thin - float(thin_ratio), min=0.0).mean()
+        total_loss = thin_loss * float(thin_weight) if total_loss is None else total_loss + thin_loss * float(thin_weight)
+        metrics["local_surface_thin"] = float(thin_loss.detach().item())
+        metrics["local_surface_thin_ratio"] = float(thin.detach().mean().item())
+
+    if total_loss is None:
+        return None, metrics
+    metrics["local_surface_loss"] = float(total_loss.detach().item())
+    return total_loss, metrics
+
+
 def _clone_frozen_tensor(tensor):
     if not torch.is_tensor(tensor):
         return tensor
@@ -4541,6 +4746,7 @@ def training(
     sof_regularization_block = None
     prior_local_bank = None
     prior_local_mask_bank = None
+    prior_local_surface_payload = None
     prior_edge_bank = None
     prior_edge_mask_bank = None
     surface_route_bank = None
@@ -4712,8 +4918,10 @@ def training(
         and bool(hybrid_args.prior_edge_mask_dir)
     )
     need_sof_edge_carrier = float(getattr(hybrid_args, "lambda_prior_edge_shape", 0.0)) > 0.0
+    need_sof_local_surface = float(getattr(hybrid_args, "lambda_prior_local_surface", 0.0)) > 0.0
     if (
         float(hybrid_args.lambda_prior_local) > 0.0
+        or need_sof_local_surface
         or float(hybrid_args.lambda_prior_edge) > 0.0
         or need_sof_edge_carrier
         or need_sof_edge_touch
@@ -4755,20 +4963,24 @@ def training(
             f"mode={hybrid_args.prior_edge_loss_mode} "
             f"contrast={hybrid_args.prior_edge_contrast_weight:.3f} "
             f"shape={hybrid_args.lambda_prior_edge_shape:.3f} "
+            f"local_surface={hybrid_args.lambda_prior_local_surface:.3f} "
             f"local_from={hybrid_args.prior_local_from_iter} "
             f"edge_from={hybrid_args.prior_edge_from_iter} "
             f"seed_touch_only={1 if need_sof_edge_touch and float(hybrid_args.lambda_prior_edge) <= 0.0 else 0}"
         )
 
-    if float(hybrid_args.lambda_prior_local) > 0.0:
-        if hybrid_args.prior_local_dir and hybrid_args.prior_local_mask_dir:
-            prior_local_bank = _build_optional_external_bank(
-                train_cameras=train_cameras,
-                root_dir=hybrid_args.prior_local_dir,
-                exts=ext_tokens,
-                bank_cls=PriorTensorBank,
-                label="SOF-PRIOR-LOCAL",
-            )
+    if float(hybrid_args.lambda_prior_local) > 0.0 or need_sof_local_surface:
+        if hybrid_args.prior_local_mask_dir and (
+            hybrid_args.prior_local_dir or not float(hybrid_args.lambda_prior_local) > 0.0
+        ):
+            if hybrid_args.prior_local_dir:
+                prior_local_bank = _build_optional_external_bank(
+                    train_cameras=train_cameras,
+                    root_dir=hybrid_args.prior_local_dir,
+                    exts=ext_tokens,
+                    bank_cls=PriorTensorBank,
+                    label="SOF-PRIOR-LOCAL",
+                )
             prior_local_mask_bank = _build_optional_external_bank(
                 train_cameras=train_cameras,
                 root_dir=hybrid_args.prior_local_mask_dir,
@@ -4777,7 +4989,30 @@ def training(
                 label="SOF-PRIOR-LOCAL-MASK",
             )
         else:
-            print("[SOF-PRIOR] local loss requested but prior_local_dir/mask_dir is incomplete; disabling local branch.")
+            print("[SOF-PRIOR] local loss requested but prior_local_mask_dir is incomplete; disabling local branch.")
+
+    if need_sof_local_surface:
+        local_surface_payload_path = str(getattr(hybrid_args, "prior_local_surface_payload", "") or "").strip()
+        if not local_surface_payload_path:
+            local_surface_payload_path = str(getattr(hybrid_args, "layer_frequency_mask_payload", "") or "").strip()
+        if not local_surface_payload_path:
+            local_surface_payload_path = str(getattr(hybrid_args, "prior_loss_gaussian_mask_payload", "") or "").strip()
+        if not local_surface_payload_path:
+            raise ValueError(
+                "--lambda_prior_local_surface requires --prior_local_surface_payload "
+                "or --layer_frequency_mask_payload."
+            )
+        prior_local_surface_payload = load_prior_local_surface_payload(
+            local_surface_payload_path,
+            total_gaussians=gaussians.get_xyz.shape[0],
+        )
+        print(
+            "[SOF-PRIOR] local surface-neighborhood enabled: "
+            f"payload={local_surface_payload_path} "
+            f"lambda={hybrid_args.lambda_prior_local_surface:.4f} "
+            f"knn={hybrid_args.prior_local_surface_knn} "
+            f"max_samples={hybrid_args.prior_local_surface_max_samples}"
+        )
 
     if float(hybrid_args.lambda_prior_edge) > 0.0 or need_sof_edge_carrier or need_sof_edge_touch:
         if hybrid_args.prior_edge_dir and hybrid_args.prior_edge_mask_dir:
@@ -6636,26 +6871,35 @@ def training(
         render_for_sof_prior = image if prior_render_image is None else prior_render_image
         camera_for_sof_prior = prior_camera if prior_camera is not None else viewpoint_cam
 
-        if sof_prior_block is not None and (prior_local_bank is not None or prior_edge_bank is not None):
+        if sof_prior_block is not None and (
+            prior_local_bank is not None
+            or prior_local_mask_bank is not None
+            or prior_edge_bank is not None
+        ):
             sof_gt_image = (
                 prior_gt_image
                 if prior_gt_image is not None
                 else camera_for_sof_prior.original_image.to(device=render_for_sof_prior.device)
             )
+            local_prior_image = None
+            local_prior_mask = None
+            edge_touch_mask_for_local_surface = None
 
-            if prior_local_bank is not None and prior_local_mask_bank is not None:
-                local_prior_image = prior_local_bank.get(
-                    camera_for_sof_prior.image_name,
-                    width=int(camera_for_sof_prior.image_width),
-                    height=int(camera_for_sof_prior.image_height),
-                    device=render_for_sof_prior.device,
-                )
+            if prior_local_mask_bank is not None:
                 local_prior_mask = prior_local_mask_bank.get(
                     camera_for_sof_prior.image_name,
                     width=int(camera_for_sof_prior.image_width),
                     height=int(camera_for_sof_prior.image_height),
                     device=render_for_sof_prior.device,
                 )
+            if prior_local_bank is not None:
+                local_prior_image = prior_local_bank.get(
+                    camera_for_sof_prior.image_name,
+                    width=int(camera_for_sof_prior.image_width),
+                    height=int(camera_for_sof_prior.image_height),
+                    device=render_for_sof_prior.device,
+                )
+            if local_prior_image is not None and local_prior_mask is not None:
                 loss_prior_local = sof_prior_block.compute_local_loss(
                     render_image=render_for_sof_prior,
                     prior_image=local_prior_image,
@@ -6713,6 +6957,7 @@ def training(
                     touch_update_mask = combine_gaussian_update_masks(external_update_mask, current_prior_loss_update_mask)
                     if touch_update_mask is not None:
                         edge_touch_mask = edge_touch_mask & touch_update_mask
+                    edge_touch_mask_for_local_surface = edge_touch_mask
                     if hasattr(gaussians, "mark_edge_touched"):
                         gaussians.mark_edge_touched(edge_touch_mask, iteration)
                     visible_count = float(
@@ -6747,6 +6992,64 @@ def training(
                             )
                             loss = loss + weighted_edge_shape
                             prior_metrics["edge_carrier_shape_w"] = float(weighted_edge_shape.detach().item())
+
+            if (
+                prior_local_surface_payload is not None
+                and local_prior_mask is not None
+                and float(hybrid_args.lambda_prior_local_surface) > 0.0
+                and int(iteration) >= int(hybrid_args.prior_local_surface_from_iter)
+                and (
+                    int(hybrid_args.prior_local_surface_interval) <= 1
+                    or int(iteration) % int(hybrid_args.prior_local_surface_interval) == 0
+                )
+            ):
+                continuous_touch_mask = sof_prior_block.build_touch_mask(
+                    viewpoint_cam=camera_for_sof_prior,
+                    gaussians=gaussians,
+                    image_mask=local_prior_mask,
+                    visibility_filter=prior_visibility_filter,
+                    radii=prior_radii,
+                    min_radius_px=float(hybrid_args.prior_local_surface_touch_min_radius_px),
+                    radius_scale=float(hybrid_args.prior_local_surface_touch_radius_scale),
+                    max_radius_px=float(hybrid_args.prior_local_surface_touch_max_radius_px),
+                    mask_threshold=float(hybrid_args.prior_local_surface_mask_threshold),
+                )
+                local_surface_update_mask = combine_gaussian_update_masks(
+                    external_update_mask,
+                    current_prior_loss_update_mask,
+                )
+                local_surface_mask = (
+                    layer_frequency_regularizer.surface_mask
+                    if layer_frequency_regularizer is not None
+                    else None
+                )
+                loss_local_surface, local_surface_metrics = compute_prior_local_surface_neighborhood_loss(
+                    gaussians,
+                    continuous_touch_mask,
+                    prior_local_surface_payload,
+                    surface_mask=local_surface_mask,
+                    edge_touch_mask=edge_touch_mask_for_local_surface,
+                    update_mask=local_surface_update_mask,
+                    min_gaussians=int(hybrid_args.prior_local_surface_min_gaussians),
+                    max_samples=int(hybrid_args.prior_local_surface_max_samples),
+                    knn=int(hybrid_args.prior_local_surface_knn),
+                    normal_min_cos=float(hybrid_args.prior_local_surface_normal_min_cos),
+                    radius_scale=float(hybrid_args.prior_local_surface_radius_scale),
+                    color_weight=float(hybrid_args.prior_local_surface_color_weight),
+                    opacity_weight=float(hybrid_args.prior_local_surface_opacity_weight),
+                    scale_weight=float(hybrid_args.prior_local_surface_scale_weight),
+                    thin_weight=float(hybrid_args.prior_local_surface_thin_weight),
+                    thin_ratio=float(hybrid_args.prior_local_surface_thin_ratio),
+                )
+                prior_metrics.update(local_surface_metrics)
+                if loss_local_surface is not None:
+                    weighted_local_surface = (
+                        float(hybrid_args.lambda_prior_local_surface)
+                        * float(prior_guidance_scale)
+                        * loss_local_surface
+                    )
+                    loss = loss + weighted_local_surface
+                    prior_metrics["local_surface_w"] = float(weighted_local_surface.detach().item())
 
         if (
             surface_route_bank is not None
@@ -7474,6 +7777,12 @@ def training(
                     )
                 if "sof_local" in prior_metrics:
                     prior_parts.append(f"local={prior_metrics['sof_local']:.6f}")
+                if "local_surface_w" in prior_metrics:
+                    prior_parts.append(f"local3d={prior_metrics['local_surface_w']:.6f}")
+                if "local_surface_count" in prior_metrics:
+                    prior_parts.append(f"l3d_count={int(prior_metrics['local_surface_count'])}")
+                if "local_surface_pairs" in prior_metrics:
+                    prior_parts.append(f"l3d_pairs={int(prior_metrics['local_surface_pairs'])}")
                 if "sof_edge" in prior_metrics:
                     prior_parts.append(f"edge={prior_metrics['sof_edge']:.6f}")
                 if "sof_edge_alpha" in prior_metrics:
@@ -7970,6 +8279,22 @@ def training_report(
                 tb_writer.add_scalar("sequence_loss/lambda_tex", prior_metrics["sequence_lambda_tex"], iteration)
             if "sof_local" in prior_metrics:
                 tb_writer.add_scalar("prior/sof_local", prior_metrics["sof_local"], iteration)
+            for key in (
+                "local_surface_w",
+                "local_surface_loss",
+                "local_surface_count",
+                "local_surface_sampled",
+                "local_surface_pairs",
+                "local_surface_radius",
+                "local_surface_normal_cos",
+                "local_surface_color",
+                "local_surface_opacity",
+                "local_surface_scale",
+                "local_surface_thin",
+                "local_surface_thin_ratio",
+            ):
+                if key in prior_metrics:
+                    tb_writer.add_scalar(f"prior/{key}", prior_metrics[key], iteration)
             if "sof_edge" in prior_metrics:
                 tb_writer.add_scalar("prior/sof_edge", prior_metrics["sof_edge"], iteration)
             if "sof_edge_alpha" in prior_metrics:
@@ -8412,6 +8737,24 @@ def make_parser():
     parser.add_argument("--lambda_prior_local", type=float, default=0.0)
     parser.add_argument("--prior_local_min_pixels", type=float, default=64.0)
     parser.add_argument("--prior_local_from_iter", type=int, default=0)
+    parser.add_argument("--lambda_prior_local_surface", type=float, default=0.0)
+    parser.add_argument("--prior_local_surface_payload", type=str, default="")
+    parser.add_argument("--prior_local_surface_from_iter", type=int, default=0)
+    parser.add_argument("--prior_local_surface_interval", type=int, default=1)
+    parser.add_argument("--prior_local_surface_min_gaussians", type=int, default=128)
+    parser.add_argument("--prior_local_surface_max_samples", type=int, default=2048)
+    parser.add_argument("--prior_local_surface_knn", type=int, default=4)
+    parser.add_argument("--prior_local_surface_normal_min_cos", type=float, default=0.85)
+    parser.add_argument("--prior_local_surface_radius_scale", type=float, default=2.5)
+    parser.add_argument("--prior_local_surface_color_weight", type=float, default=1.0)
+    parser.add_argument("--prior_local_surface_opacity_weight", type=float, default=0.05)
+    parser.add_argument("--prior_local_surface_scale_weight", type=float, default=0.02)
+    parser.add_argument("--prior_local_surface_thin_weight", type=float, default=0.05)
+    parser.add_argument("--prior_local_surface_thin_ratio", type=float, default=0.35)
+    parser.add_argument("--prior_local_surface_touch_min_radius_px", type=float, default=1.0)
+    parser.add_argument("--prior_local_surface_touch_radius_scale", type=float, default=0.35)
+    parser.add_argument("--prior_local_surface_touch_max_radius_px", type=float, default=8.0)
+    parser.add_argument("--prior_local_surface_mask_threshold", type=float, default=0.20)
     parser.add_argument("--prior_edge_dir", type=str, default="")
     parser.add_argument("--prior_edge_mask_dir", type=str, default="")
     parser.add_argument("--lambda_prior_edge", type=float, default=0.0)
