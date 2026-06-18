@@ -55,6 +55,7 @@ FORCE_RERUN="${FORCE_RERUN:-0}"
 RUN_RENDER_AFTER="${RUN_RENDER_AFTER:-1}"
 RUN_METRICS_AFTER="${RUN_METRICS_AFTER:-1}"
 RUN_COMPARE_AFTER="${RUN_COMPARE_AFTER:-1}"
+SAVE_CHECKPOINT_AFTER="${SAVE_CHECKPOINT_AFTER:-1}"
 
 # Defaults mirror the high-performing 2026-06-06 fixed-topology NoSR cleanup:
 # non-surface layers are discouraged from carrying Laplacian HF, while the
@@ -263,6 +264,12 @@ if [[ "${NEED_LAYER_FREQUENCY}" == "1" || "${SURFACE_NORMAL_LOCK}" == "1" || "${
 fi
 
 CHECKPOINT_PATH="${MODEL_DIR}/chkpnt${FINAL_ITER}.pth"
+POINT_CLOUD_PATH="${MODEL_DIR}/point_cloud/iteration_${FINAL_ITER}/point_cloud.ply"
+if [[ "${SAVE_CHECKPOINT_AFTER}" == "1" ]]; then
+  TRAIN_DONE_PATH="${CHECKPOINT_PATH}"
+else
+  TRAIN_DONE_PATH="${POINT_CLOUD_PATH}"
+fi
 RESULTS_JSON="${MODEL_DIR}/results_psnr_ssim.json"
 COMPARE_JSON="${COMPARE_JSON:-${MODEL_DIR}/nosr_cleanup_compare_vs_input.json}"
 MIP_PYTHONPATH="${MIPSPLATTING_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -316,6 +323,7 @@ fi
 echo "[nosr-layerfreq-cleanup-v0] train target      : ${TRAIN_IMAGES_SUBDIR}"
 echo "[nosr-layerfreq-cleanup-v0] output model      : ${MODEL_DIR}"
 echo "[nosr-layerfreq-cleanup-v0] iter schedule     : ${INPUT_ITERATION} -> ${FINAL_ITER}"
+echo "[nosr-layerfreq-cleanup-v0] save checkpoint   : ${SAVE_CHECKPOINT_AFTER}"
 echo "[nosr-layerfreq-cleanup-v0] layer freq        : ns=${LAMBDA_NON_SURFACE_HF} surf=${LAMBDA_SURFACE_HF_CLOSURE} start_hf=${LAMBDA_SURFACE_START_HF_PRESERVE} scale=${SURFACE_HF_UPDATE_SCALE} target=${LAYER_FREQUENCY_SURFACE_TARGET} dynamic_roots=${LAYER_FREQUENCY_DYNAMIC_ROOTS}"
 if [[ -n "${EXTERNAL_PRIOR_ROOT}" ]]; then
   echo "[nosr-layerfreq-cleanup-v0] external prior   : root=${EXTERNAL_PRIOR_ROOT} subdir=${EXTERNAL_PRIOR_SUBDIR} mask=${EXTERNAL_PRIOR_MASK_SUBDIR:-none}"
@@ -402,7 +410,7 @@ fi
 
 echo
 echo "[2/4] run fixed-topology NoSR layer-frequency cleanup"
-if [[ "${FORCE_RERUN}" == "1" || ! -f "${CHECKPOINT_PATH}" ]]; then
+if [[ "${FORCE_RERUN}" == "1" || ! -f "${TRAIN_DONE_PATH}" ]]; then
   TRAIN_ARGS=(
     "${PYTHON_BIN}" -m hybrid_sdfgs.train
     -s "${TRAIN_SCENE_ROOT}"
@@ -415,7 +423,6 @@ if [[ "${FORCE_RERUN}" == "1" || ! -f "${CHECKPOINT_PATH}" ]]; then
     --iterations "${FINAL_ITER}"
     --test_iterations "${FINAL_ITER}"
     --save_iterations "${FINAL_ITER}"
-    --checkpoint_iterations "${FINAL_ITER}"
     --start_checkpoint "${START_CHECKPOINT}"
     --densify_from_iter "${DENSIFY_FROM_ITER}"
     --densify_until_iter "${DENSIFY_UNTIL_ITER}"
@@ -430,6 +437,9 @@ if [[ "${FORCE_RERUN}" == "1" || ! -f "${CHECKPOINT_PATH}" ]]; then
     --prior_hf_weight "${PRIOR_HF_WEIGHT}"
     --prior_delta_clip "${PRIOR_DELTA_CLIP}"
   )
+  if [[ "${SAVE_CHECKPOINT_AFTER}" == "1" ]]; then
+    TRAIN_ARGS+=(--checkpoint_iterations "${FINAL_ITER}")
+  fi
   if [[ "${NEED_LAYER_FREQUENCY}" == "1" ]]; then
     TRAIN_ARGS+=(
       --layer_frequency_mask_payload "${SURFACE_STATE_PAYLOAD}"
@@ -643,7 +653,7 @@ if [[ "${FORCE_RERUN}" == "1" || ! -f "${CHECKPOINT_PATH}" ]]; then
     "${TRAIN_ARGS[@]}"
   )
 else
-  echo "[nosr-layerfreq-cleanup-v0] checkpoint exists, skipping training: ${CHECKPOINT_PATH}"
+  echo "[nosr-layerfreq-cleanup-v0] training output exists, skipping training: ${TRAIN_DONE_PATH}"
 fi
 
 echo
@@ -699,5 +709,10 @@ else
   echo "[done] surface payload : skipped"
 fi
 echo "[done] model dir       : ${MODEL_DIR}"
-echo "[done] checkpoint      : ${CHECKPOINT_PATH}"
+if [[ "${SAVE_CHECKPOINT_AFTER}" == "1" ]]; then
+  echo "[done] checkpoint      : ${CHECKPOINT_PATH}"
+else
+  echo "[done] checkpoint      : skipped"
+fi
+echo "[done] point cloud     : ${POINT_CLOUD_PATH}"
 echo "[done] metrics         : ${RESULTS_JSON}"
