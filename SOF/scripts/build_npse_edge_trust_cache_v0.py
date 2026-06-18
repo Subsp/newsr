@@ -183,6 +183,12 @@ def _parse_args() -> argparse.Namespace:
             "trust_continuous for disk-constrained resume."
         ),
     )
+    parser.add_argument(
+        "--start_index",
+        type=int,
+        default=1,
+        help="1-based matched-frame index to start from. Useful for resuming disk-constrained runs.",
+    )
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -926,10 +932,20 @@ def main() -> None:
         raise FileNotFoundError(f"reference_dir not found: {args.reference_dir}")
 
     triples, match_summary = _build_triples(args)
+    original_num_triples = len(triples)
+    if int(args.start_index) < 1:
+        raise ValueError(f"--start_index must be >= 1, got {args.start_index}")
+    if int(args.start_index) > 1:
+        triples = triples[int(args.start_index) - 1 :]
     if int(args.limit) > 0:
         triples = triples[: int(args.limit)]
     if not triples:
         raise RuntimeError("No matched frames to process.")
+    if int(args.start_index) > 1:
+        print(
+            f"[npse-cache-v0] resume from matched index {int(args.start_index)}/"
+            f"{original_num_triples}"
+        )
 
     full_asset_names = (
         "edge_depth",
@@ -1037,7 +1053,9 @@ def main() -> None:
         "edge_target_direction_blur": int(args.edge_target_direction_blur),
         "edge_residual_clip": float(args.edge_residual_clip),
         "asset_profile": str(args.asset_profile),
+        "start_index": int(args.start_index),
         "match_summary": match_summary,
+        "num_total_matched": int(original_num_triples),
         "num_requested": len(triples),
         "num_written": len(frames),
         "frames": frames,

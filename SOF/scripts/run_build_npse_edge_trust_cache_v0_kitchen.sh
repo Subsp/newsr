@@ -34,6 +34,7 @@ MATCH_POLICY="${MATCH_POLICY:-llff_train_order}"
 PRIOR_LLFFHOLD="${PRIOR_LLFFHOLD:-8}"
 ALLOW_EXTRA_INPUTS="${ALLOW_EXTRA_INPUTS:-1}"
 LIMIT="${LIMIT:-0}"
+START_INDEX="${START_INDEX:-1}"
 OVERWRITE="${OVERWRITE:-0}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
@@ -118,6 +119,7 @@ CMD=(
   --edge_target_direction_blur "${EDGE_TARGET_DIRECTION_BLUR}"
   --edge_residual_clip "${EDGE_RESIDUAL_CLIP}"
   --asset_profile "${NPSE_ASSET_PROFILE}"
+  --start_index "${START_INDEX}"
   --limit "${LIMIT}"
 )
 
