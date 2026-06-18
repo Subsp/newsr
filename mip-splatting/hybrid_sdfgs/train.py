@@ -2442,6 +2442,188 @@ def compute_prior_local_surface_neighborhood_loss(
     return total_loss, metrics
 
 
+def compute_prior_ray_patch_surface_loss(
+    gaussians,
+    seed_touch_mask,
+    surface_payload,
+    *,
+    viewpoint_cam,
+    target_image,
+    target_mask,
+    surface_mask=None,
+    edge_touch_mask=None,
+    update_mask=None,
+    visibility_filter=None,
+    min_seeds: int = 64,
+    max_seeds: int = 512,
+    max_candidates: int = 16384,
+    knn: int = 8,
+    normal_min_cos: float = 0.85,
+    radius_scale: float = 2.5,
+    target_blend: float = 0.25,
+    target_delta_clip: float = 0.08,
+    confidence_power: float = 1.0,
+    min_weight: float = 0.05,
+):
+    metrics = {}
+    if seed_touch_mask is None or surface_payload is None or target_image is None or target_mask is None:
+        return None, metrics
+    total = int(gaussians.get_xyz.shape[0])
+    device = gaussians.get_xyz.device
+
+    seed = seed_touch_mask.to(device=device, dtype=torch.bool).reshape(-1)
+    if int(seed.shape[0]) != total:
+        raise ValueError(f"Ray-patch seed mask length mismatch: {int(seed.shape[0])} vs {total}")
+
+    candidate = torch.ones((total,), dtype=torch.bool, device=device)
+    payload_surface = surface_payload.get("surface_mask")
+    if payload_surface is not None:
+        payload_surface = payload_surface.to(device=device, dtype=torch.bool).reshape(-1)
+        if int(payload_surface.shape[0]) != total:
+            raise ValueError(f"Ray-patch payload surface mask mismatch: {int(payload_surface.shape[0])} vs {total}")
+        candidate = candidate & payload_surface
+    if surface_mask is not None:
+        surface_mask = surface_mask.to(device=device, dtype=torch.bool).reshape(-1)
+        if int(surface_mask.shape[0]) != total:
+            raise ValueError(f"Ray-patch surface mask mismatch: {int(surface_mask.shape[0])} vs {total}")
+        candidate = candidate & surface_mask
+    if edge_touch_mask is not None:
+        edge_touch_mask = edge_touch_mask.to(device=device, dtype=torch.bool).reshape(-1)
+        if int(edge_touch_mask.shape[0]) != total:
+            raise ValueError(f"Ray-patch edge mask mismatch: {int(edge_touch_mask.shape[0])} vs {total}")
+        candidate = candidate & (~edge_touch_mask)
+    if update_mask is not None:
+        update_mask = update_mask.to(device=device, dtype=torch.bool).reshape(-1)
+        if int(update_mask.shape[0]) != total:
+            raise ValueError(f"Ray-patch update mask mismatch: {int(update_mask.shape[0])} vs {total}")
+        candidate = candidate & update_mask
+    if visibility_filter is not None:
+        visibility_filter = visibility_filter.to(device=device, dtype=torch.bool).reshape(-1)
+        if int(visibility_filter.shape[0]) == total:
+            candidate = candidate & visibility_filter
+
+    seed = seed & candidate
+    seed_count = int(seed.sum().item())
+    metrics["ray_patch_seed_count"] = float(seed_count)
+    if seed_count < int(min_seeds):
+        return None, metrics
+
+    seed_ids = torch.nonzero(seed, as_tuple=False).reshape(-1)
+    if int(seed_ids.numel()) > int(max_seeds):
+        seed_ids = seed_ids[torch.randperm(int(seed_ids.numel()), device=device)[: int(max_seeds)]]
+    candidate_ids = torch.nonzero(candidate, as_tuple=False).reshape(-1)
+    if int(candidate_ids.numel()) > int(max_candidates):
+        keep_seed = torch.zeros((total,), dtype=torch.bool, device=device)
+        keep_seed[seed_ids] = True
+        other_ids = candidate_ids[~keep_seed[candidate_ids]]
+        keep_other = max(0, int(max_candidates) - int(seed_ids.numel()))
+        if int(other_ids.numel()) > keep_other:
+            other_ids = other_ids[torch.randperm(int(other_ids.numel()), device=device)[:keep_other]]
+        candidate_ids = torch.cat([seed_ids, other_ids], dim=0)
+
+    mask_hw = target_mask
+    if mask_hw.ndim == 3 and mask_hw.shape[0] == 1:
+        mask_hw = mask_hw[0]
+    if mask_hw.ndim != 2:
+        raise ValueError(f"Ray-patch target mask must be [H,W] or [1,H,W], got {tuple(target_mask.shape)}")
+    mask_hw = mask_hw.to(device=device, dtype=torch.float32)
+
+    R = torch.as_tensor(viewpoint_cam.R, device=device, dtype=torch.float32)
+    T = torch.as_tensor(viewpoint_cam.T, device=device, dtype=torch.float32)
+    xyz = gaussians.get_xyz.detach()[seed_ids].to(dtype=torch.float32)
+    xyz_cam = xyz @ R + T.unsqueeze(0)
+    z = xyz_cam[:, 2]
+    x = xyz_cam[:, 0] / torch.clamp_min(z, 1e-6) * float(viewpoint_cam.focal_x) + float(viewpoint_cam.image_width) / 2.0
+    y = xyz_cam[:, 1] / torch.clamp_min(z, 1e-6) * float(viewpoint_cam.focal_y) + float(viewpoint_cam.image_height) / 2.0
+    xi = torch.round(x).to(dtype=torch.int64)
+    yi = torch.round(y).to(dtype=torch.int64)
+    valid = (
+        (z > 1e-6)
+        & (xi >= 0)
+        & (xi < int(viewpoint_cam.image_width))
+        & (yi >= 0)
+        & (yi < int(viewpoint_cam.image_height))
+    )
+    if not torch.any(valid):
+        return None, metrics
+    seed_ids = seed_ids[valid]
+    xi = xi[valid]
+    yi = yi[valid]
+    confidence = mask_hw[yi, xi].clamp(0.0, 1.0)
+    if float(confidence_power) != 1.0:
+        confidence = confidence.pow(max(float(confidence_power), 0.0))
+    valid_conf = confidence >= float(min_weight)
+    if not torch.any(valid_conf):
+        return None, metrics
+    seed_ids = seed_ids[valid_conf]
+    xi = xi[valid_conf]
+    yi = yi[valid_conf]
+    confidence = confidence[valid_conf]
+    seed_count = int(seed_ids.numel())
+    metrics["ray_patch_seeds"] = float(seed_count)
+    if seed_count < int(min_seeds):
+        return None, metrics
+
+    seed_anchors = surface_payload["anchors"].to(device=device, dtype=torch.float32)[seed_ids]
+    seed_normals = _normalize_3d(surface_payload["normals"].to(device=device, dtype=torch.float32)[seed_ids])
+    candidate_anchors = surface_payload["anchors"].to(device=device, dtype=torch.float32)[candidate_ids]
+    candidate_normals = _normalize_3d(surface_payload["normals"].to(device=device, dtype=torch.float32)[candidate_ids])
+    dist = torch.cdist(seed_anchors, candidate_anchors)
+    k = min(max(int(knn), 1), int(candidate_ids.numel()))
+    nn_dist, nn_pos = torch.topk(dist, k=k, dim=1, largest=False)
+    nn_ids = candidate_ids[nn_pos]
+
+    nn_normals = candidate_normals[nn_pos]
+    normal_cos = torch.abs(torch.sum(seed_normals[:, None, :] * nn_normals, dim=-1)).clamp(0.0, 1.0)
+    valid_pair = torch.isfinite(nn_dist) & (normal_cos >= float(normal_min_cos))
+    finite_dist = nn_dist[valid_pair]
+    if finite_dist.numel() <= 0:
+        metrics["ray_patch_pairs"] = 0.0
+        return None, metrics
+    radius = finite_dist.detach().median().clamp_min(1e-6) * max(float(radius_scale), 1e-6)
+    valid_pair = valid_pair & (nn_dist <= radius)
+    pair_weight = torch.where(
+        valid_pair,
+        torch.exp(-nn_dist / radius.clamp_min(1e-6)) * normal_cos * confidence[:, None],
+        torch.zeros_like(nn_dist),
+    )
+    active_weight = pair_weight.sum()
+    if float(active_weight.item()) <= 0.0:
+        metrics["ray_patch_pairs"] = 0.0
+        return None, metrics
+
+    target_rgb = target_image.detach().to(device=device, dtype=torch.float32)[:, yi, xi].transpose(0, 1)
+    target_dc = RGB2SH(target_rgb)
+    neighbor_dc = gaussians._features_dc.reshape(total, -1)[nn_ids]
+    patch_target = target_dc[:, None, :].expand_as(neighbor_dc)
+    if float(target_delta_clip) > 0.0:
+        delta_clip = float(target_delta_clip) / float(C0)
+        patch_target = torch.max(
+            torch.min(patch_target, neighbor_dc.detach() + delta_clip),
+            neighbor_dc.detach() - delta_clip,
+        )
+    blend = max(0.0, min(1.0, float(target_blend)))
+    patch_target = (1.0 - blend) * neighbor_dc.detach() + blend * patch_target.detach()
+    pair_l1 = torch.abs(neighbor_dc - patch_target).mean(dim=-1)
+    loss = (pair_l1 * pair_weight).sum() / active_weight.clamp_min(1e-8)
+
+    metrics.update(
+        {
+            "ray_patch_candidates": float(int(candidate_ids.numel())),
+            "ray_patch_pairs": float((pair_weight > 0).sum().detach().item()),
+            "ray_patch_radius": float(radius.detach().item()),
+            "ray_patch_conf": float(confidence.detach().mean().item()),
+            "ray_patch_loss": float(loss.detach().item()),
+            "ray_patch_target_abs": float(target_rgb.detach().abs().mean().item()),
+            "ray_patch_normal_cos": float(
+                (normal_cos * (pair_weight > 0).to(dtype=normal_cos.dtype)).sum().detach().item()
+                / max(float((pair_weight > 0).sum().detach().item()), 1.0)
+            ),
+        }
+    )
+    return loss, metrics
+
+
 def _clone_frozen_tensor(tensor):
     if not torch.is_tensor(tensor):
         return tensor
@@ -7108,41 +7290,89 @@ def training(
                     if layer_frequency_regularizer is not None
                     else None
                 )
-                loss_local_surface, local_surface_metrics = compute_prior_local_surface_neighborhood_loss(
-                    gaussians,
-                    continuous_touch_mask,
-                    prior_local_surface_payload,
-                    viewpoint_cam=camera_for_sof_prior,
-                    render_image=render_for_sof_prior,
-                    prior_image=local_prior_image,
-                    prior_mask=local_prior_mask,
-                    surface_mask=local_surface_mask,
-                    edge_touch_mask=edge_touch_mask_for_local_surface,
-                    update_mask=local_surface_update_mask,
-                    min_gaussians=int(hybrid_args.prior_local_surface_min_gaussians),
-                    max_samples=int(hybrid_args.prior_local_surface_max_samples),
-                    knn=int(hybrid_args.prior_local_surface_knn),
-                    normal_min_cos=float(hybrid_args.prior_local_surface_normal_min_cos),
-                    radius_scale=float(hybrid_args.prior_local_surface_radius_scale),
-                    color_weight=float(hybrid_args.prior_local_surface_color_weight),
-                    opacity_weight=float(hybrid_args.prior_local_surface_opacity_weight),
-                    scale_weight=float(hybrid_args.prior_local_surface_scale_weight),
-                    thin_weight=float(hybrid_args.prior_local_surface_thin_weight),
-                    thin_ratio=float(hybrid_args.prior_local_surface_thin_ratio),
-                    residual_weight=float(hybrid_args.prior_local_surface_residual_weight),
-                    residual_clip=float(hybrid_args.prior_local_surface_residual_clip),
-                    residual_confidence_power=float(hybrid_args.prior_local_surface_residual_confidence_power),
-                    residual_min_weight=float(hybrid_args.prior_local_surface_residual_min_weight),
-                )
-                prior_metrics.update(local_surface_metrics)
-                if loss_local_surface is not None:
-                    weighted_local_surface = (
-                        float(hybrid_args.lambda_prior_local_surface)
-                        * float(prior_guidance_scale)
-                        * loss_local_surface
+                use_local_surface_regularizer = any(
+                    float(value) > 0.0
+                    for value in (
+                        hybrid_args.prior_local_surface_color_weight,
+                        hybrid_args.prior_local_surface_opacity_weight,
+                        hybrid_args.prior_local_surface_scale_weight,
+                        hybrid_args.prior_local_surface_thin_weight,
+                        hybrid_args.prior_local_surface_residual_weight,
                     )
-                    loss = loss + weighted_local_surface
-                    prior_metrics["local_surface_w"] = float(weighted_local_surface.detach().item())
+                )
+                if use_local_surface_regularizer:
+                    loss_local_surface, local_surface_metrics = compute_prior_local_surface_neighborhood_loss(
+                        gaussians,
+                        continuous_touch_mask,
+                        prior_local_surface_payload,
+                        viewpoint_cam=camera_for_sof_prior,
+                        render_image=render_for_sof_prior,
+                        prior_image=local_prior_image,
+                        prior_mask=local_prior_mask,
+                        surface_mask=local_surface_mask,
+                        edge_touch_mask=edge_touch_mask_for_local_surface,
+                        update_mask=local_surface_update_mask,
+                        min_gaussians=int(hybrid_args.prior_local_surface_min_gaussians),
+                        max_samples=int(hybrid_args.prior_local_surface_max_samples),
+                        knn=int(hybrid_args.prior_local_surface_knn),
+                        normal_min_cos=float(hybrid_args.prior_local_surface_normal_min_cos),
+                        radius_scale=float(hybrid_args.prior_local_surface_radius_scale),
+                        color_weight=float(hybrid_args.prior_local_surface_color_weight),
+                        opacity_weight=float(hybrid_args.prior_local_surface_opacity_weight),
+                        scale_weight=float(hybrid_args.prior_local_surface_scale_weight),
+                        thin_weight=float(hybrid_args.prior_local_surface_thin_weight),
+                        thin_ratio=float(hybrid_args.prior_local_surface_thin_ratio),
+                        residual_weight=float(hybrid_args.prior_local_surface_residual_weight),
+                        residual_clip=float(hybrid_args.prior_local_surface_residual_clip),
+                        residual_confidence_power=float(hybrid_args.prior_local_surface_residual_confidence_power),
+                        residual_min_weight=float(hybrid_args.prior_local_surface_residual_min_weight),
+                    )
+                    prior_metrics.update(local_surface_metrics)
+                    if loss_local_surface is not None:
+                        weighted_local_surface = (
+                            float(hybrid_args.lambda_prior_local_surface)
+                            * float(prior_guidance_scale)
+                            * loss_local_surface
+                        )
+                        loss = loss + weighted_local_surface
+                        prior_metrics["local_surface_w"] = float(weighted_local_surface.detach().item())
+
+                if float(hybrid_args.prior_local_surface_ray_patch_weight) > 0.0:
+                    ray_patch_target_image = local_prior_image
+                    if str(hybrid_args.prior_local_surface_ray_patch_target).strip().lower() == "gt":
+                        ray_patch_target_image = sof_gt_image
+                    loss_ray_patch, ray_patch_metrics = compute_prior_ray_patch_surface_loss(
+                        gaussians,
+                        continuous_touch_mask,
+                        prior_local_surface_payload,
+                        viewpoint_cam=camera_for_sof_prior,
+                        target_image=ray_patch_target_image,
+                        target_mask=local_prior_mask,
+                        surface_mask=local_surface_mask,
+                        edge_touch_mask=edge_touch_mask_for_local_surface,
+                        update_mask=local_surface_update_mask,
+                        visibility_filter=prior_visibility_filter,
+                        min_seeds=int(hybrid_args.prior_local_surface_ray_patch_min_seeds),
+                        max_seeds=int(hybrid_args.prior_local_surface_ray_patch_max_seeds),
+                        max_candidates=int(hybrid_args.prior_local_surface_ray_patch_max_candidates),
+                        knn=int(hybrid_args.prior_local_surface_ray_patch_knn),
+                        normal_min_cos=float(hybrid_args.prior_local_surface_normal_min_cos),
+                        radius_scale=float(hybrid_args.prior_local_surface_radius_scale),
+                        target_blend=float(hybrid_args.prior_local_surface_ray_patch_target_blend),
+                        target_delta_clip=float(hybrid_args.prior_local_surface_ray_patch_target_delta_clip),
+                        confidence_power=float(hybrid_args.prior_local_surface_ray_patch_confidence_power),
+                        min_weight=float(hybrid_args.prior_local_surface_ray_patch_min_weight),
+                    )
+                    prior_metrics.update(ray_patch_metrics)
+                    if loss_ray_patch is not None:
+                        weighted_ray_patch = (
+                            float(hybrid_args.lambda_prior_local_surface)
+                            * float(prior_guidance_scale)
+                            * float(hybrid_args.prior_local_surface_ray_patch_weight)
+                            * loss_ray_patch
+                        )
+                        loss = loss + weighted_ray_patch
+                        prior_metrics["ray_patch_w"] = float(weighted_ray_patch.detach().item())
 
         if (
             surface_route_bank is not None
@@ -7878,6 +8108,10 @@ def training(
                     prior_parts.append(f"l3d_pairs={int(prior_metrics['local_surface_pairs'])}")
                 if "local_surface_residual" in prior_metrics:
                     prior_parts.append(f"l3d_res={prior_metrics['local_surface_residual']:.6f}")
+                if "ray_patch_w" in prior_metrics:
+                    prior_parts.append(f"raypatch={prior_metrics['ray_patch_w']:.6f}")
+                if "ray_patch_pairs" in prior_metrics:
+                    prior_parts.append(f"rp_pairs={int(prior_metrics['ray_patch_pairs'])}")
                 if "sof_edge" in prior_metrics:
                     prior_parts.append(f"edge={prior_metrics['sof_edge']:.6f}")
                 if "sof_edge_alpha" in prior_metrics:
@@ -8391,6 +8625,16 @@ def training_report(
                 "local_surface_scale",
                 "local_surface_thin",
                 "local_surface_thin_ratio",
+                "ray_patch_w",
+                "ray_patch_loss",
+                "ray_patch_seed_count",
+                "ray_patch_seeds",
+                "ray_patch_candidates",
+                "ray_patch_pairs",
+                "ray_patch_radius",
+                "ray_patch_conf",
+                "ray_patch_target_abs",
+                "ray_patch_normal_cos",
             ):
                 if key in prior_metrics:
                     tb_writer.add_scalar(f"prior/{key}", prior_metrics[key], iteration)
@@ -8854,6 +9098,16 @@ def make_parser():
     parser.add_argument("--prior_local_surface_residual_clip", type=float, default=0.03)
     parser.add_argument("--prior_local_surface_residual_confidence_power", type=float, default=1.0)
     parser.add_argument("--prior_local_surface_residual_min_weight", type=float, default=0.05)
+    parser.add_argument("--prior_local_surface_ray_patch_weight", type=float, default=0.0)
+    parser.add_argument("--prior_local_surface_ray_patch_target", type=str, default="gt", choices=["gt", "prior"])
+    parser.add_argument("--prior_local_surface_ray_patch_min_seeds", type=int, default=64)
+    parser.add_argument("--prior_local_surface_ray_patch_max_seeds", type=int, default=512)
+    parser.add_argument("--prior_local_surface_ray_patch_max_candidates", type=int, default=16384)
+    parser.add_argument("--prior_local_surface_ray_patch_knn", type=int, default=8)
+    parser.add_argument("--prior_local_surface_ray_patch_target_blend", type=float, default=0.25)
+    parser.add_argument("--prior_local_surface_ray_patch_target_delta_clip", type=float, default=0.08)
+    parser.add_argument("--prior_local_surface_ray_patch_confidence_power", type=float, default=1.0)
+    parser.add_argument("--prior_local_surface_ray_patch_min_weight", type=float, default=0.05)
     parser.add_argument("--prior_local_surface_touch_min_radius_px", type=float, default=1.0)
     parser.add_argument("--prior_local_surface_touch_radius_scale", type=float, default=0.35)
     parser.add_argument("--prior_local_surface_touch_max_radius_px", type=float, default=8.0)
