@@ -174,12 +174,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--residual_vis_scale", type=float, default=4.0)
     parser.add_argument(
         "--asset_profile",
-        choices=("full", "train", "train_no_npz"),
+        choices=("full", "train", "train_no_npz", "continuous"),
         default="full",
         help=(
             "full writes all diagnostic/debug assets. train writes only training "
             "targets/masks plus npz. train_no_npz writes only image training "
-            "targets/masks and is useful when disk space is tight."
+            "targets/masks. continuous writes only continuous_target and "
+            "trust_continuous for disk-constrained resume."
         ),
     )
     parser.add_argument("--limit", type=int, default=0)
@@ -966,12 +967,18 @@ def main() -> None:
         "continuous_target",
         "trust_continuous",
     )
+    continuous_asset_names = (
+        "continuous_target",
+        "trust_continuous",
+    )
     if str(args.asset_profile) == "full":
         asset_names = full_asset_names
     elif str(args.asset_profile) == "train":
         asset_names = train_asset_names
-    else:
+    elif str(args.asset_profile) == "train_no_npz":
         asset_names = train_no_npz_asset_names
+    else:
+        asset_names = continuous_asset_names
     output_dirs = {name: args.output_root / name for name in asset_names}
     for path in output_dirs.values():
         path.mkdir(parents=True, exist_ok=True)
