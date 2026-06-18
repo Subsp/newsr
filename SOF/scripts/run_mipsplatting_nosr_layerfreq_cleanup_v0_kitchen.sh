@@ -86,6 +86,10 @@ EXTERNAL_PRIOR_MASK_SUBDIR="${EXTERNAL_PRIOR_MASK_SUBDIR:-}"
 EXTERNAL_PRIOR_EXTS="${EXTERNAL_PRIOR_EXTS:-png,jpg,jpeg,webp}"
 PRIOR_CONSISTENCY_THRESHOLD="${PRIOR_CONSISTENCY_THRESHOLD:-0.20}"
 PRIOR_MIN_VALID_RATIO="${PRIOR_MIN_VALID_RATIO:-0.30}"
+PRIOR_LOSS_MODE="${PRIOR_LOSS_MODE:-rgb_hf}"
+PRIOR_L1_WEIGHT="${PRIOR_L1_WEIGHT:-0.05}"
+PRIOR_HF_WEIGHT="${PRIOR_HF_WEIGHT:-0.1}"
+PRIOR_DELTA_CLIP="${PRIOR_DELTA_CLIP:-0.15}"
 
 PRIOR_LOCAL_DIR="${PRIOR_LOCAL_DIR:-}"
 PRIOR_LOCAL_MASK_DIR="${PRIOR_LOCAL_MASK_DIR:-}"
@@ -384,6 +388,10 @@ if [[ "${FORCE_RERUN}" == "1" || ! -f "${CHECKPOINT_PATH}" ]]; then
     --layer_frequency_from_iter "${LAYER_FREQUENCY_FROM_ITER}"
     --layer_frequency_until_iter "${LAYER_FREQUENCY_UNTIL_ITER}"
     --layer_frequency_log_interval "${LAYER_FREQUENCY_LOG_INTERVAL}"
+    --prior_loss_mode "${PRIOR_LOSS_MODE}"
+    --prior_l1_weight "${PRIOR_L1_WEIGHT}"
+    --prior_hf_weight "${PRIOR_HF_WEIGHT}"
+    --prior_delta_clip "${PRIOR_DELTA_CLIP}"
   )
   if [[ -n "${PRIOR_EDGE_DIR}" || -n "${PRIOR_EDGE_MASK_DIR}" ]]; then
     TRAIN_ARGS+=(
