@@ -2270,7 +2270,11 @@ def compute_prior_edge_carrier_shape_loss(
     if surface_mask is not None:
         surface_mask = surface_mask.to(device=gaussians.get_xyz.device, dtype=torch.bool).reshape(-1)
         if int(surface_mask.shape[0]) != total:
-            raise ValueError(f"Edge carrier surface mask length mismatch: {int(surface_mask.shape[0])} vs {total}")
+            surface_mask = _expand_root_aligned_mask(
+                surface_mask,
+                gaussians,
+                label="edge carrier surface mask",
+            )
         selected = selected & surface_mask
     count = int(selected.sum().item())
     metrics["edge_carrier_count"] = float(count)
@@ -2419,7 +2423,11 @@ def compute_prior_local_surface_neighborhood_loss(
     if surface_mask is not None:
         surface_mask = surface_mask.to(device=device, dtype=torch.bool).reshape(-1)
         if int(surface_mask.shape[0]) != total:
-            raise ValueError(f"Local surface mask length mismatch: {int(surface_mask.shape[0])} vs {total}")
+            surface_mask = _expand_root_aligned_mask(
+                surface_mask,
+                gaussians,
+                label="local surface mask",
+            )
         selected = selected & surface_mask
     if edge_touch_mask is not None:
         edge_touch_mask = edge_touch_mask.to(device=device, dtype=torch.bool).reshape(-1)
@@ -2640,7 +2648,11 @@ def compute_prior_ray_patch_surface_loss(
     if surface_mask is not None:
         surface_mask = surface_mask.to(device=device, dtype=torch.bool).reshape(-1)
         if int(surface_mask.shape[0]) != total:
-            raise ValueError(f"Ray-patch surface mask mismatch: {int(surface_mask.shape[0])} vs {total}")
+            surface_mask = _expand_root_aligned_mask(
+                surface_mask,
+                gaussians,
+                label="ray-patch surface mask",
+            )
         candidate = candidate & surface_mask
     if edge_touch_mask is not None:
         edge_touch_mask = edge_touch_mask.to(device=device, dtype=torch.bool).reshape(-1)
