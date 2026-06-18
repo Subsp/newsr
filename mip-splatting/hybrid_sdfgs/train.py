@@ -4407,6 +4407,61 @@ def _load_prior_feature_pack(
         )
 
     prior_loss_mode = str(getattr(hybrid_args, "prior_loss_mode", "rgb_hf"))
+    if prior_loss_mode == "ie_srgs_fusion_v0":
+        if prior_anchor_image is None:
+            return None
+        structure_mask = torch.ones_like(prior_image[:1])
+        if prior_mask_bank is not None:
+            loaded_mask = prior_mask_bank.get(
+                camera.image_name,
+                width=int(camera.image_width),
+                height=int(camera.image_height),
+                device=device,
+            )
+            if loaded_mask is not None:
+                structure_mask = loaded_mask.clamp(min=0.0, max=1.0)
+        eps = max(float(getattr(hybrid_args, "prior_ie_srgs_eps", 1e-6)), 1e-12)
+        threshold = float(getattr(hybrid_args, "prior_ie_srgs_threshold", 0.9))
+        discrepancy = (
+            (prior_image - prior_anchor_image).abs()
+            / prior_anchor_image.abs().clamp(min=eps)
+        ).mean(dim=0, keepdim=True)
+        internal_mask = (discrepancy >= threshold).to(dtype=prior_image.dtype)
+        external_mask = 1.0 - internal_mask
+        fusion_target = internal_mask * prior_anchor_image + external_mask * prior_image
+        prior_delta = fusion_target - prior_anchor_image
+        if hybrid_args.prior_delta_clip > 0:
+            clip_v = float(hybrid_args.prior_delta_clip)
+            prior_delta = prior_delta.clamp(min=-clip_v, max=clip_v)
+        lap_hf = _laplacian_highfreq(prior_delta).abs().mean(dim=0, keepdim=True)
+        hf_guidance = lap_hf * structure_mask
+        grad_x, grad_y = _sobel_gradients(prior_delta.mean(dim=0, keepdim=True))
+        feature_map = torch.cat(
+            [
+                hf_guidance,
+                grad_x * structure_mask,
+                grad_y * structure_mask,
+            ],
+            dim=0,
+        )
+        return {
+            "prior_image": prior_image,
+            "gt_image": gt_image,
+            "anchor_image": prior_anchor_image,
+            "fusion_target": fusion_target.detach(),
+            "fusion_internal_mask": internal_mask.detach(),
+            "fusion_external_mask": external_mask.detach(),
+            "consistency": discrepancy.detach(),
+            "mask": structure_mask,
+            "consistency_mask": torch.ones_like(structure_mask),
+            "structure_mask": structure_mask,
+            "hard_mask": prior_hard_mask,
+            "soft_mask": prior_soft_mask,
+            "valid_ratio": structure_mask.mean(),
+            "guidance": hf_guidance,
+            "feature_map": feature_map,
+        }
+
     if prior_loss_mode == "masked_residual_hf_v1":
         if prior_anchor_image is None:
             return None
@@ -5362,7 +5417,7 @@ def training(
             print("[PRIOR] no usable external prior masks found, falling back to consistency mask only.")
 
     prior_anchor_fallback_roots = []
-    if hybrid_args.prior_loss_mode == "masked_residual_hf_v1" and prior_root:
+    if hybrid_args.prior_loss_mode in {"masked_residual_hf_v1", "ie_srgs_fusion_v0"} and prior_root:
         prior_anchor_fallback_roots.append(os.path.join(prior_root, "aligned_references"))
     prior_anchor_bank = _build_optional_external_bank(
         train_cameras=train_cameras,
@@ -5395,6 +5450,14 @@ def training(
             f"soft_power={hybrid_args.prior_soft_mask_power} "
             f"hard_threshold={hybrid_args.prior_hard_mask_threshold} "
             f"min_pixels={hybrid_args.prior_masked_min_pixels}"
+        )
+    if hybrid_args.prior_loss_mode == "ie_srgs_fusion_v0":
+        print(
+            "[PRIOR] IE-SRGS fusion mode: "
+            f"external={prior_root or '<none>'} "
+            f"internal={hybrid_args.prior_anchor_dir or '<fallback/none>'} "
+            f"threshold={hybrid_args.prior_ie_srgs_threshold:.3f} "
+            f"eps={hybrid_args.prior_ie_srgs_eps:.1e}"
         )
 
     prior_view_train_cameras = []
@@ -7030,7 +7093,29 @@ def training(
                         hf_focus_weight.sum() * render_for_prior.shape[0],
                         min=1.0,
                     )
-                    if hybrid_args.prior_loss_mode == "masked_residual_hf_v1":
+                    prior_target_image = prior_feature_pack.get("fusion_target", prior_image)
+                    if prior_target_image is None:
+                        prior_target_image = prior_image
+                    prior_target_image = prior_target_image.to(
+                        device=render_for_prior.device,
+                        dtype=render_for_prior.dtype,
+                    )
+
+                    if hybrid_args.prior_loss_mode == "ie_srgs_fusion_v0":
+                        if prior_anchor_image is None:
+                            raise RuntimeError("ie_srgs_fusion_v0 requires a prior anchor image for every active prior sample.")
+                        anchor_for_prior = prior_anchor_image.to(device=render_for_prior.device, dtype=render_for_prior.dtype)
+                        prior_delta = prior_target_image - anchor_for_prior
+                        render_delta = render_for_prior - anchor_for_prior
+                        primary_render_delta = render_delta
+                        primary_prior_delta = prior_delta
+                        loss_prior_l1 = ((render_for_prior - prior_target_image).abs() * mask).sum() / denom
+                        render_residual_hf = _laplacian_highfreq(render_delta)
+                        prior_residual_hf = _laplacian_highfreq(prior_delta)
+                        loss_prior_hf = (
+                            (render_residual_hf - prior_residual_hf).abs() * hf_focus_weight
+                        ).sum() / hf_focus_denom
+                    elif hybrid_args.prior_loss_mode == "masked_residual_hf_v1":
                         if prior_anchor_image is None:
                             raise RuntimeError("masked_residual_hf_v1 requires a prior anchor image for every active prior sample.")
                         anchor_for_prior = prior_anchor_image.to(device=render_for_prior.device, dtype=render_for_prior.dtype)
@@ -7050,7 +7135,7 @@ def training(
                     else:
                         loss_prior_l1 = ((render_for_prior - prior_image).abs() * mask).sum() / denom
 
-                    if hybrid_args.prior_loss_mode != "masked_residual_hf_v1" and hybrid_args.disable_prior_hf_residual:
+                    if hybrid_args.prior_loss_mode not in {"masked_residual_hf_v1", "ie_srgs_fusion_v0"} and hybrid_args.disable_prior_hf_residual:
                         image_hf = _laplacian_highfreq(render_for_prior)
                         prior_hf = _laplacian_highfreq(prior_image)
                         primary_render_delta = render_for_prior
@@ -7058,7 +7143,7 @@ def training(
                         render_residual_hf = image_hf
                         prior_residual_hf = prior_hf
                         loss_prior_hf = ((image_hf - prior_hf).abs() * hf_focus_weight).sum() / hf_focus_denom
-                    elif hybrid_args.prior_loss_mode != "masked_residual_hf_v1":
+                    elif hybrid_args.prior_loss_mode not in {"masked_residual_hf_v1", "ie_srgs_fusion_v0"}:
                         prior_delta = prior_image - gt_for_prior
                         if hybrid_args.prior_delta_clip > 0:
                             clip_v = hybrid_args.prior_delta_clip
@@ -7322,6 +7407,15 @@ def training(
                         "guidance_scale": float(prior_guidance_scale),
                         "masked_update": 1.0 if prior_residual_masked_update else 0.0,
                     }
+                    if hybrid_args.prior_loss_mode == "ie_srgs_fusion_v0":
+                        fusion_internal_mask = prior_feature_pack.get("fusion_internal_mask")
+                        fusion_external_mask = prior_feature_pack.get("fusion_external_mask")
+                        if fusion_internal_mask is not None:
+                            prior_metrics["ie_internal"] = fusion_internal_mask.detach().mean().item()
+                        if fusion_external_mask is not None:
+                            prior_metrics["ie_external"] = fusion_external_mask.detach().mean().item()
+                        if consistency is not None:
+                            prior_metrics["ie_discrepancy"] = consistency.detach().mean().item()
                     if recent_seed_imprint_loss is not None:
                         prior_metrics["hf_recent_imprint"] = recent_seed_imprint_loss.detach().item()
                     if prior_view_curriculum_state is not None:
@@ -7378,7 +7472,7 @@ def training(
                     ):
                         freq_prior_base, freq_prior_info = frequency_block.compute(
                             render_image=render_for_prior,
-                            target_image=prior_image,
+                            target_image=prior_target_image,
                             mask=mask,
                         )
                         weighted_freq_prior = (
@@ -8395,6 +8489,12 @@ def training(
                     )
                 if "sof_local" in prior_metrics:
                     prior_parts.append(f"local={prior_metrics['sof_local']:.6f}")
+                if "ie_internal" in prior_metrics:
+                    prior_parts.append(f"ie_int={prior_metrics['ie_internal']:.3f}")
+                if "ie_external" in prior_metrics:
+                    prior_parts.append(f"ie_ext={prior_metrics['ie_external']:.3f}")
+                if "ie_discrepancy" in prior_metrics:
+                    prior_parts.append(f"ie_D={prior_metrics['ie_discrepancy']:.3f}")
                 if "local_surface_w" in prior_metrics:
                     prior_parts.append(f"local3d={prior_metrics['local_surface_w']:.6f}")
                 if "local_surface_count" in prior_metrics:
@@ -8915,6 +9015,9 @@ def training_report(
                 tb_writer.add_scalar("sequence_loss/lambda_tex", prior_metrics["sequence_lambda_tex"], iteration)
             if "sof_local" in prior_metrics:
                 tb_writer.add_scalar("prior/sof_local", prior_metrics["sof_local"], iteration)
+            for key in ("ie_internal", "ie_external", "ie_discrepancy"):
+                if key in prior_metrics:
+                    tb_writer.add_scalar(f"prior/{key}", prior_metrics[key], iteration)
             for key in (
                 "local_surface_w",
                 "local_surface_loss",
@@ -9367,8 +9470,10 @@ def make_parser():
     parser.add_argument("--external_prior_mask_subdir", type=str, default="")
     parser.add_argument("--external_prior_exts", type=str, default="png,jpg,jpeg,webp")
     parser.add_argument("--external_prior_use_dataset_root", action="store_true")
-    parser.add_argument("--prior_loss_mode", type=str, default="rgb_hf", choices=["rgb_hf", "masked_residual_hf_v1"])
+    parser.add_argument("--prior_loss_mode", type=str, default="rgb_hf", choices=["rgb_hf", "masked_residual_hf_v1", "ie_srgs_fusion_v0"])
     parser.add_argument("--prior_anchor_dir", type=str, default="")
+    parser.add_argument("--prior_ie_srgs_threshold", type=float, default=0.9)
+    parser.add_argument("--prior_ie_srgs_eps", type=float, default=1e-6)
     parser.add_argument("--prior_soft_mask_dir", type=str, default="")
     parser.add_argument("--prior_hard_mask_dir", type=str, default="")
     parser.add_argument("--prior_soft_mask_power", type=float, default=1.0)

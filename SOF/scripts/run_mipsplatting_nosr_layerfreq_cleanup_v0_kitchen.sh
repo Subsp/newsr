@@ -85,9 +85,12 @@ EXTERNAL_PRIOR_ROOT="${EXTERNAL_PRIOR_ROOT:-}"
 EXTERNAL_PRIOR_SUBDIR="${EXTERNAL_PRIOR_SUBDIR:-priors}"
 EXTERNAL_PRIOR_MASK_SUBDIR="${EXTERNAL_PRIOR_MASK_SUBDIR:-}"
 EXTERNAL_PRIOR_EXTS="${EXTERNAL_PRIOR_EXTS:-png,jpg,jpeg,webp}"
+PRIOR_ANCHOR_DIR="${PRIOR_ANCHOR_DIR:-}"
 PRIOR_CONSISTENCY_THRESHOLD="${PRIOR_CONSISTENCY_THRESHOLD:-0.20}"
 PRIOR_MIN_VALID_RATIO="${PRIOR_MIN_VALID_RATIO:-0.30}"
 PRIOR_LOSS_MODE="${PRIOR_LOSS_MODE:-rgb_hf}"
+PRIOR_IE_SRGS_THRESHOLD="${PRIOR_IE_SRGS_THRESHOLD:-0.9}"
+PRIOR_IE_SRGS_EPS="${PRIOR_IE_SRGS_EPS:-1e-6}"
 PRIOR_L1_WEIGHT="${PRIOR_L1_WEIGHT:-0.05}"
 PRIOR_HF_WEIGHT="${PRIOR_HF_WEIGHT:-0.1}"
 PRIOR_DELTA_CLIP="${PRIOR_DELTA_CLIP:-0.15}"
@@ -327,6 +330,16 @@ echo "[nosr-layerfreq-cleanup-v0] save checkpoint   : ${SAVE_CHECKPOINT_AFTER}"
 echo "[nosr-layerfreq-cleanup-v0] layer freq        : ns=${LAMBDA_NON_SURFACE_HF} surf=${LAMBDA_SURFACE_HF_CLOSURE} start_hf=${LAMBDA_SURFACE_START_HF_PRESERVE} scale=${SURFACE_HF_UPDATE_SCALE} target=${LAYER_FREQUENCY_SURFACE_TARGET} dynamic_roots=${LAYER_FREQUENCY_DYNAMIC_ROOTS}"
 if [[ -n "${EXTERNAL_PRIOR_ROOT}" ]]; then
   echo "[nosr-layerfreq-cleanup-v0] external prior   : root=${EXTERNAL_PRIOR_ROOT} subdir=${EXTERNAL_PRIOR_SUBDIR} mask=${EXTERNAL_PRIOR_MASK_SUBDIR:-none}"
+  if [[ "${PRIOR_LOSS_MODE}" == "ie_srgs_fusion_v0" && -z "${PRIOR_ANCHOR_DIR}" ]]; then
+    echo "[nosr-layerfreq-cleanup-v0] PRIOR_LOSS_MODE=ie_srgs_fusion_v0 requires PRIOR_ANCHOR_DIR as the internal 3DGS source." >&2
+    exit 1
+  fi
+  if [[ -n "${PRIOR_ANCHOR_DIR}" ]]; then
+    echo "[nosr-layerfreq-cleanup-v0] prior anchor     : ${PRIOR_ANCHOR_DIR}"
+  fi
+  if [[ "${PRIOR_LOSS_MODE}" == "ie_srgs_fusion_v0" ]]; then
+    echo "[nosr-layerfreq-cleanup-v0] IE-SRGS fusion  : threshold=${PRIOR_IE_SRGS_THRESHOLD} eps=${PRIOR_IE_SRGS_EPS}"
+  fi
 fi
 if [[ -n "${PRIOR_LOCAL_DIR}" || -n "${PRIOR_LOCAL_MASK_DIR}" ]]; then
   if [[ -z "${PRIOR_LOCAL_DIR}" || -z "${PRIOR_LOCAL_MASK_DIR}" ]]; then
@@ -551,7 +564,12 @@ if [[ "${FORCE_RERUN}" == "1" || ! -f "${TRAIN_DONE_PATH}" ]]; then
       --external_prior_exts "${EXTERNAL_PRIOR_EXTS}"
       --prior_consistency_threshold "${PRIOR_CONSISTENCY_THRESHOLD}"
       --prior_min_valid_ratio "${PRIOR_MIN_VALID_RATIO}"
+      --prior_ie_srgs_threshold "${PRIOR_IE_SRGS_THRESHOLD}"
+      --prior_ie_srgs_eps "${PRIOR_IE_SRGS_EPS}"
     )
+    if [[ -n "${PRIOR_ANCHOR_DIR}" ]]; then
+      TRAIN_ARGS+=(--prior_anchor_dir "${PRIOR_ANCHOR_DIR}")
+    fi
     if [[ -n "${EXTERNAL_PRIOR_MASK_SUBDIR}" ]]; then
       TRAIN_ARGS+=(--external_prior_mask_subdir "${EXTERNAL_PRIOR_MASK_SUBDIR}")
     fi
