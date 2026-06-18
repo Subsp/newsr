@@ -29,6 +29,7 @@ class SOFPriorConfig:
     prior_edge_lowfreq_anchor: str = "render"
     prior_edge_detail_min_gain: float = 0.0
     prior_edge_confidence_power: float = 1.0
+    prior_edge_hf_residual_clip: float = 0.0
     prior_edge_contrast_weight: float = 0.0
     prior_edge_contrast_radius: int = 1
     prior_edge_contrast_target_gain: float = 1.0
@@ -59,6 +60,10 @@ def blur_image_chw(image: torch.Tensor, kernel_size: int) -> torch.Tensor:
     pad = kernel_size // 2
     padded = F.pad(image.unsqueeze(0), (pad, pad, pad, pad), mode="reflect")
     return F.avg_pool2d(padded, kernel_size=kernel_size, stride=1)[0]
+
+
+def highpass_image_chw(image: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    return image - blur_image_chw(image, kernel_size)
 
 
 def compute_masked_l1_loss(
@@ -180,6 +185,40 @@ def compute_weighted_directional_contrast_l1_loss(
     return (torch.abs(image_contrast - target_contrast) * weight).sum() / active.clamp_min(1.0)
 
 
+def compute_weighted_directional_contrast_residual_l1_loss(
+    image: torch.Tensor,
+    target: torch.Tensor,
+    anchor: torch.Tensor,
+    weight_hw: Optional[torch.Tensor],
+    *,
+    radius_px: int = 1,
+    target_gain: float = 1.0,
+    target_clip: float = 0.0,
+) -> Optional[torch.Tensor]:
+    weight_hw = _normalize_mask_hw(weight_hw, dtype=image.dtype, device=image.device)
+    if weight_hw is None:
+        return None
+    image_luma = _luma_chw(image)
+    target_luma = _luma_chw(target.detach())
+    anchor_luma = _luma_chw(anchor.detach())
+    image_cx, image_cy, valid_x, valid_y = _central_contrast_maps(image_luma, int(radius_px))
+    target_cx, target_cy, _, _ = _central_contrast_maps(target_luma, int(radius_px))
+    anchor_cx, anchor_cy, _, _ = _central_contrast_maps(anchor_luma, int(radius_px))
+    target_rx = target_cx - anchor_cx
+    target_ry = target_cy - anchor_cy
+    choose_x = target_rx.detach().abs() >= target_ry.detach().abs()
+    valid = torch.where(choose_x, valid_x, valid_y)
+    image_residual = torch.where(choose_x, image_cx - anchor_cx, image_cy - anchor_cy)
+    target_residual = torch.where(choose_x, target_rx, target_ry).detach() * float(target_gain)
+    if float(target_clip) > 0.0:
+        target_residual = target_residual.clamp(min=-float(target_clip), max=float(target_clip))
+    weight = weight_hw * valid.to(dtype=weight_hw.dtype)
+    active = weight.sum()
+    if float(active.item()) <= 0:
+        return None
+    return (torch.abs(image_residual - target_residual) * weight).sum() / active.clamp_min(1.0)
+
+
 class SOFPriorBlock:
     def __init__(self, cfg: SOFPriorConfig):
         self.cfg = cfg
@@ -223,6 +262,7 @@ class SOFPriorBlock:
         iteration: int,
         train_start_iter: int,
         lowfreq_anchor: Optional[torch.Tensor] = None,
+        anchor_image: Optional[torch.Tensor] = None,
     ) -> tuple[Optional[torch.Tensor], Optional[float]]:
         if float(self.cfg.lambda_prior_edge) <= 0.0 or prior_image is None:
             return None, None
@@ -234,7 +274,8 @@ class SOFPriorBlock:
         if float(mask_hw.sum().item()) < float(self.cfg.prior_edge_min_pixels):
             return None, None
 
-        if str(self.cfg.prior_edge_loss_mode).strip().lower() == "detail_v1":
+        mode = str(self.cfg.prior_edge_loss_mode).strip().lower()
+        if mode == "detail_v1":
             detail_alpha = self.get_prior_edge_detail_alpha(iteration, train_start_iter)
             return (
                 self.compute_prior_edge_detail_loss(
@@ -246,6 +287,18 @@ class SOFPriorBlock:
                 ),
                 detail_alpha,
             )
+        if mode == "hf_residual_v1":
+            detail_alpha = self.get_prior_edge_detail_alpha(iteration, train_start_iter)
+            return (
+                self.compute_prior_edge_hf_residual_loss(
+                    image=render_image,
+                    prior_target=prior_image,
+                    image_mask=mask_hw,
+                    detail_alpha=detail_alpha,
+                    anchor_image=anchor_image,
+                ),
+                detail_alpha,
+            )
 
         blend_alpha = float(self.cfg.prior_edge_blend_alpha)
         prior_target = prior_image
@@ -253,6 +306,103 @@ class SOFPriorBlock:
             blend_alpha = max(0.0, blend_alpha)
             prior_target = blend_alpha * prior_target + (1.0 - blend_alpha) * render_image.detach()
         return compute_masked_l1_loss(render_image, prior_target, mask_hw), None
+
+    def compute_prior_edge_hf_residual_loss(
+        self,
+        image: torch.Tensor,
+        prior_target: torch.Tensor,
+        image_mask: Optional[torch.Tensor],
+        *,
+        detail_alpha: float,
+        anchor_image: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        image_mask = _normalize_mask_hw(image_mask, dtype=image.dtype, device=image.device)
+        if image_mask is None:
+            return None
+        if float(image_mask.sum().item()) <= 0:
+            return None
+
+        blur_kernel = int(self.cfg.prior_edge_detail_blur_kernel)
+        anchor = image.detach() if anchor_image is None else anchor_image.detach()
+        image_low = blur_image_chw(image, blur_kernel)
+        anchor_low = blur_image_chw(anchor, blur_kernel)
+        prior_low = blur_image_chw(prior_target, blur_kernel)
+        image_high = image - image_low
+        anchor_high = highpass_image_chw(anchor, blur_kernel)
+        prior_high = highpass_image_chw(prior_target, blur_kernel)
+
+        target_residual = prior_high - anchor_high
+        residual_clip = float(self.cfg.prior_edge_hf_residual_clip)
+        if residual_clip > 0.0:
+            target_residual = target_residual.clamp(min=-residual_clip, max=residual_clip)
+
+        lowfreq_diff = torch.abs(prior_low - anchor_low).mean(dim=0)
+        lowfreq_threshold = float(self.cfg.prior_edge_lowfreq_threshold)
+        if lowfreq_threshold > 0.0:
+            confidence = torch.clamp(1.0 - lowfreq_diff / lowfreq_threshold, min=0.0, max=1.0)
+        else:
+            confidence = torch.ones_like(image_mask)
+
+        detail_min_gain = float(self.cfg.prior_edge_detail_min_gain)
+        if detail_min_gain > 0.0:
+            target_detail = torch.abs(target_residual).mean(dim=0)
+            current_residual = highpass_image_chw(image.detach(), blur_kernel) - anchor_high
+            current_detail = torch.abs(current_residual).mean(dim=0)
+            detail_confidence = torch.clamp(
+                (target_detail - current_detail - detail_min_gain) / detail_min_gain,
+                min=0.0,
+                max=1.0,
+            )
+            confidence = confidence * detail_confidence
+
+        confidence_power = float(self.cfg.prior_edge_confidence_power)
+        if confidence_power != 1.0:
+            confidence = torch.clamp(confidence, min=0.0, max=1.0).pow(confidence_power)
+        confidence = confidence * image_mask
+
+        if float(confidence.sum().item()) < float(self.cfg.prior_edge_min_pixels):
+            return None
+
+        detail_alpha = max(0.0, min(1.0, float(detail_alpha)))
+        image_residual = image_high - anchor_high
+        residual_loss = compute_weighted_l1_loss(
+            image_residual,
+            (detail_alpha * target_residual).detach(),
+            confidence,
+        )
+        if residual_loss is None:
+            return None
+
+        total_loss = float(self.cfg.prior_edge_detail_weight) * residual_loss
+
+        lowfreq_weight = float(self.cfg.prior_edge_lowfreq_weight)
+        if lowfreq_weight > 0.0:
+            low_loss = compute_weighted_l1_loss(image_low, anchor_low.detach(), image_mask)
+            if low_loss is not None:
+                total_loss = total_loss + lowfreq_weight * low_loss
+
+        grad_weight = float(self.cfg.prior_edge_grad_weight)
+        if grad_weight > 0.0:
+            grad_target = anchor + detail_alpha * target_residual
+            grad_loss = compute_weighted_gradient_l1_loss(image, grad_target.detach(), confidence)
+            if grad_loss is not None:
+                total_loss = total_loss + grad_weight * grad_loss
+
+        contrast_weight = float(self.cfg.prior_edge_contrast_weight)
+        if contrast_weight > 0.0:
+            contrast_loss = compute_weighted_directional_contrast_residual_l1_loss(
+                image,
+                prior_target,
+                anchor,
+                confidence,
+                radius_px=int(self.cfg.prior_edge_contrast_radius),
+                target_gain=float(self.cfg.prior_edge_contrast_target_gain),
+                target_clip=float(self.cfg.prior_edge_contrast_target_clip),
+            )
+            if contrast_loss is not None:
+                total_loss = total_loss + contrast_weight * contrast_loss
+
+        return total_loss
 
     def compute_prior_edge_detail_loss(
         self,

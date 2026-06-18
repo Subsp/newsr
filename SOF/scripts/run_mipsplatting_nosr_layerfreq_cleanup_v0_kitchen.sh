@@ -131,6 +131,7 @@ PRIOR_LOCAL_SURFACE_MASK_THRESHOLD="${PRIOR_LOCAL_SURFACE_MASK_THRESHOLD:-0.20}"
 
 PRIOR_EDGE_DIR="${PRIOR_EDGE_DIR:-}"
 PRIOR_EDGE_MASK_DIR="${PRIOR_EDGE_MASK_DIR:-}"
+PRIOR_EDGE_ANCHOR_DIR="${PRIOR_EDGE_ANCHOR_DIR:-}"
 LAMBDA_PRIOR_EDGE="${LAMBDA_PRIOR_EDGE:-0.0}"
 PRIOR_EDGE_LOSS_MODE="${PRIOR_EDGE_LOSS_MODE:-detail_v1}"
 PRIOR_EDGE_FROM_ITER="${PRIOR_EDGE_FROM_ITER:-${INPUT_ITERATION}}"
@@ -147,6 +148,7 @@ PRIOR_EDGE_LOWFREQ_THRESHOLD="${PRIOR_EDGE_LOWFREQ_THRESHOLD:-0.08}"
 PRIOR_EDGE_LOWFREQ_ANCHOR="${PRIOR_EDGE_LOWFREQ_ANCHOR:-render}"
 PRIOR_EDGE_DETAIL_MIN_GAIN="${PRIOR_EDGE_DETAIL_MIN_GAIN:-0.0}"
 PRIOR_EDGE_CONFIDENCE_POWER="${PRIOR_EDGE_CONFIDENCE_POWER:-1.5}"
+PRIOR_EDGE_HF_RESIDUAL_CLIP="${PRIOR_EDGE_HF_RESIDUAL_CLIP:-0.0}"
 PRIOR_EDGE_UPDATE_SCALE="${PRIOR_EDGE_UPDATE_SCALE:-0.75}"
 PRIOR_EDGE_CONTRAST_WEIGHT="${PRIOR_EDGE_CONTRAST_WEIGHT:-0.0}"
 PRIOR_EDGE_CONTRAST_RADIUS="${PRIOR_EDGE_CONTRAST_RADIUS:-1}"
@@ -307,8 +309,12 @@ if [[ -n "${PRIOR_EDGE_DIR}" || -n "${PRIOR_EDGE_MASK_DIR}" ]]; then
       exit 1
     fi
   done
+  if [[ -n "${PRIOR_EDGE_ANCHOR_DIR}" && ! -d "${PRIOR_EDGE_ANCHOR_DIR}" ]]; then
+    echo "[nosr-layerfreq-cleanup-v0] required NPSE edge anchor dir not found: ${PRIOR_EDGE_ANCHOR_DIR}" >&2
+    exit 1
+  fi
   echo "[nosr-layerfreq-cleanup-v0] prior edge      : target=${PRIOR_EDGE_DIR} mask=${PRIOR_EDGE_MASK_DIR} lambda=${LAMBDA_PRIOR_EDGE} mode=${PRIOR_EDGE_LOSS_MODE}"
-  echo "[nosr-layerfreq-cleanup-v0] edge carrier    : contrast=${PRIOR_EDGE_CONTRAST_WEIGHT} shape=${LAMBDA_PRIOR_EDGE_SHAPE} thin=${PRIOR_EDGE_SHAPE_THIN_RATIO} line=${PRIOR_EDGE_SHAPE_LINE_RATIO}"
+  echo "[nosr-layerfreq-cleanup-v0] edge carrier    : anchor=${PRIOR_EDGE_ANCHOR_DIR:-render-detach} contrast=${PRIOR_EDGE_CONTRAST_WEIGHT} hf_clip=${PRIOR_EDGE_HF_RESIDUAL_CLIP} shape=${LAMBDA_PRIOR_EDGE_SHAPE} thin=${PRIOR_EDGE_SHAPE_THIN_RATIO} line=${PRIOR_EDGE_SHAPE_LINE_RATIO}"
 fi
 if [[ "${PRIOR_HF_SEED_ENABLE}" == "1" ]]; then
   if [[ -z "${EXTERNAL_PRIOR_ROOT}" ]]; then
@@ -403,6 +409,7 @@ if [[ "${FORCE_RERUN}" == "1" || ! -f "${CHECKPOINT_PATH}" ]]; then
       --prior_edge_mask_dir "${PRIOR_EDGE_MASK_DIR}"
       --lambda_prior_edge "${LAMBDA_PRIOR_EDGE}"
       --prior_edge_loss_mode "${PRIOR_EDGE_LOSS_MODE}"
+      --prior_edge_anchor_dir "${PRIOR_EDGE_ANCHOR_DIR}"
       --prior_edge_blend_alpha "${PRIOR_EDGE_BLEND_ALPHA}"
       --prior_edge_min_pixels "${PRIOR_EDGE_MIN_PIXELS}"
       --prior_edge_from_iter "${PRIOR_EDGE_FROM_ITER}"
@@ -420,6 +427,7 @@ if [[ "${FORCE_RERUN}" == "1" || ! -f "${CHECKPOINT_PATH}" ]]; then
       --prior_edge_lowfreq_anchor "${PRIOR_EDGE_LOWFREQ_ANCHOR}"
       --prior_edge_detail_min_gain "${PRIOR_EDGE_DETAIL_MIN_GAIN}"
       --prior_edge_confidence_power "${PRIOR_EDGE_CONFIDENCE_POWER}"
+      --prior_edge_hf_residual_clip "${PRIOR_EDGE_HF_RESIDUAL_CLIP}"
       --prior_edge_update_scale "${PRIOR_EDGE_UPDATE_SCALE}"
       --prior_edge_contrast_weight "${PRIOR_EDGE_CONTRAST_WEIGHT}"
       --prior_edge_contrast_radius "${PRIOR_EDGE_CONTRAST_RADIUS}"

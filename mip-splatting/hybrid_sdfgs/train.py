@@ -5193,6 +5193,7 @@ def training(
     prior_local_surface_payload = None
     prior_edge_bank = None
     prior_edge_mask_bank = None
+    prior_edge_anchor_bank = None
     surface_route_bank = None
     external_update_mask = None
     active_train_cameras = train_cameras
@@ -5394,6 +5395,7 @@ def training(
                 prior_edge_lowfreq_anchor=hybrid_args.prior_edge_lowfreq_anchor,
                 prior_edge_detail_min_gain=hybrid_args.prior_edge_detail_min_gain,
                 prior_edge_confidence_power=hybrid_args.prior_edge_confidence_power,
+                prior_edge_hf_residual_clip=hybrid_args.prior_edge_hf_residual_clip,
                 prior_edge_contrast_weight=hybrid_args.prior_edge_contrast_weight,
                 prior_edge_contrast_radius=hybrid_args.prior_edge_contrast_radius,
                 prior_edge_contrast_target_gain=hybrid_args.prior_edge_contrast_target_gain,
@@ -5406,6 +5408,7 @@ def training(
             f"edge={hybrid_args.lambda_prior_edge:.3f} "
             f"mode={hybrid_args.prior_edge_loss_mode} "
             f"contrast={hybrid_args.prior_edge_contrast_weight:.3f} "
+            f"hf_clip={hybrid_args.prior_edge_hf_residual_clip:.3f} "
             f"shape={hybrid_args.lambda_prior_edge_shape:.3f} "
             f"local_surface={hybrid_args.lambda_prior_local_surface:.3f} "
             f"local_from={hybrid_args.prior_local_from_iter} "
@@ -5473,6 +5476,13 @@ def training(
                 exts=ext_tokens,
                 bank_cls=PriorMaskTensorBank,
                 label="SOF-PRIOR-EDGE-MASK",
+            )
+            prior_edge_anchor_bank = _build_optional_external_bank(
+                train_cameras=train_cameras,
+                root_dir=hybrid_args.prior_edge_anchor_dir,
+                exts=ext_tokens,
+                bank_cls=PriorTensorBank,
+                label="SOF-PRIOR-EDGE-ANCHOR",
             )
         else:
             print("[SOF-PRIOR] edge branch requested but prior_edge_dir/mask_dir is incomplete; disabling edge branch.")
@@ -7371,6 +7381,14 @@ def training(
                     height=int(camera_for_sof_prior.image_height),
                     device=render_for_sof_prior.device,
                 )
+                edge_anchor_image = None
+                if prior_edge_anchor_bank is not None:
+                    edge_anchor_image = prior_edge_anchor_bank.get(
+                        camera_for_sof_prior.image_name,
+                        width=int(camera_for_sof_prior.image_width),
+                        height=int(camera_for_sof_prior.image_height),
+                        device=render_for_sof_prior.device,
+                    )
                 lowfreq_anchor = sof_gt_image if hybrid_args.prior_edge_lowfreq_anchor == "gt" else None
                 loss_prior_edge, edge_alpha = sof_prior_block.compute_edge_loss(
                     render_image=render_for_sof_prior,
@@ -7379,6 +7397,7 @@ def training(
                     iteration=iteration,
                     train_start_iter=train_start_iter,
                     lowfreq_anchor=lowfreq_anchor,
+                    anchor_image=edge_anchor_image,
                 )
                 if loss_prior_edge is not None:
                     weighted_prior_edge = hybrid_args.lambda_prior_edge * loss_prior_edge
@@ -9324,7 +9343,8 @@ def make_parser():
     parser.add_argument("--prior_edge_dir", type=str, default="")
     parser.add_argument("--prior_edge_mask_dir", type=str, default="")
     parser.add_argument("--lambda_prior_edge", type=float, default=0.0)
-    parser.add_argument("--prior_edge_loss_mode", type=str, default="rgb", choices=["rgb", "detail_v1"])
+    parser.add_argument("--prior_edge_loss_mode", type=str, default="rgb", choices=["rgb", "detail_v1", "hf_residual_v1"])
+    parser.add_argument("--prior_edge_anchor_dir", type=str, default="")
     parser.add_argument("--prior_edge_blend_alpha", type=float, default=1.0)
     parser.add_argument("--prior_edge_min_pixels", type=float, default=64.0)
     parser.add_argument("--prior_edge_from_iter", type=int, default=0)
@@ -9342,6 +9362,7 @@ def make_parser():
     parser.add_argument("--prior_edge_lowfreq_anchor", type=str, default="render", choices=["render", "gt"])
     parser.add_argument("--prior_edge_detail_min_gain", type=float, default=0.0)
     parser.add_argument("--prior_edge_confidence_power", type=float, default=1.0)
+    parser.add_argument("--prior_edge_hf_residual_clip", type=float, default=0.0)
     parser.add_argument("--prior_edge_update_scale", type=float, default=1.0)
     parser.add_argument("--prior_edge_contrast_weight", type=float, default=0.0)
     parser.add_argument("--prior_edge_contrast_radius", type=int, default=1)
