@@ -117,3 +117,40 @@ bash scripts/run_build_npse_edge_trust_cache_v0_kitchen_nosr_anchor.sh
 This changes only the anchor render. If red/blue still track clutter, the next
 probe should regenerate `DEPTH_PRIOR_DIR` using a NoSR-derived mesh rather than
 the vanilla gs2mesh mesh.
+
+## EdgeCarrier / Continuous Diffusion v1
+
+N-PSE v1 keeps the direct edge target as the conservative image signal, but adds
+two structure-aware training hooks:
+
+- Edge contrast: within `trust_edge`, match the target's directional luminance
+  contrast instead of only fitting high-frequency pixels.
+- Edge carrier shape: gaussians touched by `trust_edge` can be pushed toward a
+  line-like carrier shape, using small/mid and mid/large scale-ratio penalties.
+
+Both are off by default. Enable them through the existing NoSR cleanup runner:
+
+```bash
+PRIOR_EDGE_CONTRAST_WEIGHT=0.25 \
+LAMBDA_PRIOR_EDGE_SHAPE=0.002 \
+PRIOR_EDGE_SHAPE_THIN_RATIO=0.35 \
+PRIOR_EDGE_SHAPE_LINE_RATIO=0.60 \
+bash scripts/run_mipsplatting_nosr_layerfreq_cleanup_v0_kitchen.sh
+```
+
+For continuous-surface diffusion, materialize trainable targets from an existing
+cache first:
+
+```bash
+python scripts/materialize_npse_continuous_targets_v0.py \
+  --npse_cache_root /root/autodl-tmp/kitchen/_hrgsrefiner_assets/npse_cache/render_x1_restormer_depthprior_npse_yellow_fidelity_nogate_full_v0
+```
+
+This creates:
+
+- `continuous_target`: `anchor + residual_npse * continuous_mask`
+- `trust_continuous`: `trust_sr * continuous_mask`
+
+Use them through the existing `prior_local` branch with a small weight, e.g.
+`LAMBDA_PRIOR_LOCAL=0.005`, so surface interiors receive propagated residual
+supervision without crossing the edge/barrier band.

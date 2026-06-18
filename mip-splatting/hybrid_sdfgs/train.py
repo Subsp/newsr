@@ -2095,6 +2095,63 @@ def combine_gaussian_update_masks(*masks):
     return combined
 
 
+def compute_prior_edge_carrier_shape_loss(
+    gaussians,
+    edge_touch_mask,
+    *,
+    surface_mask=None,
+    min_gaussians: int = 32,
+    thin_ratio: float = 0.35,
+    line_ratio: float = 0.60,
+    max_axis: float = 0.0,
+):
+    metrics = {}
+    if edge_touch_mask is None:
+        return None, metrics
+    total = int(gaussians.get_xyz.shape[0])
+    selected = edge_touch_mask.to(device=gaussians.get_xyz.device, dtype=torch.bool).reshape(-1)
+    if int(selected.shape[0]) != total:
+        raise ValueError(f"Edge carrier mask length mismatch: {int(selected.shape[0])} vs {total}")
+    if surface_mask is not None:
+        surface_mask = surface_mask.to(device=gaussians.get_xyz.device, dtype=torch.bool).reshape(-1)
+        if int(surface_mask.shape[0]) != total:
+            raise ValueError(f"Edge carrier surface mask length mismatch: {int(surface_mask.shape[0])} vs {total}")
+        selected = selected & surface_mask
+    count = int(selected.sum().item())
+    metrics["edge_carrier_count"] = float(count)
+    if count < int(min_gaussians):
+        return None, metrics
+
+    scales = gaussians.get_scaling[selected].clamp(min=1e-8)
+    sorted_scales, _ = torch.sort(scales, dim=1)
+    small = sorted_scales[:, 0]
+    mid = sorted_scales[:, 1]
+    large = sorted_scales[:, 2]
+
+    thin = small / mid.clamp(min=1e-8)
+    line = mid / large.clamp(min=1e-8)
+    thin_loss = torch.clamp(thin - float(thin_ratio), min=0.0).mean()
+    line_loss = torch.clamp(line - float(line_ratio), min=0.0).mean()
+    shape_loss = thin_loss + line_loss
+
+    if float(max_axis) > 0.0:
+        max_axis_loss = torch.clamp(large / float(max_axis) - 1.0, min=0.0).mean()
+        shape_loss = shape_loss + max_axis_loss
+        metrics["edge_carrier_max_axis_loss"] = float(max_axis_loss.detach().item())
+
+    metrics.update(
+        {
+            "edge_carrier_shape": float(shape_loss.detach().item()),
+            "edge_carrier_thin": float(thin_loss.detach().item()),
+            "edge_carrier_line": float(line_loss.detach().item()),
+            "edge_carrier_thin_ratio": float(thin.detach().mean().item()),
+            "edge_carrier_line_ratio": float(line.detach().mean().item()),
+            "edge_carrier_max_axis": float(large.detach().mean().item()),
+        }
+    )
+    return shape_loss, metrics
+
+
 def _clone_frozen_tensor(tensor):
     if not torch.is_tensor(tensor):
         return tensor
@@ -4654,9 +4711,11 @@ def training(
         and bool(hybrid_args.prior_edge_dir)
         and bool(hybrid_args.prior_edge_mask_dir)
     )
+    need_sof_edge_carrier = float(getattr(hybrid_args, "lambda_prior_edge_shape", 0.0)) > 0.0
     if (
         float(hybrid_args.lambda_prior_local) > 0.0
         or float(hybrid_args.lambda_prior_edge) > 0.0
+        or need_sof_edge_carrier
         or need_sof_edge_touch
     ):
         sof_prior_block = SOFPriorBlock(
@@ -4683,6 +4742,10 @@ def training(
                 prior_edge_lowfreq_anchor=hybrid_args.prior_edge_lowfreq_anchor,
                 prior_edge_detail_min_gain=hybrid_args.prior_edge_detail_min_gain,
                 prior_edge_confidence_power=hybrid_args.prior_edge_confidence_power,
+                prior_edge_contrast_weight=hybrid_args.prior_edge_contrast_weight,
+                prior_edge_contrast_radius=hybrid_args.prior_edge_contrast_radius,
+                prior_edge_contrast_target_gain=hybrid_args.prior_edge_contrast_target_gain,
+                prior_edge_contrast_target_clip=hybrid_args.prior_edge_contrast_target_clip,
             )
         )
         print(
@@ -4690,6 +4753,8 @@ def training(
             f"local={hybrid_args.lambda_prior_local:.3f} "
             f"edge={hybrid_args.lambda_prior_edge:.3f} "
             f"mode={hybrid_args.prior_edge_loss_mode} "
+            f"contrast={hybrid_args.prior_edge_contrast_weight:.3f} "
+            f"shape={hybrid_args.lambda_prior_edge_shape:.3f} "
             f"local_from={hybrid_args.prior_local_from_iter} "
             f"edge_from={hybrid_args.prior_edge_from_iter} "
             f"seed_touch_only={1 if need_sof_edge_touch and float(hybrid_args.lambda_prior_edge) <= 0.0 else 0}"
@@ -4714,7 +4779,7 @@ def training(
         else:
             print("[SOF-PRIOR] local loss requested but prior_local_dir/mask_dir is incomplete; disabling local branch.")
 
-    if float(hybrid_args.lambda_prior_edge) > 0.0 or need_sof_edge_touch:
+    if float(hybrid_args.lambda_prior_edge) > 0.0 or need_sof_edge_carrier or need_sof_edge_touch:
         if hybrid_args.prior_edge_dir and hybrid_args.prior_edge_mask_dir:
             prior_edge_bank = _build_optional_external_bank(
                 train_cameras=train_cameras,
@@ -6658,6 +6723,30 @@ def training(
                     touched_count = float(edge_touch_mask.sum().item())
                     prior_metrics["sof_edge_touch_ratio"] = touched_count / max(visible_count, 1.0)
                     prior_metrics["sof_edge_touched"] = touched_count
+                    if float(hybrid_args.lambda_prior_edge_shape) > 0.0:
+                        edge_shape_surface_mask = (
+                            layer_frequency_regularizer.surface_mask
+                            if layer_frequency_regularizer is not None
+                            else None
+                        )
+                        loss_edge_shape, edge_shape_metrics = compute_prior_edge_carrier_shape_loss(
+                            gaussians,
+                            edge_touch_mask,
+                            surface_mask=edge_shape_surface_mask,
+                            min_gaussians=int(hybrid_args.prior_edge_shape_min_gaussians),
+                            thin_ratio=float(hybrid_args.prior_edge_shape_thin_ratio),
+                            line_ratio=float(hybrid_args.prior_edge_shape_line_ratio),
+                            max_axis=float(hybrid_args.prior_edge_shape_max_axis),
+                        )
+                        prior_metrics.update(edge_shape_metrics)
+                        if loss_edge_shape is not None:
+                            weighted_edge_shape = (
+                                float(hybrid_args.lambda_prior_edge_shape)
+                                * float(prior_guidance_scale)
+                                * loss_edge_shape
+                            )
+                            loss = loss + weighted_edge_shape
+                            prior_metrics["edge_carrier_shape_w"] = float(weighted_edge_shape.detach().item())
 
         if (
             surface_route_bank is not None
@@ -7391,6 +7480,12 @@ def training(
                     prior_parts.append(f"alpha={prior_metrics['sof_edge_alpha']:.3f}")
                 if "sof_edge_touch_ratio" in prior_metrics:
                     prior_parts.append(f"touch={prior_metrics['sof_edge_touch_ratio']:.3f}")
+                if "edge_carrier_shape_w" in prior_metrics:
+                    prior_parts.append(f"eshape={prior_metrics['edge_carrier_shape_w']:.6f}")
+                if "edge_carrier_line_ratio" in prior_metrics:
+                    prior_parts.append(f"eline={prior_metrics['edge_carrier_line_ratio']:.3f}")
+                if "edge_carrier_thin_ratio" in prior_metrics:
+                    prior_parts.append(f"ethin={prior_metrics['edge_carrier_thin_ratio']:.3f}")
                 if "hf_seeded" in prior_metrics:
                     prior_parts.extend(
                         [
@@ -7881,6 +7976,18 @@ def training_report(
                 tb_writer.add_scalar("prior/sof_edge_alpha", prior_metrics["sof_edge_alpha"], iteration)
             if "sof_edge_touch_ratio" in prior_metrics:
                 tb_writer.add_scalar("prior/sof_edge_touch_ratio", prior_metrics["sof_edge_touch_ratio"], iteration)
+            for key in (
+                "edge_carrier_count",
+                "edge_carrier_shape",
+                "edge_carrier_shape_w",
+                "edge_carrier_thin",
+                "edge_carrier_line",
+                "edge_carrier_thin_ratio",
+                "edge_carrier_line_ratio",
+                "edge_carrier_max_axis",
+            ):
+                if key in prior_metrics:
+                    tb_writer.add_scalar(f"prior/{key}", prior_metrics[key], iteration)
             if "hf_seeded" in prior_metrics:
                 tb_writer.add_scalar("prior/hf_seeded", prior_metrics["hf_seeded"], iteration)
                 tb_writer.add_scalar("prior/hf_seed_total", prior_metrics["hf_seed_total"], iteration)
@@ -8327,6 +8434,15 @@ def make_parser():
     parser.add_argument("--prior_edge_detail_min_gain", type=float, default=0.0)
     parser.add_argument("--prior_edge_confidence_power", type=float, default=1.0)
     parser.add_argument("--prior_edge_update_scale", type=float, default=1.0)
+    parser.add_argument("--prior_edge_contrast_weight", type=float, default=0.0)
+    parser.add_argument("--prior_edge_contrast_radius", type=int, default=1)
+    parser.add_argument("--prior_edge_contrast_target_gain", type=float, default=1.0)
+    parser.add_argument("--prior_edge_contrast_target_clip", type=float, default=0.0)
+    parser.add_argument("--lambda_prior_edge_shape", type=float, default=0.0)
+    parser.add_argument("--prior_edge_shape_min_gaussians", type=int, default=32)
+    parser.add_argument("--prior_edge_shape_thin_ratio", type=float, default=0.35)
+    parser.add_argument("--prior_edge_shape_line_ratio", type=float, default=0.60)
+    parser.add_argument("--prior_edge_shape_max_axis", type=float, default=0.0)
     parser.add_argument("--prior_hf_seed_enable", action="store_true")
     parser.add_argument("--prior_hf_seed_from_iter", type=int, default=0)
     parser.add_argument("--prior_hf_seed_until_iter", type=int, default=0)

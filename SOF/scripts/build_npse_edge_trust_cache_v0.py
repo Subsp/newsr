@@ -766,6 +766,8 @@ def _process_frame(
         sigma=float(args.prop_sigma),
     )
     residual_npse = residual_npse * continuous_mask[..., None] + residual_raw * (1.0 - continuous_mask[..., None])
+    trust_continuous = (trust_sr * continuous_mask).astype(np.float32, copy=False)
+    continuous_target = np.clip(anchor + residual_npse * continuous_mask[..., None], 0.0, 1.0)
 
     if str(args.edge_target_mode) == "fidelity":
         trust_edge = edge_band * edge_sr * np.power(
@@ -808,6 +810,7 @@ def _process_frame(
     _save_gray01(dirs["edge_direction_gate"] / f"{stem}.png", edge_direction_gate)
     _save_gray01(dirs["trust_edge"] / f"{stem}.png", trust_edge)
     _save_gray01(dirs["continuous_mask"] / f"{stem}.png", continuous_mask)
+    _save_gray01(dirs["trust_continuous"] / f"{stem}.png", trust_continuous)
     _save_rgb01(dirs["edge_type"] / f"{stem}.png", _edge_type_rgb(edge_type))
     _save_rgb01(
         dirs["residual_raw"] / f"{stem}.png",
@@ -818,6 +821,7 @@ def _process_frame(
         np.clip(0.5 + residual_npse * float(args.residual_vis_scale), 0.0, 1.0),
     )
     _save_rgb01(dirs["edge_target"] / f"{stem}.png", edge_target)
+    _save_rgb01(dirs["continuous_target"] / f"{stem}.png", continuous_target)
     _save_rgb01(dirs["debug_overlay"] / f"{stem}.png", _overlay_edges(sr, edge_fused, trust_sr))
 
     npz_path = dirs["npz"] / f"{stem}.npz"
@@ -840,8 +844,10 @@ def _process_frame(
         edge_direction_gate=edge_direction_gate.astype(np.float16),
         trust_edge=trust_edge.astype(np.float16),
         continuous_mask=continuous_mask.astype(np.float16),
+        trust_continuous=trust_continuous.astype(np.float16),
         edge_band=edge_band.astype(np.float16),
         edge_target=edge_target.astype(np.float16),
+        continuous_target=continuous_target.astype(np.float16),
     )
 
     return {
@@ -859,6 +865,7 @@ def _process_frame(
         "edge_direction_gate_mean": float(edge_direction_gate.mean()),
         "trust_edge_mean": float(trust_edge.mean()),
         "continuous_ratio": float(continuous_mask.mean()),
+        "trust_continuous_mean": float(trust_continuous.mean()),
         "edge_position_ratio": float(edge_seed.mean()),
         "edge_band_ratio": float(edge_band.mean()),
         "geometry_candidate_ratio": float(geo_candidate.mean()),
@@ -908,9 +915,11 @@ def main() -> None:
             "edge_direction_gate",
             "trust_edge",
             "continuous_mask",
+            "trust_continuous",
             "residual_raw",
             "residual_npse",
             "edge_target",
+            "continuous_target",
             "debug_overlay",
             "npz",
         )
@@ -979,6 +988,7 @@ def main() -> None:
             "edge_direction_gate_mean": None if not frames else float(np.mean([f["edge_direction_gate_mean"] for f in frames])),
             "trust_edge_mean": None if not frames else float(np.mean([f["trust_edge_mean"] for f in frames])),
             "continuous_ratio_mean": None if not frames else float(np.mean([f["continuous_ratio"] for f in frames])),
+            "trust_continuous_mean": None if not frames else float(np.mean([f["trust_continuous_mean"] for f in frames])),
             "edge_position_ratio_mean": None if not frames else float(np.mean([f["edge_position_ratio"] for f in frames])),
             "edge_band_ratio_mean": None if not frames else float(np.mean([f["edge_band_ratio"] for f in frames])),
             "geometry_candidate_ratio_mean": None if not frames else float(np.mean([f["geometry_candidate_ratio"] for f in frames])),

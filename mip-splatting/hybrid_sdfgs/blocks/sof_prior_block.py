@@ -29,6 +29,10 @@ class SOFPriorConfig:
     prior_edge_lowfreq_anchor: str = "render"
     prior_edge_detail_min_gain: float = 0.0
     prior_edge_confidence_power: float = 1.0
+    prior_edge_contrast_weight: float = 0.0
+    prior_edge_contrast_radius: int = 1
+    prior_edge_contrast_target_gain: float = 1.0
+    prior_edge_contrast_target_clip: float = 0.0
 
 
 def _normalize_mask_hw(mask: Optional[torch.Tensor], *, dtype: torch.dtype, device: torch.device) -> Optional[torch.Tensor]:
@@ -118,6 +122,62 @@ def _dilate_binary_mask(mask_hw: torch.Tensor, radius_px: int) -> torch.Tensor:
     kernel = int(radius_px) * 2 + 1
     dilated = F.max_pool2d(mask, kernel_size=kernel, stride=1, padding=int(radius_px))
     return dilated[0, 0] > 0.5
+
+
+def _luma_chw(image: torch.Tensor) -> torch.Tensor:
+    if image.shape[0] == 1:
+        return image[0]
+    weights = torch.tensor(
+        [0.299, 0.587, 0.114],
+        dtype=image.dtype,
+        device=image.device,
+    )[:, None, None]
+    return (image[:3] * weights).sum(dim=0)
+
+
+def _central_contrast_maps(luma: torch.Tensor, radius_px: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    radius_px = max(1, int(radius_px))
+    h, w = luma.shape
+    contrast_x = torch.zeros_like(luma)
+    contrast_y = torch.zeros_like(luma)
+    valid_x = torch.zeros_like(luma, dtype=torch.bool)
+    valid_y = torch.zeros_like(luma, dtype=torch.bool)
+    if w > 2 * radius_px:
+        contrast_x[:, radius_px : w - radius_px] = luma[:, 2 * radius_px :] - luma[:, : w - 2 * radius_px]
+        valid_x[:, radius_px : w - radius_px] = True
+    if h > 2 * radius_px:
+        contrast_y[radius_px : h - radius_px, :] = luma[2 * radius_px :, :] - luma[: h - 2 * radius_px, :]
+        valid_y[radius_px : h - radius_px, :] = True
+    return contrast_x, contrast_y, valid_x, valid_y
+
+
+def compute_weighted_directional_contrast_l1_loss(
+    image: torch.Tensor,
+    target: torch.Tensor,
+    weight_hw: Optional[torch.Tensor],
+    *,
+    radius_px: int = 1,
+    target_gain: float = 1.0,
+    target_clip: float = 0.0,
+) -> Optional[torch.Tensor]:
+    weight_hw = _normalize_mask_hw(weight_hw, dtype=image.dtype, device=image.device)
+    if weight_hw is None:
+        return None
+    image_luma = _luma_chw(image)
+    target_luma = _luma_chw(target.detach())
+    image_cx, image_cy, valid_x, valid_y = _central_contrast_maps(image_luma, int(radius_px))
+    target_cx, target_cy, _, _ = _central_contrast_maps(target_luma, int(radius_px))
+    choose_x = target_cx.detach().abs() >= target_cy.detach().abs()
+    valid = torch.where(choose_x, valid_x, valid_y)
+    image_contrast = torch.where(choose_x, image_cx, image_cy)
+    target_contrast = torch.where(choose_x, target_cx, target_cy).detach() * float(target_gain)
+    if float(target_clip) > 0.0:
+        target_contrast = target_contrast.clamp(min=-float(target_clip), max=float(target_clip))
+    weight = weight_hw * valid.to(dtype=weight_hw.dtype)
+    active = weight.sum()
+    if float(active.item()) <= 0:
+        return None
+    return (torch.abs(image_contrast - target_contrast) * weight).sum() / active.clamp_min(1.0)
 
 
 class SOFPriorBlock:
@@ -265,6 +325,19 @@ class SOFPriorBlock:
             grad_loss = compute_weighted_gradient_l1_loss(image, grad_target.detach(), confidence)
             if grad_loss is not None:
                 total_loss = total_loss + grad_weight * grad_loss
+
+        contrast_weight = float(self.cfg.prior_edge_contrast_weight)
+        if contrast_weight > 0.0:
+            contrast_loss = compute_weighted_directional_contrast_l1_loss(
+                image,
+                prior_target,
+                confidence,
+                radius_px=int(self.cfg.prior_edge_contrast_radius),
+                target_gain=float(self.cfg.prior_edge_contrast_target_gain),
+                target_clip=float(self.cfg.prior_edge_contrast_target_clip),
+            )
+            if contrast_loss is not None:
+                total_loss = total_loss + contrast_weight * contrast_loss
 
         return total_loss
 

@@ -87,6 +87,12 @@ EXTERNAL_PRIOR_EXTS="${EXTERNAL_PRIOR_EXTS:-png,jpg,jpeg,webp}"
 PRIOR_CONSISTENCY_THRESHOLD="${PRIOR_CONSISTENCY_THRESHOLD:-0.20}"
 PRIOR_MIN_VALID_RATIO="${PRIOR_MIN_VALID_RATIO:-0.30}"
 
+PRIOR_LOCAL_DIR="${PRIOR_LOCAL_DIR:-}"
+PRIOR_LOCAL_MASK_DIR="${PRIOR_LOCAL_MASK_DIR:-}"
+LAMBDA_PRIOR_LOCAL="${LAMBDA_PRIOR_LOCAL:-0.0}"
+PRIOR_LOCAL_FROM_ITER="${PRIOR_LOCAL_FROM_ITER:-${INPUT_ITERATION}}"
+PRIOR_LOCAL_MIN_PIXELS="${PRIOR_LOCAL_MIN_PIXELS:-64}"
+
 PRIOR_EDGE_DIR="${PRIOR_EDGE_DIR:-}"
 PRIOR_EDGE_MASK_DIR="${PRIOR_EDGE_MASK_DIR:-}"
 LAMBDA_PRIOR_EDGE="${LAMBDA_PRIOR_EDGE:-0.0}"
@@ -106,6 +112,15 @@ PRIOR_EDGE_LOWFREQ_ANCHOR="${PRIOR_EDGE_LOWFREQ_ANCHOR:-render}"
 PRIOR_EDGE_DETAIL_MIN_GAIN="${PRIOR_EDGE_DETAIL_MIN_GAIN:-0.0}"
 PRIOR_EDGE_CONFIDENCE_POWER="${PRIOR_EDGE_CONFIDENCE_POWER:-1.5}"
 PRIOR_EDGE_UPDATE_SCALE="${PRIOR_EDGE_UPDATE_SCALE:-0.75}"
+PRIOR_EDGE_CONTRAST_WEIGHT="${PRIOR_EDGE_CONTRAST_WEIGHT:-0.0}"
+PRIOR_EDGE_CONTRAST_RADIUS="${PRIOR_EDGE_CONTRAST_RADIUS:-1}"
+PRIOR_EDGE_CONTRAST_TARGET_GAIN="${PRIOR_EDGE_CONTRAST_TARGET_GAIN:-1.0}"
+PRIOR_EDGE_CONTRAST_TARGET_CLIP="${PRIOR_EDGE_CONTRAST_TARGET_CLIP:-0.0}"
+LAMBDA_PRIOR_EDGE_SHAPE="${LAMBDA_PRIOR_EDGE_SHAPE:-0.0}"
+PRIOR_EDGE_SHAPE_MIN_GAUSSIANS="${PRIOR_EDGE_SHAPE_MIN_GAUSSIANS:-32}"
+PRIOR_EDGE_SHAPE_THIN_RATIO="${PRIOR_EDGE_SHAPE_THIN_RATIO:-0.35}"
+PRIOR_EDGE_SHAPE_LINE_RATIO="${PRIOR_EDGE_SHAPE_LINE_RATIO:-0.60}"
+PRIOR_EDGE_SHAPE_MAX_AXIS="${PRIOR_EDGE_SHAPE_MAX_AXIS:-0.0}"
 PRIOR_EDGE_TOUCH_MIN_RADIUS_PX="${PRIOR_EDGE_TOUCH_MIN_RADIUS_PX:-1.0}"
 PRIOR_EDGE_TOUCH_RADIUS_SCALE="${PRIOR_EDGE_TOUCH_RADIUS_SCALE:-0.35}"
 PRIOR_EDGE_TOUCH_MAX_RADIUS_PX="${PRIOR_EDGE_TOUCH_MAX_RADIUS_PX:-8.0}"
@@ -175,6 +190,19 @@ echo "[nosr-layerfreq-cleanup-v0] layer freq        : ns=${LAMBDA_NON_SURFACE_HF
 if [[ -n "${EXTERNAL_PRIOR_ROOT}" ]]; then
   echo "[nosr-layerfreq-cleanup-v0] external prior   : root=${EXTERNAL_PRIOR_ROOT} subdir=${EXTERNAL_PRIOR_SUBDIR} mask=${EXTERNAL_PRIOR_MASK_SUBDIR:-none}"
 fi
+if [[ -n "${PRIOR_LOCAL_DIR}" || -n "${PRIOR_LOCAL_MASK_DIR}" ]]; then
+  if [[ -z "${PRIOR_LOCAL_DIR}" || -z "${PRIOR_LOCAL_MASK_DIR}" ]]; then
+    echo "[nosr-layerfreq-cleanup-v0] PRIOR_LOCAL_DIR and PRIOR_LOCAL_MASK_DIR must be set together." >&2
+    exit 1
+  fi
+  for path in "${PRIOR_LOCAL_DIR}" "${PRIOR_LOCAL_MASK_DIR}"; do
+    if [[ ! -d "${path}" ]]; then
+      echo "[nosr-layerfreq-cleanup-v0] required NPSE local prior dir not found: ${path}" >&2
+      exit 1
+    fi
+  done
+  echo "[nosr-layerfreq-cleanup-v0] prior local     : target=${PRIOR_LOCAL_DIR} mask=${PRIOR_LOCAL_MASK_DIR} lambda=${LAMBDA_PRIOR_LOCAL}"
+fi
 if [[ -n "${PRIOR_EDGE_DIR}" || -n "${PRIOR_EDGE_MASK_DIR}" ]]; then
   if [[ -z "${PRIOR_EDGE_DIR}" || -z "${PRIOR_EDGE_MASK_DIR}" ]]; then
     echo "[nosr-layerfreq-cleanup-v0] PRIOR_EDGE_DIR and PRIOR_EDGE_MASK_DIR must be set together." >&2
@@ -187,6 +215,7 @@ if [[ -n "${PRIOR_EDGE_DIR}" || -n "${PRIOR_EDGE_MASK_DIR}" ]]; then
     fi
   done
   echo "[nosr-layerfreq-cleanup-v0] prior edge      : target=${PRIOR_EDGE_DIR} mask=${PRIOR_EDGE_MASK_DIR} lambda=${LAMBDA_PRIOR_EDGE} mode=${PRIOR_EDGE_LOSS_MODE}"
+  echo "[nosr-layerfreq-cleanup-v0] edge carrier    : contrast=${PRIOR_EDGE_CONTRAST_WEIGHT} shape=${LAMBDA_PRIOR_EDGE_SHAPE} thin=${PRIOR_EDGE_SHAPE_THIN_RATIO} line=${PRIOR_EDGE_SHAPE_LINE_RATIO}"
 fi
 if [[ "${LAMBDA_SURFACE_START_HF_PRESERVE}" != "0" && "${LAMBDA_SURFACE_START_HF_PRESERVE}" != "0.0" ]]; then
   echo "[nosr-layerfreq-cleanup-v0] start HF preserve: checkpoint=${LAYER_FREQUENCY_START_HF_CHECKPOINT} lf_kernel=${LAYER_FREQUENCY_START_HF_LOWFREQ_KERNEL} lf_thr=${LAYER_FREQUENCY_START_HF_LOWFREQ_THRESHOLD} energy_thr=${LAYER_FREQUENCY_START_HF_ENERGY_THRESHOLD} power=${LAYER_FREQUENCY_START_HF_MASK_POWER} protect_ns=${LAYER_FREQUENCY_START_HF_PROTECT_NON_SURFACE}"
@@ -280,6 +309,24 @@ if [[ "${FORCE_RERUN}" == "1" || ! -f "${CHECKPOINT_PATH}" ]]; then
       --prior_edge_detail_min_gain "${PRIOR_EDGE_DETAIL_MIN_GAIN}"
       --prior_edge_confidence_power "${PRIOR_EDGE_CONFIDENCE_POWER}"
       --prior_edge_update_scale "${PRIOR_EDGE_UPDATE_SCALE}"
+      --prior_edge_contrast_weight "${PRIOR_EDGE_CONTRAST_WEIGHT}"
+      --prior_edge_contrast_radius "${PRIOR_EDGE_CONTRAST_RADIUS}"
+      --prior_edge_contrast_target_gain "${PRIOR_EDGE_CONTRAST_TARGET_GAIN}"
+      --prior_edge_contrast_target_clip "${PRIOR_EDGE_CONTRAST_TARGET_CLIP}"
+      --lambda_prior_edge_shape "${LAMBDA_PRIOR_EDGE_SHAPE}"
+      --prior_edge_shape_min_gaussians "${PRIOR_EDGE_SHAPE_MIN_GAUSSIANS}"
+      --prior_edge_shape_thin_ratio "${PRIOR_EDGE_SHAPE_THIN_RATIO}"
+      --prior_edge_shape_line_ratio "${PRIOR_EDGE_SHAPE_LINE_RATIO}"
+      --prior_edge_shape_max_axis "${PRIOR_EDGE_SHAPE_MAX_AXIS}"
+    )
+  fi
+  if [[ -n "${PRIOR_LOCAL_DIR}" || -n "${PRIOR_LOCAL_MASK_DIR}" ]]; then
+    TRAIN_ARGS+=(
+      --prior_local_dir "${PRIOR_LOCAL_DIR}"
+      --prior_local_mask_dir "${PRIOR_LOCAL_MASK_DIR}"
+      --lambda_prior_local "${LAMBDA_PRIOR_LOCAL}"
+      --prior_local_from_iter "${PRIOR_LOCAL_FROM_ITER}"
+      --prior_local_min_pixels "${PRIOR_LOCAL_MIN_PIXELS}"
     )
   fi
   if [[ -n "${EXTERNAL_PRIOR_ROOT}" ]]; then
