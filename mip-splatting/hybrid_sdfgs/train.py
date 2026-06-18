@@ -4535,6 +4535,69 @@ def _load_prior_feature_pack(
     }
 
 
+def _build_edge_seed_feature_pack(
+    *,
+    edge_prior_image,
+    edge_prior_mask,
+    edge_anchor_image,
+    gt_image,
+    render_image,
+    hybrid_args,
+):
+    if edge_prior_image is None or edge_prior_mask is None:
+        return None
+    mask = edge_prior_mask.to(device=edge_prior_image.device, dtype=edge_prior_image.dtype)
+    if mask.ndim == 2:
+        mask = mask[None]
+    if mask.ndim != 3 or mask.shape[0] != 1:
+        return None
+    mask = mask.clamp(min=0.0, max=1.0)
+    if float(mask.sum().detach().item()) < float(getattr(hybrid_args, "prior_edge_min_pixels", 64.0)):
+        return None
+
+    if edge_anchor_image is not None:
+        anchor = edge_anchor_image.detach().to(device=edge_prior_image.device, dtype=edge_prior_image.dtype)
+    elif render_image is not None:
+        anchor = render_image.detach().to(device=edge_prior_image.device, dtype=edge_prior_image.dtype)
+    elif gt_image is not None:
+        anchor = gt_image.detach().to(device=edge_prior_image.device, dtype=edge_prior_image.dtype)
+    else:
+        anchor = edge_prior_image.detach()
+
+    residual = edge_prior_image - anchor
+    clip_v = float(getattr(hybrid_args, "prior_edge_hf_residual_clip", 0.0))
+    if clip_v > 0.0:
+        residual = residual.clamp(min=-clip_v, max=clip_v)
+
+    kernel = int(getattr(hybrid_args, "prior_hf_seed_edge_highpass_kernel", 0))
+    if kernel <= 0:
+        kernel = int(getattr(hybrid_args, "prior_edge_detail_blur_kernel", 9))
+    residual_hf = _box_highpass(residual, kernel)
+    guidance = residual_hf.abs().mean(dim=0, keepdim=True) * mask
+
+    min_gain = float(getattr(hybrid_args, "prior_edge_detail_min_gain", 0.0))
+    if min_gain > 0.0:
+        guidance = torch.clamp((guidance - min_gain) / min_gain, min=0.0, max=1.0) * mask
+    power = float(getattr(hybrid_args, "prior_hf_seed_edge_guidance_power", 1.0))
+    if power != 1.0:
+        guidance = torch.clamp(guidance, min=0.0).pow(max(power, 1e-6))
+
+    return {
+        "prior_image": edge_prior_image,
+        "gt_image": gt_image if gt_image is not None else anchor,
+        "anchor_image": anchor,
+        "consistency": torch.zeros_like(mask),
+        "mask": mask,
+        "consistency_mask": mask.gt(0.0).to(dtype=mask.dtype),
+        "structure_mask": mask,
+        "hard_mask": mask.gt(0.0).to(dtype=mask.dtype),
+        "soft_mask": mask,
+        "valid_ratio": mask.gt(0.0).to(dtype=mask.dtype).mean(),
+        "guidance": guidance,
+        "feature_map": torch.cat([guidance, residual_hf.mean(dim=0, keepdim=True) * mask], dim=0),
+    }
+
+
 def _select_neighbor_cameras(
     reference_camera,
     camera_pool,
@@ -6389,6 +6452,7 @@ def training(
         prior_structure_ratio = None
         prior_hf_guidance = None
         prior_feature_pack = None
+        prior_hf_seed_feature_pack = None
         prior_render_image = None
         prior_gt_image = None
         prior_anchor_image = None
@@ -6446,14 +6510,21 @@ def training(
                     prior_hf_guidance = prior_feature_pack["guidance"]
                     prior_gt_image = prior_feature_pack["gt_image"]
                     prior_anchor_image = prior_feature_pack.get("anchor_image")
+                    if str(getattr(hybrid_args, "prior_hf_seed_source", "external")).strip().lower() == "external":
+                        prior_hf_seed_feature_pack = prior_feature_pack
 
         seed_gate_diag = {
             "hf_seed_gate_enable": 1.0 if bool(hybrid_args.prior_hf_seed_enable) else 0.0,
             "hf_seed_gate_first_visit": 1.0 if prior_hf_seed_first_visit else 0.0,
-            "hf_seed_gate_prior_pack": 1.0 if prior_feature_pack is not None else 0.0,
+            "hf_seed_gate_prior_pack": 1.0 if prior_hf_seed_feature_pack is not None else 0.0,
             "hf_seed_gate_guidance": (
                 1.0
-                if prior_feature_pack is not None and prior_feature_pack.get("guidance") is not None
+                if prior_hf_seed_feature_pack is not None and prior_hf_seed_feature_pack.get("guidance") is not None
+                else 0.0
+            ),
+            "hf_seed_source_edge": (
+                1.0
+                if str(getattr(hybrid_args, "prior_hf_seed_source", "external")).strip().lower() == "edge"
                 else 0.0
             ),
             "hf_seed_gate_prior_bank": 1.0 if prior_bank is not None else 0.0,
@@ -7389,6 +7460,23 @@ def training(
                         height=int(camera_for_sof_prior.image_height),
                         device=render_for_sof_prior.device,
                     )
+                if str(getattr(hybrid_args, "prior_hf_seed_source", "external")).strip().lower() == "edge":
+                    edge_seed_feature_pack = _build_edge_seed_feature_pack(
+                        edge_prior_image=edge_prior_image,
+                        edge_prior_mask=edge_prior_mask,
+                        edge_anchor_image=edge_anchor_image,
+                        gt_image=sof_gt_image,
+                        render_image=render_for_sof_prior,
+                        hybrid_args=hybrid_args,
+                    )
+                    if edge_seed_feature_pack is not None:
+                        prior_hf_seed_feature_pack = edge_seed_feature_pack
+                        prior_hf_guidance = edge_seed_feature_pack["guidance"]
+                        seed_gate_diag["hf_seed_gate_prior_pack"] = 1.0
+                        seed_gate_diag["hf_seed_gate_guidance"] = (
+                            1.0 if edge_seed_feature_pack.get("guidance") is not None else 0.0
+                        )
+                        seed_gate_diag["hf_seed_edge_pack"] = 1.0
                 lowfreq_anchor = sof_gt_image if hybrid_args.prior_edge_lowfreq_anchor == "gt" else None
                 loss_prior_edge, edge_alpha = sof_prior_block.compute_edge_loss(
                     render_image=render_for_sof_prior,
@@ -8073,8 +8161,8 @@ def training(
                     )
                 if (
                     hybrid_args.prior_hf_seed_enable
-                    and prior_feature_pack is not None
-                    and prior_feature_pack.get("guidance") is not None
+                    and prior_hf_seed_feature_pack is not None
+                    and prior_hf_seed_feature_pack.get("guidance") is not None
                     and iteration >= int(hybrid_args.prior_hf_seed_from_iter)
                     and (
                         int(hybrid_args.prior_hf_seed_until_iter) <= 0
@@ -8088,7 +8176,7 @@ def training(
                     remaining = int(hybrid_args.prior_hf_seed_max_total) - prior_hf_seed_total
                     seed_births, seed_metrics = _build_prior_residual_seed_births(
                         gaussians=gaussians,
-                        prior_feature_pack=prior_feature_pack,
+                        prior_feature_pack=prior_hf_seed_feature_pack,
                         prior_render_pkg=prior_render_pkg,
                         reference_camera=camera_for_sof_prior,
                         visibility_filter=prior_visibility_filter,
@@ -9376,6 +9464,7 @@ def make_parser():
     parser.add_argument("--densify_min_opacity", type=float, default=0.005)
     parser.add_argument("--densify_global_prune_enable", type=int, default=1)
     parser.add_argument("--prior_hf_seed_enable", action="store_true")
+    parser.add_argument("--prior_hf_seed_source", type=str, default="external", choices=["external", "edge"])
     parser.add_argument("--prior_hf_seed_from_iter", type=int, default=0)
     parser.add_argument("--prior_hf_seed_until_iter", type=int, default=0)
     parser.add_argument("--prior_hf_seed_interval", type=int, default=100)
@@ -9414,6 +9503,8 @@ def make_parser():
     parser.add_argument("--prior_hf_seed_jitter_scale", type=float, default=0.15)
     parser.add_argument("--prior_hf_seed_color_residual_gain", type=float, default=1.0)
     parser.add_argument("--prior_hf_seed_guidance_threshold", type=float, default=0.0)
+    parser.add_argument("--prior_hf_seed_edge_highpass_kernel", type=int, default=0)
+    parser.add_argument("--prior_hf_seed_edge_guidance_power", type=float, default=1.0)
     parser.add_argument("--prior_hf_seed_ray_fan_enable", action="store_true")
     parser.add_argument("--prior_hf_seed_ray_fan_rays", type=int, default=1)
     parser.add_argument("--prior_hf_seed_ray_fan_radius_px", type=float, default=1.0)

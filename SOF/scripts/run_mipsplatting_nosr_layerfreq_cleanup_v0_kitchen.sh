@@ -164,6 +164,7 @@ PRIOR_EDGE_TOUCH_RADIUS_SCALE="${PRIOR_EDGE_TOUCH_RADIUS_SCALE:-0.35}"
 PRIOR_EDGE_TOUCH_MAX_RADIUS_PX="${PRIOR_EDGE_TOUCH_MAX_RADIUS_PX:-8.0}"
 
 PRIOR_HF_SEED_ENABLE="${PRIOR_HF_SEED_ENABLE:-0}"
+PRIOR_HF_SEED_SOURCE="${PRIOR_HF_SEED_SOURCE:-external}"
 PRIOR_HF_SEED_FROM_ITER="${PRIOR_HF_SEED_FROM_ITER:-${INPUT_ITERATION}}"
 PRIOR_HF_SEED_UNTIL_ITER="${PRIOR_HF_SEED_UNTIL_ITER:-${FINAL_ITER}}"
 PRIOR_HF_SEED_INTERVAL="${PRIOR_HF_SEED_INTERVAL:-100}"
@@ -188,6 +189,8 @@ PRIOR_HF_SEED_OPACITY="${PRIOR_HF_SEED_OPACITY:-0.015}"
 PRIOR_HF_SEED_JITTER_SCALE="${PRIOR_HF_SEED_JITTER_SCALE:-0.0}"
 PRIOR_HF_SEED_COLOR_RESIDUAL_GAIN="${PRIOR_HF_SEED_COLOR_RESIDUAL_GAIN:-0.5}"
 PRIOR_HF_SEED_GUIDANCE_THRESHOLD="${PRIOR_HF_SEED_GUIDANCE_THRESHOLD:-0.0}"
+PRIOR_HF_SEED_EDGE_HIGHPASS_KERNEL="${PRIOR_HF_SEED_EDGE_HIGHPASS_KERNEL:-0}"
+PRIOR_HF_SEED_EDGE_GUIDANCE_POWER="${PRIOR_HF_SEED_EDGE_GUIDANCE_POWER:-1.0}"
 PRIOR_HF_SEED_FIRST_CYCLE_ONLY="${PRIOR_HF_SEED_FIRST_CYCLE_ONLY:-1}"
 PRIOR_HF_SEED_ORIGINAL_ONLY="${PRIOR_HF_SEED_ORIGINAL_ONLY:-1}"
 PRIOR_HF_SEED_PRUNE_PROTECT_ITERS="${PRIOR_HF_SEED_PRUNE_PROTECT_ITERS:-320}"
@@ -317,11 +320,15 @@ if [[ -n "${PRIOR_EDGE_DIR}" || -n "${PRIOR_EDGE_MASK_DIR}" ]]; then
   echo "[nosr-layerfreq-cleanup-v0] edge carrier    : anchor=${PRIOR_EDGE_ANCHOR_DIR:-render-detach} contrast=${PRIOR_EDGE_CONTRAST_WEIGHT} hf_clip=${PRIOR_EDGE_HF_RESIDUAL_CLIP} shape=${LAMBDA_PRIOR_EDGE_SHAPE} thin=${PRIOR_EDGE_SHAPE_THIN_RATIO} line=${PRIOR_EDGE_SHAPE_LINE_RATIO}"
 fi
 if [[ "${PRIOR_HF_SEED_ENABLE}" == "1" ]]; then
-  if [[ -z "${EXTERNAL_PRIOR_ROOT}" ]]; then
+  if [[ "${PRIOR_HF_SEED_SOURCE}" == "external" && -z "${EXTERNAL_PRIOR_ROOT}" ]]; then
     echo "[nosr-layerfreq-cleanup-v0] PRIOR_HF_SEED_ENABLE=1 requires EXTERNAL_PRIOR_ROOT for seed guidance." >&2
     exit 1
   fi
-  echo "[nosr-layerfreq-cleanup-v0] hf seed          : max_iter=${PRIOR_HF_SEED_MAX_PER_ITER} max_total=${PRIOR_HF_SEED_MAX_TOTAL} first_cycle=${PRIOR_HF_SEED_FIRST_CYCLE_ONLY} protect=${PRIOR_HF_SEED_PRUNE_PROTECT_ITERS}"
+  if [[ "${PRIOR_HF_SEED_SOURCE}" == "edge" && ( -z "${PRIOR_EDGE_DIR}" || -z "${PRIOR_EDGE_MASK_DIR}" ) ]]; then
+    echo "[nosr-layerfreq-cleanup-v0] PRIOR_HF_SEED_SOURCE=edge requires PRIOR_EDGE_DIR and PRIOR_EDGE_MASK_DIR." >&2
+    exit 1
+  fi
+  echo "[nosr-layerfreq-cleanup-v0] hf seed          : source=${PRIOR_HF_SEED_SOURCE} max_iter=${PRIOR_HF_SEED_MAX_PER_ITER} max_total=${PRIOR_HF_SEED_MAX_TOTAL} first_cycle=${PRIOR_HF_SEED_FIRST_CYCLE_ONLY} protect=${PRIOR_HF_SEED_PRUNE_PROTECT_ITERS}"
   if [[ "${PRIOR_HF_SEED_RAY_FAN_ENABLE}" == "1" ]]; then
     echo "[nosr-layerfreq-cleanup-v0] hf seed rayfan   : rays=${PRIOR_HF_SEED_RAY_FAN_RAYS} radius_px=${PRIOR_HF_SEED_RAY_FAN_RADIUS_PX} mask_thr=${PRIOR_HF_SEED_RAY_FAN_MASK_THRESHOLD}"
   fi
@@ -496,6 +503,7 @@ if [[ "${FORCE_RERUN}" == "1" || ! -f "${CHECKPOINT_PATH}" ]]; then
   if [[ "${PRIOR_HF_SEED_ENABLE}" == "1" ]]; then
     TRAIN_ARGS+=(
       --prior_hf_seed_enable
+      --prior_hf_seed_source "${PRIOR_HF_SEED_SOURCE}"
       --prior_hf_seed_from_iter "${PRIOR_HF_SEED_FROM_ITER}"
       --prior_hf_seed_until_iter "${PRIOR_HF_SEED_UNTIL_ITER}"
       --prior_hf_seed_interval "${PRIOR_HF_SEED_INTERVAL}"
@@ -516,6 +524,8 @@ if [[ "${FORCE_RERUN}" == "1" || ! -f "${CHECKPOINT_PATH}" ]]; then
       --prior_hf_seed_jitter_scale "${PRIOR_HF_SEED_JITTER_SCALE}"
       --prior_hf_seed_color_residual_gain "${PRIOR_HF_SEED_COLOR_RESIDUAL_GAIN}"
       --prior_hf_seed_guidance_threshold "${PRIOR_HF_SEED_GUIDANCE_THRESHOLD}"
+      --prior_hf_seed_edge_highpass_kernel "${PRIOR_HF_SEED_EDGE_HIGHPASS_KERNEL}"
+      --prior_hf_seed_edge_guidance_power "${PRIOR_HF_SEED_EDGE_GUIDANCE_POWER}"
       --prior_hf_seed_prune_protect_iters "${PRIOR_HF_SEED_PRUNE_PROTECT_ITERS}"
       --prior_hf_seed_recent_hf_boost "${PRIOR_HF_SEED_RECENT_HF_BOOST}"
       --prior_hf_seed_recent_imprint_weight "${PRIOR_HF_SEED_RECENT_IMPRINT_WEIGHT}"
