@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import sys
 from argparse import Namespace
 from pathlib import Path
@@ -294,56 +293,6 @@ def _profile_ncc(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return ((a0 * b0).sum(axis=1) / denom).astype(np.float32)
 
 
-def _draw_renderer_supported_score_map(
-    width: int,
-    height: int,
-    edge_image: np.ndarray,
-    xs: np.ndarray,
-    ys: np.ndarray,
-    radii: np.ndarray,
-    scores: np.ndarray,
-    *,
-    support_radius_scale: float,
-    edge_threshold: float,
-    edge_power: float,
-    max_draw: int,
-) -> np.ndarray:
-    support_map = np.zeros((height, width), dtype=np.float32)
-    if scores.shape[0] == 0:
-        return support_map
-    order = np.argsort(scores)
-    if int(max_draw) > 0 and order.shape[0] > int(max_draw):
-        order = order[-int(max_draw):]
-    edge_threshold = max(float(edge_threshold), 0.0)
-    support_radius_scale = max(float(support_radius_scale), 0.25)
-    edge_power = max(float(edge_power), 0.0)
-    for i in order:
-        score = float(scores[i])
-        if score <= 0.0:
-            continue
-        radius = max(float(radii[i]) * support_radius_scale, 0.5)
-        xmin = max(0, int(math.floor(float(xs[i]) - radius)))
-        xmax = min(width, int(math.ceil(float(xs[i]) + radius + 1.0)))
-        ymin = max(0, int(math.floor(float(ys[i]) - radius)))
-        ymax = min(height, int(math.ceil(float(ys[i]) + radius + 1.0)))
-        if xmin >= xmax or ymin >= ymax:
-            continue
-        yy, xx = np.mgrid[ymin:ymax, xmin:xmax].astype(np.float32)
-        dx = (xx + 0.5 - float(xs[i])) / radius
-        dy = (yy + 0.5 - float(ys[i])) / radius
-        q = dx * dx + dy * dy
-        edge_crop = edge_image[ymin:ymax, xmin:xmax]
-        support = (q <= 1.0) & (edge_crop >= edge_threshold)
-        if not np.any(support):
-            continue
-        value = score * np.exp(-0.5 * np.clip(q, 0.0, 1.0)).astype(np.float32)
-        if edge_power > 0.0:
-            value = value * np.power(np.clip(edge_crop, 0.0, 1.0), edge_power)
-        crop = support_map[ymin:ymax, xmin:xmax]
-        crop[support] = np.maximum(crop[support], value[support])
-    return np.clip(support_map, 0.0, 1.0)
-
-
 def _select_views(cameras: Sequence[object], limit: int) -> List[object]:
     cams = list(cameras)
     if int(limit) > 0:
@@ -362,7 +311,7 @@ def _neighbor_indices(index: int, total: int, radius: int) -> List[int]:
 
 
 def _view_dirs(output_root: Path) -> Dict[str, Path]:
-    names = ["hf_edge", "carrier_score", "ownership_score", "validated_edge", "overlay", "per_view"]
+    names = ["hf_edge", "carrier_touch", "carrier_score", "ownership_score", "validated_edge", "overlay", "per_view"]
     dirs = {name: output_root / name for name in names}
     for path in dirs.values():
         path.mkdir(parents=True, exist_ok=True)
@@ -394,7 +343,7 @@ def main() -> None:
     parser.add_argument("--min_radius_px", type=float, default=0.5)
     parser.add_argument("--max_radius_px", type=float, default=12.0)
     parser.add_argument("--candidate_radius_scale", type=float, default=1.0)
-    parser.add_argument("--max_gaussians_per_view", type=int, default=8192)
+    parser.add_argument("--max_gaussians_per_view", type=int, default=32768)
     parser.add_argument("--min_center_hf", type=float, default=0.05)
     parser.add_argument("--edge_mask_threshold", type=float, default=0.05)
     parser.add_argument("--profile_grid_radius", type=float, default=2.0)
@@ -403,7 +352,9 @@ def main() -> None:
     parser.add_argument("--neighbor_radius", type=int, default=1)
     parser.add_argument("--consistency_floor", type=float, default=0.0)
     parser.add_argument("--score_power", type=float, default=1.0)
-    parser.add_argument("--draw_max_gaussians", type=int, default=4096)
+    parser.add_argument("--draw_max_gaussians", type=int, default=32768)
+    parser.add_argument("--carrier_touch_max_gaussians", type=int, default=65536)
+    parser.add_argument("--carrier_score_mode", default="hit", choices=["touch", "hit", "validated"])
     parser.add_argument("--ownership_support_radius", type=float, default=1.0)
     parser.add_argument("--ownership_edge_threshold", type=float, default=0.05)
     parser.add_argument("--ownership_edge_power", type=float, default=0.0)
@@ -542,6 +493,45 @@ def main() -> None:
                     break
         return meta
 
+    def render_carrier_score_map(
+        cam,
+        gaussian_ids: np.ndarray,
+        values: np.ndarray,
+        *,
+        max_gaussians: int,
+    ) -> np.ndarray:
+        width = int(cam.image_width)
+        height = int(cam.image_height)
+        gaussian_ids = np.asarray(gaussian_ids, dtype=np.int64).reshape(-1)
+        values = np.asarray(values, dtype=np.float32).reshape(-1)
+        if gaussian_ids.shape[0] == 0 or values.shape[0] == 0:
+            return np.zeros((height, width), dtype=np.float32)
+        count = min(int(gaussian_ids.shape[0]), int(values.shape[0]))
+        gaussian_ids = gaussian_ids[:count]
+        values = np.nan_to_num(values[:count], nan=0.0, posinf=0.0, neginf=0.0)
+        active = np.nonzero(values > 0.0)[0].astype(np.int64)
+        if active.shape[0] == 0:
+            return np.zeros((height, width), dtype=np.float32)
+        if active.shape[0] > int(max_gaussians) > 0:
+            rank = values[active]
+            keep = np.argpartition(-rank, int(max_gaussians) - 1)[: int(max_gaussians)]
+            active = active[keep]
+        subset_ids_t = torch.from_numpy(gaussian_ids[active]).to(device=device, dtype=torch.long)
+        subset_scores_t = torch.from_numpy(values[active].astype(np.float32, copy=False)).to(device=device)
+        carrier_subset = _clone_subset_gaussians(gaussians, subset_ids_t)
+        carrier_color = subset_scores_t[:, None].expand(-1, 3).contiguous()
+        with torch.no_grad():
+            carrier_pkg = render(
+                cam,
+                carrier_subset,
+                pipe,
+                torch.zeros_like(background),
+                kernel_size=float(dataset.kernel_size),
+                override_color=carrier_color,
+            )
+        carrier_rgb = carrier_pkg["render"][:3].detach().cpu().numpy().transpose(1, 2, 0)
+        return np.clip(np.max(carrier_rgb, axis=2).astype(np.float32, copy=False), 0.0, 1.0)
+
     grid, weights = _canonical_grid(float(args.profile_grid_radius), int(args.profile_grid_steps))
     manifest_frames = []
     all_scores = []
@@ -580,19 +570,31 @@ def main() -> None:
         candidate_t = touch_mask & (opacity_t >= float(args.min_opacity))
         raw_candidates = int(candidate_t.sum().item())
         visible_gaussians = int(meta["visible_t"].sum().item())
-        ids = candidate_t.nonzero(as_tuple=True)[0].detach().cpu().numpy().astype(np.int64)
+        touch_ids = candidate_t.nonzero(as_tuple=True)[0].detach().cpu().numpy().astype(np.int64)
+        if touch_ids.shape[0] > 0:
+            touch_center_hf, touch_center_valid = _sample_bilinear(proposal, meta["x"][touch_ids], meta["y"][touch_ids])
+            touch_radii_rank = np.clip(meta["radii"][touch_ids], 0.0, float(args.max_radius_px)) / max(float(args.max_radius_px), 1e-6)
+            touch_rank = (touch_center_hf + 0.10 * touch_radii_rank) * np.sqrt(opacity_np[touch_ids].clip(0.0, 1.0))
+            touch_rank *= touch_center_valid.astype(np.float32)
+            if np.any(touch_rank > 0.0):
+                touch_values = np.clip(touch_rank / np.percentile(touch_rank[touch_rank > 0.0], 95).clip(1e-6), 0.0, 1.0)
+            else:
+                touch_values = np.ones_like(touch_rank, dtype=np.float32)
+        else:
+            touch_rank = np.empty((0,), dtype=np.float32)
+            touch_values = np.empty((0,), dtype=np.float32)
+        ids = touch_ids
+        id_rank = touch_rank
 
         if ids.shape[0] > int(args.max_gaussians_per_view) > 0:
-            center_hf, center_valid = _sample_bilinear(proposal, meta["x"][ids], meta["y"][ids])
-            radii_rank = np.clip(meta["radii"][ids], 0.0, float(args.max_radius_px)) / max(float(args.max_radius_px), 1e-6)
-            rank = (center_hf + 0.10 * radii_rank) * np.sqrt(opacity_np[ids].clip(0.0, 1.0))
-            rank *= center_valid.astype(np.float32)
-            keep = np.argpartition(-rank, int(args.max_gaussians_per_view) - 1)[: int(args.max_gaussians_per_view)]
+            keep = np.argpartition(-id_rank, int(args.max_gaussians_per_view) - 1)[: int(args.max_gaussians_per_view)]
             ids = ids[keep]
+            id_rank = id_rank[keep]
 
         if ids.shape[0] == 0:
             score_map = np.zeros((height, width), dtype=np.float32)
             _save_gray(dirs["hf_edge"] / f"{name}.png", abs_hf)
+            _save_gray(dirs["carrier_touch"] / f"{name}.png", score_map)
             _save_gray(dirs["carrier_score"] / f"{name}.png", score_map)
             _save_gray(dirs["ownership_score"] / f"{name}.png", score_map)
             _save_gray(dirs["validated_edge"] / f"{name}.png", score_map)
@@ -651,46 +653,38 @@ def main() -> None:
             score = np.power(np.clip(score, 0.0, 1.0), float(args.score_power))
         score *= (valid_current & (valid_ratio >= float(args.profile_min_valid))).astype(np.float32)
 
-        carrier_map = np.zeros((height, width), dtype=np.float32)
-        render_score_ids = np.nonzero(score > 0.0)[0].astype(np.int64)
-        if render_score_ids.shape[0] > int(args.draw_max_gaussians) > 0:
-            render_rank = score[render_score_ids]
-            keep = np.argpartition(-render_rank, int(args.draw_max_gaussians) - 1)[: int(args.draw_max_gaussians)]
-            render_score_ids = render_score_ids[keep]
-        if render_score_ids.shape[0] > 0:
-            subset_ids_t = torch.from_numpy(ids[render_score_ids]).to(device=device, dtype=torch.long)
-            subset_scores_t = torch.from_numpy(score[render_score_ids].astype(np.float32, copy=False)).to(device=device)
-            carrier_subset = _clone_subset_gaussians(gaussians, subset_ids_t)
-            carrier_color = subset_scores_t[:, None].expand(-1, 3).contiguous()
-            with torch.no_grad():
-                carrier_pkg = render(
-                    cam,
-                    carrier_subset,
-                    pipe,
-                    torch.zeros_like(background),
-                    kernel_size=float(dataset.kernel_size),
-                    override_color=carrier_color,
-                )
-            carrier_rgb = carrier_pkg["render"][:3].detach().cpu().numpy().transpose(1, 2, 0)
-            carrier_map = np.max(carrier_rgb, axis=2).astype(np.float32, copy=False)
-            carrier_map = np.clip(carrier_map, 0.0, 1.0)
-        score_map = _draw_renderer_supported_score_map(
-            width,
-            height,
-            proposal,
-            cx,
-            cy,
-            radii,
+        if np.any(id_rank > 0.0):
+            id_touch_values = np.clip(id_rank / np.percentile(id_rank[id_rank > 0.0], 95).clip(1e-6), 0.0, 1.0)
+        else:
+            id_touch_values = np.ones_like(id_rank, dtype=np.float32)
+        carrier_values = {
+            "touch": id_touch_values,
+            "hit": hit_norm * valid_current.astype(np.float32),
+            "validated": score,
+        }[str(args.carrier_score_mode)]
+        touch_map = render_carrier_score_map(
+            cam,
+            touch_ids,
+            touch_values,
+            max_gaussians=int(args.carrier_touch_max_gaussians),
+        )
+        carrier_map = render_carrier_score_map(
+            cam,
+            ids,
+            carrier_values,
+            max_gaussians=int(args.draw_max_gaussians),
+        )
+        score_map = render_carrier_score_map(
+            cam,
+            ids,
             score,
-            support_radius_scale=float(args.ownership_support_radius),
-            edge_threshold=float(args.ownership_edge_threshold),
-            edge_power=float(args.ownership_edge_power),
-            max_draw=int(args.draw_max_gaussians),
+            max_gaussians=int(args.draw_max_gaussians),
         )
         validated = proposal * np.clip(score_map, 0.0, 1.0)
         overlay = np.stack([abs_hf, np.maximum(abs_hf * 0.35, validated), abs_hf * 0.25], axis=2)
 
         _save_gray(dirs["hf_edge"] / f"{name}.png", abs_hf)
+        _save_gray(dirs["carrier_touch"] / f"{name}.png", touch_map)
         _save_gray(dirs["carrier_score"] / f"{name}.png", carrier_map)
         _save_gray(dirs["ownership_score"] / f"{name}.png", score_map)
         _save_gray(dirs["validated_edge"] / f"{name}.png", validated)
@@ -706,6 +700,8 @@ def main() -> None:
             x=cx.astype(np.float32),
             y=cy.astype(np.float32),
             radius=radii.astype(np.float32),
+            touch_rank=id_rank.astype(np.float32),
+            carrier_values=carrier_values.astype(np.float32),
             raw_candidates=np.asarray([raw_candidates], dtype=np.int64),
             visible_gaussians=np.asarray([visible_gaussians], dtype=np.int64),
         )
@@ -721,7 +717,9 @@ def main() -> None:
             "score_p90": float(np.percentile(score, 90)) if score.size else 0.0,
             "score_p95": float(np.percentile(score, 95)) if score.size else 0.0,
             "validated_ratio": float((score_map > 0.05).mean()),
+            "touch_ratio": float((touch_map > 0.05).mean()),
             "carrier_ratio": float((carrier_map > 0.05).mean()),
+            "carrier_score_mode": str(args.carrier_score_mode),
         }
         manifest_frames.append(frame)
         all_scores.append(score)
@@ -743,7 +741,7 @@ def main() -> None:
         return float(arr.mean())
 
     summary = {
-        "version": "renderer_backed_v1",
+        "version": "renderer_backed_dense_carrier_v2",
         "scene_root": str(scene_root),
         "model_dir": str(model_dir),
         "iteration": int(loaded_iter),
@@ -755,6 +753,10 @@ def main() -> None:
         "score_mean": _cat_mean(all_scores),
         "consistency_mean": _cat_mean(all_cons),
         "hit_mean": _cat_mean(all_hits),
+        "carrier_score_mode": str(args.carrier_score_mode),
+        "max_gaussians_per_view": int(args.max_gaussians_per_view),
+        "draw_max_gaussians": int(args.draw_max_gaussians),
+        "carrier_touch_max_gaussians": int(args.carrier_touch_max_gaussians),
         "frames": manifest_frames,
     }
     manifest_path = output_root / "manifest.json"
