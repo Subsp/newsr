@@ -11,7 +11,8 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from PIL import Image, ImageDraw
+import torch.nn as nn
+from PIL import Image
 
 SOF_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MIPSPLATTING_ROOT = SOF_ROOT.parent / "mip-splatting"
@@ -25,6 +26,34 @@ class Projected:
         self.y = y
         self.z = z
         self.valid = valid
+
+
+def _clone_subset_gaussians(base, ids: torch.Tensor):
+    from scene.gaussian_model import GaussianModel
+
+    ids = ids.to(device=base.get_xyz.device, dtype=torch.long).reshape(-1)
+    count = int(ids.shape[0])
+    subset = GaussianModel(base.max_sh_degree)
+    subset.active_sh_degree = int(base.active_sh_degree)
+    subset.spatial_lr_scale = float(base.spatial_lr_scale)
+    subset._xyz = nn.Parameter(base._xyz.detach()[ids].clone().requires_grad_(False))
+    subset._features_dc = nn.Parameter(base._features_dc.detach()[ids].clone().requires_grad_(False))
+    subset._features_rest = nn.Parameter(base._features_rest.detach()[ids].clone().requires_grad_(False))
+    subset._opacity = nn.Parameter(base._opacity.detach()[ids].clone().requires_grad_(False))
+    subset._scaling = nn.Parameter(base._scaling.detach()[ids].clone().requires_grad_(False))
+    subset._rotation = nn.Parameter(base._rotation.detach()[ids].clone().requires_grad_(False))
+    if isinstance(getattr(base, "filter_3D", None), torch.Tensor) and int(base.filter_3D.shape[0]) == int(base.get_xyz.shape[0]):
+        subset.filter_3D = base.filter_3D.detach()[ids].clone()
+    else:
+        subset.filter_3D = torch.zeros((count, 1), dtype=torch.float32, device=base.get_xyz.device)
+    subset.max_radii2D = torch.zeros((count,), dtype=torch.float32, device=base.get_xyz.device)
+    subset.xyz_gradient_accum = torch.zeros((count, 1), dtype=torch.float32, device=base.get_xyz.device)
+    subset.denom = torch.zeros((count, 1), dtype=torch.float32, device=base.get_xyz.device)
+    if hasattr(subset, "xyz_gradient_accum_abs"):
+        subset.xyz_gradient_accum_abs = torch.zeros((count, 1), dtype=torch.float32, device=base.get_xyz.device)
+    if hasattr(subset, "xyz_gradient_accum_abs_max"):
+        subset.xyz_gradient_accum_abs_max = torch.zeros((count, 1), dtype=torch.float32, device=base.get_xyz.device)
+    return subset
 
 
 def _ensure_mipsplatting_imports(root: Path) -> None:
@@ -263,34 +292,6 @@ def _profile_ncc(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     b0 = b - b.mean(axis=1, keepdims=True)
     denom = np.sqrt((a0 * a0).sum(axis=1) * (b0 * b0).sum(axis=1)).clip(1e-8)
     return ((a0 * b0).sum(axis=1) / denom).astype(np.float32)
-
-
-def _draw_carrier_score_map(
-    width: int,
-    height: int,
-    xs: np.ndarray,
-    ys: np.ndarray,
-    radii: np.ndarray,
-    scores: np.ndarray,
-    *,
-    max_draw: int,
-) -> np.ndarray:
-    image = Image.new("F", (width, height), 0.0)
-    draw = ImageDraw.Draw(image)
-    if scores.shape[0] == 0:
-        return np.zeros((height, width), dtype=np.float32)
-    order = np.argsort(scores)
-    if int(max_draw) > 0 and order.shape[0] > int(max_draw):
-        order = order[-int(max_draw):]
-    for i in order:
-        score = float(scores[i])
-        if score <= 0.0:
-            continue
-        r = float(np.clip(radii[i], 1.0, 12.0))
-        x = float(xs[i])
-        y = float(ys[i])
-        draw.ellipse((x - r, y - r, x + r, y + r), fill=score)
-    return np.asarray(image, dtype=np.float32).clip(0.0, 1.0)
 
 
 def _draw_renderer_supported_score_map(
@@ -650,7 +651,29 @@ def main() -> None:
             score = np.power(np.clip(score, 0.0, 1.0), float(args.score_power))
         score *= (valid_current & (valid_ratio >= float(args.profile_min_valid))).astype(np.float32)
 
-        carrier_map = _draw_carrier_score_map(width, height, cx, cy, radii, score, max_draw=int(args.draw_max_gaussians))
+        carrier_map = np.zeros((height, width), dtype=np.float32)
+        render_score_ids = np.nonzero(score > 0.0)[0].astype(np.int64)
+        if render_score_ids.shape[0] > int(args.draw_max_gaussians) > 0:
+            render_rank = score[render_score_ids]
+            keep = np.argpartition(-render_rank, int(args.draw_max_gaussians) - 1)[: int(args.draw_max_gaussians)]
+            render_score_ids = render_score_ids[keep]
+        if render_score_ids.shape[0] > 0:
+            subset_ids_t = torch.from_numpy(ids[render_score_ids]).to(device=device, dtype=torch.long)
+            subset_scores_t = torch.from_numpy(score[render_score_ids].astype(np.float32, copy=False)).to(device=device)
+            carrier_subset = _clone_subset_gaussians(gaussians, subset_ids_t)
+            carrier_color = subset_scores_t[:, None].expand(-1, 3).contiguous()
+            with torch.no_grad():
+                carrier_pkg = render(
+                    cam,
+                    carrier_subset,
+                    pipe,
+                    torch.zeros_like(background),
+                    kernel_size=float(dataset.kernel_size),
+                    override_color=carrier_color,
+                )
+            carrier_rgb = carrier_pkg["render"][:3].detach().cpu().numpy().transpose(1, 2, 0)
+            carrier_map = np.max(carrier_rgb, axis=2).astype(np.float32, copy=False)
+            carrier_map = np.clip(carrier_map, 0.0, 1.0)
         score_map = _draw_renderer_supported_score_map(
             width,
             height,
