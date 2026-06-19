@@ -25,7 +25,7 @@ ANCHOR_DIR="${ANCHOR_DIR:-${INPUT_MODEL_DIR}/train/ours_30000/test_preds_1}"
 NPSE_CACHE="${NPSE_CACHE:-${SCENE_ASSET_ROOT}/npse_cache/render_x1_restormer_depthprior_npse_yellow_fidelity_nogate_full_v0}"
 EDGE_MASK_DIR="${EDGE_MASK_DIR:-${NPSE_CACHE}/trust_edge}"
 
-OUTPUT_NAME="${OUTPUT_NAME:-render_x1_restormer_cave_hf_ownership_v0}"
+OUTPUT_NAME="${OUTPUT_NAME:-render_x1_restormer_cave_hf_ownership_renderer_v1}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${SCENE_ASSET_ROOT}/cave_hf_ownership/${OUTPUT_NAME}}"
 
 MATCH_POLICY="${MATCH_POLICY:-llff_train_order}"
@@ -49,6 +49,9 @@ NEIGHBOR_RADIUS="${NEIGHBOR_RADIUS:-1}"
 CONSISTENCY_FLOOR="${CONSISTENCY_FLOOR:-0.0}"
 SCORE_POWER="${SCORE_POWER:-1.0}"
 DRAW_MAX_GAUSSIANS="${DRAW_MAX_GAUSSIANS:-4096}"
+OWNERSHIP_SUPPORT_RADIUS="${OWNERSHIP_SUPPORT_RADIUS:-1.0}"
+OWNERSHIP_EDGE_THRESHOLD="${OWNERSHIP_EDGE_THRESHOLD:-0.05}"
+OWNERSHIP_EDGE_POWER="${OWNERSHIP_EDGE_POWER:-0.0}"
 
 for path in \
   "${SCENE_ROOT}" \
@@ -59,29 +62,30 @@ for path in \
   "${ANCHOR_DIR}" \
   "${MIPSPLATTING_ROOT}"; do
   if [[ ! -e "${path}" ]]; then
-    echo "[cave-hf-v0] required path not found: ${path}" >&2
+    echo "[cave-hf-v1] required path not found: ${path}" >&2
     exit 1
   fi
 done
 
 if [[ -n "${EDGE_MASK_DIR}" && ! -d "${EDGE_MASK_DIR}" ]]; then
-  echo "[cave-hf-v0] edge mask dir not found, continuing without mask: ${EDGE_MASK_DIR}" >&2
+  echo "[cave-hf-v1] edge mask dir not found, continuing without mask: ${EDGE_MASK_DIR}" >&2
   EDGE_MASK_DIR=""
 fi
 
 mkdir -p "${OUTPUT_ROOT}"
 
-echo "[cave-hf-v0] scene      : ${SCENE_ROOT}"
-echo "[cave-hf-v0] images     : ${IMAGES_SUBDIR}"
-echo "[cave-hf-v0] model      : ${CAVE_MODEL_DIR}"
-echo "[cave-hf-v0] iteration  : ${CAVE_ITERATION}"
-echo "[cave-hf-v0] sr         : ${SR_DIR}"
-echo "[cave-hf-v0] anchor     : ${ANCHOR_DIR}"
-echo "[cave-hf-v0] edge mask  : ${EDGE_MASK_DIR:-none}"
-echo "[cave-hf-v0] output     : ${OUTPUT_ROOT}"
-echo "[cave-hf-v0] limit      : ${LIMIT}"
-echo "[cave-hf-v0] candidates : max=${MAX_GAUSSIANS_PER_VIEW} min_hf=${MIN_CENTER_HF} opacity=${MIN_OPACITY}"
-echo "[cave-hf-v0] covariance : grid=${PROFILE_GRID_STEPS} radius=${PROFILE_GRID_RADIUS} neighbors=${NEIGHBOR_RADIUS}"
+echo "[cave-hf-v1] scene      : ${SCENE_ROOT}"
+echo "[cave-hf-v1] images     : ${IMAGES_SUBDIR}"
+echo "[cave-hf-v1] model      : ${CAVE_MODEL_DIR}"
+echo "[cave-hf-v1] iteration  : ${CAVE_ITERATION}"
+echo "[cave-hf-v1] sr         : ${SR_DIR}"
+echo "[cave-hf-v1] anchor     : ${ANCHOR_DIR}"
+echo "[cave-hf-v1] edge mask  : ${EDGE_MASK_DIR:-none}"
+echo "[cave-hf-v1] output     : ${OUTPUT_ROOT}"
+echo "[cave-hf-v1] limit      : ${LIMIT}"
+echo "[cave-hf-v1] candidates : max=${MAX_GAUSSIANS_PER_VIEW} min_hf=${MIN_CENTER_HF} opacity=${MIN_OPACITY}"
+echo "[cave-hf-v1] renderer   : original GS render radii/visibility + SOFPriorBlock touch"
+echo "[cave-hf-v1] profile    : grid=${PROFILE_GRID_STEPS} radius=${PROFILE_GRID_RADIUS} neighbors=${NEIGHBOR_RADIUS}"
 
 ARGS=(
   "${PYTHON_BIN}" "${SOF_ROOT}/scripts/build_cave_hf_ownership_cache_v0.py"
@@ -112,6 +116,9 @@ ARGS=(
   --consistency_floor "${CONSISTENCY_FLOOR}"
   --score_power "${SCORE_POWER}"
   --draw_max_gaussians "${DRAW_MAX_GAUSSIANS}"
+  --ownership_support_radius "${OWNERSHIP_SUPPORT_RADIUS}"
+  --ownership_edge_threshold "${OWNERSHIP_EDGE_THRESHOLD}"
+  --ownership_edge_power "${OWNERSHIP_EDGE_POWER}"
 )
 
 if [[ -n "${CAVE_POINT_CLOUD_PLY}" ]]; then
@@ -126,4 +133,4 @@ fi
 
 "${ARGS[@]}"
 
-echo "[cave-hf-v0] done: ${OUTPUT_ROOT}"
+echo "[cave-hf-v1] done: ${OUTPUT_ROOT}"

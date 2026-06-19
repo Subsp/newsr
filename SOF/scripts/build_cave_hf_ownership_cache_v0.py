@@ -5,11 +5,12 @@ import argparse
 import json
 import math
 import sys
-from dataclasses import dataclass
+from argparse import Namespace
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+import torch
 from PIL import Image, ImageDraw
 
 SOF_ROOT = Path(__file__).resolve().parents[1]
@@ -18,21 +19,12 @@ DEFAULT_MIPSPLATTING_ROOT = SOF_ROOT.parent / "mip-splatting"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 
 
-@dataclass
-class GaussianCloud:
-    xyz: np.ndarray
-    scale: np.ndarray
-    rotation: np.ndarray
-    opacity: np.ndarray
-    max_scale: np.ndarray
-
-
-@dataclass
 class Projected:
-    x: np.ndarray
-    y: np.ndarray
-    z: np.ndarray
-    valid: np.ndarray
+    def __init__(self, x: np.ndarray, y: np.ndarray, z: np.ndarray, valid: np.ndarray):
+        self.x = x
+        self.y = y
+        self.z = z
+        self.valid = valid
 
 
 def _ensure_mipsplatting_imports(root: Path) -> None:
@@ -41,82 +33,52 @@ def _ensure_mipsplatting_imports(root: Path) -> None:
         sys.path.insert(0, root_str)
 
 
-def _sigmoid(x: np.ndarray) -> np.ndarray:
-    return 1.0 / (1.0 + np.exp(-x))
-
-
-def _load_gaussians(ply_path: Path) -> GaussianCloud:
-    from plyfile import PlyData
-
-    ply = PlyData.read(str(ply_path))
-    v = ply["vertex"]
-    xyz = np.stack([np.asarray(v["x"]), np.asarray(v["y"]), np.asarray(v["z"])], axis=1).astype(np.float32)
-    scale_names = sorted(
-        [p.name for p in v.properties if p.name.startswith("scale_")],
-        key=lambda name: int(name.split("_")[-1]),
-    )
-    rot_names = sorted(
-        [p.name for p in v.properties if p.name.startswith("rot")],
-        key=lambda name: int(name.split("_")[-1]),
-    )
-    if len(scale_names) != 3:
-        raise ValueError(f"Expected 3 scale_* fields in {ply_path}, got {scale_names}")
-    if len(rot_names) != 4:
-        raise ValueError(f"Expected 4 rot_* fields in {ply_path}, got {rot_names}")
-    raw_scale = np.stack([np.asarray(v[name]) for name in scale_names], axis=1).astype(np.float32)
-    raw_rot = np.stack([np.asarray(v[name]) for name in rot_names], axis=1).astype(np.float32)
-    raw_opacity = np.asarray(v["opacity"], dtype=np.float32).reshape(-1)
-    scale = np.exp(raw_scale).astype(np.float32)
-    rotation = raw_rot / np.linalg.norm(raw_rot, axis=1, keepdims=True).clip(1e-8)
-    opacity = _sigmoid(raw_opacity).astype(np.float32)
-    return GaussianCloud(
-        xyz=xyz,
-        scale=scale,
-        rotation=rotation,
-        opacity=opacity,
-        max_scale=np.max(scale, axis=1).astype(np.float32),
+def _build_dataset_args(scene_root: str, model_path: str, images_subdir: str, white_background: bool) -> Namespace:
+    return Namespace(
+        sh_degree=3,
+        source_path=scene_root,
+        model_path=model_path,
+        images=images_subdir,
+        resolution=1,
+        white_background=white_background,
+        data_device="cuda",
+        eval=True,
+        kernel_size=0.1,
+        ray_jitter=False,
+        resample_gt_image=False,
+        load_allres=False,
+        sample_more_highres=False,
     )
 
 
-def _quat_to_rotmat(q: np.ndarray) -> np.ndarray:
-    q = q / np.linalg.norm(q, axis=1, keepdims=True).clip(1e-8)
-    r, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-    out = np.empty((q.shape[0], 3, 3), dtype=np.float32)
-    out[:, 0, 0] = 1 - 2 * (y * y + z * z)
-    out[:, 0, 1] = 2 * (x * y - r * z)
-    out[:, 0, 2] = 2 * (x * z + r * y)
-    out[:, 1, 0] = 2 * (x * y + r * z)
-    out[:, 1, 1] = 1 - 2 * (x * x + z * z)
-    out[:, 1, 2] = 2 * (y * z - r * x)
-    out[:, 2, 0] = 2 * (x * z - r * y)
-    out[:, 2, 1] = 2 * (y * z + r * x)
-    out[:, 2, 2] = 1 - 2 * (x * x + y * y)
-    return out
+def _build_pipe_args() -> Namespace:
+    return Namespace(
+        convert_SHs_python=False,
+        compute_cov3D_python=False,
+        compute_filter3D_python=False,
+        compute_view2gaussian_python=False,
+        use_merged_sof_rasterizer=False,
+        use_vanilla_sof_rasterizer=False,
+        require_merged_sof_aux=False,
+        debug=False,
+    )
 
 
-def _resolve_point_cloud(model_dir: Path, iteration: int, point_cloud_ply: Optional[str]) -> Path:
-    if point_cloud_ply:
-        path = Path(point_cloud_ply).expanduser().resolve()
-        if not path.is_file():
-            raise FileNotFoundError(path)
-        return path
-    if int(iteration) < 0:
-        root = model_dir / "point_cloud"
-        candidates = []
-        for child in root.glob("iteration_*"):
-            if not child.is_dir():
-                continue
-            try:
-                candidates.append(int(child.name.split("_")[-1]))
-            except ValueError:
-                continue
-        if not candidates:
-            raise FileNotFoundError(f"No point_cloud/iteration_* under {model_dir}")
-        iteration = max(candidates)
-    path = model_dir / "point_cloud" / f"iteration_{int(iteration)}" / "point_cloud.ply"
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    return path
+def _resolve_iteration(model_path: Path, iteration: int) -> int:
+    if int(iteration) >= 0:
+        return int(iteration)
+    point_root = model_path / "point_cloud"
+    candidates: List[int] = []
+    for child in point_root.iterdir():
+        if not child.is_dir() or not child.name.startswith("iteration_"):
+            continue
+        try:
+            candidates.append(int(child.name.split("_")[-1]))
+        except ValueError:
+            continue
+    if not candidates:
+        raise FileNotFoundError(f"No iteration_* directories found under {point_root}")
+    return max(candidates)
 
 
 def _list_images(root: Path) -> List[Path]:
@@ -243,10 +205,10 @@ def _sample_bilinear(image: np.ndarray, xs: np.ndarray, ys: np.ndarray) -> Tuple
 def _project_points(xyz: np.ndarray, camera: object) -> Projected:
     r = np.asarray(camera.R, dtype=np.float32)
     t = np.asarray(camera.T, dtype=np.float32).reshape(1, 3)
-    width = _camera_width(camera)
-    height = _camera_height(camera)
-    focal_x = _camera_focal_x(camera)
-    focal_y = _camera_focal_y(camera)
+    width = int(camera.image_width)
+    height = int(camera.image_height)
+    focal_x = float(camera.focal_x)
+    focal_y = float(camera.focal_y)
     xyz_cam = xyz @ r + t
     z = xyz_cam[:, 2]
     safe_z = np.clip(z, 1e-6, None)
@@ -254,50 +216,6 @@ def _project_points(xyz: np.ndarray, camera: object) -> Projected:
     y = xyz_cam[:, 1] / safe_z * focal_y + height * 0.5
     valid = z > 1e-6
     return Projected(x=x.astype(np.float32), y=y.astype(np.float32), z=z.astype(np.float32), valid=valid)
-
-
-def _project_pixel(xyz: np.ndarray, camera: object) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    proj = _project_points(xyz, camera)
-    return proj.x, proj.y, proj.z
-
-
-def _ellipse_cholesky_for_ids(
-    cloud: GaussianCloud,
-    ids: np.ndarray,
-    camera: object,
-    *,
-    sigma_scale: float,
-    min_sigma_px: float,
-    max_sigma_px: float,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    xyz = cloud.xyz[ids]
-    center_x, center_y, center_z = _project_pixel(xyz, camera)
-    rot = _quat_to_rotmat(cloud.rotation[ids])
-    axes = rot * cloud.scale[ids][:, None, :]
-    cov = np.zeros((ids.shape[0], 2, 2), dtype=np.float32)
-    valid = center_z > 1e-6
-    for axis_idx in range(3):
-        px, py, _ = _project_pixel(xyz + axes[:, :, axis_idx] * float(sigma_scale), camera)
-        dx = px - center_x
-        dy = py - center_y
-        cov[:, 0, 0] += dx * dx
-        cov[:, 0, 1] += dx * dy
-        cov[:, 1, 0] += dy * dx
-        cov[:, 1, 1] += dy * dy
-    cov[:, 0, 0] += float(min_sigma_px) ** 2
-    cov[:, 1, 1] += float(min_sigma_px) ** 2
-    eigvals = np.linalg.eigvalsh(cov).astype(np.float32)
-    radius = np.sqrt(np.maximum(eigvals[:, 1], 0.0))
-    if float(max_sigma_px) > 0.0:
-        shrink = np.minimum(1.0, float(max_sigma_px) / np.maximum(radius, 1e-6))
-        cov *= (shrink * shrink)[:, None, None]
-        radius *= shrink
-    try:
-        chol = np.linalg.cholesky(cov)
-    except np.linalg.LinAlgError:
-        eye = np.eye(2, dtype=np.float32)[None]
-        chol = np.linalg.cholesky(cov + 1e-3 * eye)
-    return center_x, center_y, chol.astype(np.float32), valid
 
 
 def _canonical_grid(radius: float, steps: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -314,12 +232,12 @@ def _canonical_grid(radius: float, steps: int) -> Tuple[np.ndarray, np.ndarray]:
     return grid, weights
 
 
-def _sample_profiles(
+def _sample_profiles_isotropic(
     signed_hf: np.ndarray,
     abs_hf: np.ndarray,
     cx: np.ndarray,
     cy: np.ndarray,
-    chol: np.ndarray,
+    radii: np.ndarray,
     grid: np.ndarray,
     weights: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -328,7 +246,7 @@ def _sample_profiles(
     abs_profiles = np.zeros((n, grid.shape[0]), dtype=np.float32)
     valid_ratio = np.zeros((n,), dtype=np.float32)
     for i in range(n):
-        pts = grid @ chol[i].T
+        pts = grid * max(float(radii[i]), 1e-6)
         xs = cx[i] + pts[:, 0]
         ys = cy[i] + pts[:, 1]
         signed, valid = _sample_bilinear(signed_hf, xs, ys)
@@ -347,7 +265,7 @@ def _profile_ncc(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return ((a0 * b0).sum(axis=1) / denom).astype(np.float32)
 
 
-def _draw_score_map(
+def _draw_carrier_score_map(
     width: int,
     height: int,
     xs: np.ndarray,
@@ -375,35 +293,61 @@ def _draw_score_map(
     return np.asarray(image, dtype=np.float32).clip(0.0, 1.0)
 
 
+def _draw_renderer_supported_score_map(
+    width: int,
+    height: int,
+    edge_image: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    radii: np.ndarray,
+    scores: np.ndarray,
+    *,
+    support_radius_scale: float,
+    edge_threshold: float,
+    edge_power: float,
+    max_draw: int,
+) -> np.ndarray:
+    support_map = np.zeros((height, width), dtype=np.float32)
+    if scores.shape[0] == 0:
+        return support_map
+    order = np.argsort(scores)
+    if int(max_draw) > 0 and order.shape[0] > int(max_draw):
+        order = order[-int(max_draw):]
+    edge_threshold = max(float(edge_threshold), 0.0)
+    support_radius_scale = max(float(support_radius_scale), 0.25)
+    edge_power = max(float(edge_power), 0.0)
+    for i in order:
+        score = float(scores[i])
+        if score <= 0.0:
+            continue
+        radius = max(float(radii[i]) * support_radius_scale, 0.5)
+        xmin = max(0, int(math.floor(float(xs[i]) - radius)))
+        xmax = min(width, int(math.ceil(float(xs[i]) + radius + 1.0)))
+        ymin = max(0, int(math.floor(float(ys[i]) - radius)))
+        ymax = min(height, int(math.ceil(float(ys[i]) + radius + 1.0)))
+        if xmin >= xmax or ymin >= ymax:
+            continue
+        yy, xx = np.mgrid[ymin:ymax, xmin:xmax].astype(np.float32)
+        dx = (xx + 0.5 - float(xs[i])) / radius
+        dy = (yy + 0.5 - float(ys[i])) / radius
+        q = dx * dx + dy * dy
+        edge_crop = edge_image[ymin:ymax, xmin:xmax]
+        support = (q <= 1.0) & (edge_crop >= edge_threshold)
+        if not np.any(support):
+            continue
+        value = score * np.exp(-0.5 * np.clip(q, 0.0, 1.0)).astype(np.float32)
+        if edge_power > 0.0:
+            value = value * np.power(np.clip(edge_crop, 0.0, 1.0), edge_power)
+        crop = support_map[ymin:ymax, xmin:xmax]
+        crop[support] = np.maximum(crop[support], value[support])
+    return np.clip(support_map, 0.0, 1.0)
+
+
 def _select_views(cameras: Sequence[object], limit: int) -> List[object]:
     cams = list(cameras)
     if int(limit) > 0:
         cams = cams[: int(limit)]
     return cams
-
-
-def _camera_width(camera: object) -> int:
-    if hasattr(camera, "image_width"):
-        return int(camera.image_width)
-    return int(camera.width)
-
-
-def _camera_height(camera: object) -> int:
-    if hasattr(camera, "image_height"):
-        return int(camera.image_height)
-    return int(camera.height)
-
-
-def _camera_focal_x(camera: object) -> float:
-    if hasattr(camera, "focal_x"):
-        return float(camera.focal_x)
-    return _camera_width(camera) / (2.0 * math.tan(float(camera.FovX) * 0.5))
-
-
-def _camera_focal_y(camera: object) -> float:
-    if hasattr(camera, "focal_y"):
-        return float(camera.focal_y)
-    return _camera_height(camera) / (2.0 * math.tan(float(camera.FovY) * 0.5))
 
 
 def _neighbor_indices(index: int, total: int, radius: int) -> List[int]:
@@ -417,7 +361,7 @@ def _neighbor_indices(index: int, total: int, radius: int) -> List[int]:
 
 
 def _view_dirs(output_root: Path) -> Dict[str, Path]:
-    names = ["hf_edge", "ownership_score", "validated_edge", "overlay", "per_view"]
+    names = ["hf_edge", "carrier_score", "ownership_score", "validated_edge", "overlay", "per_view"]
     dirs = {name: output_root / name for name in names}
     for path in dirs.values():
         path.mkdir(parents=True, exist_ok=True)
@@ -425,19 +369,23 @@ def _view_dirs(output_root: Path) -> Dict[str, Path]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build CAVE high-frequency Gaussian ownership diagnostics.")
+    parser = argparse.ArgumentParser(description="Build renderer-backed CAVE high-frequency Gaussian ownership diagnostics.")
     parser.add_argument("--scene_root", required=True)
     parser.add_argument("--images_subdir", default="images_2")
     parser.add_argument("--model_dir", required=True)
     parser.add_argument("--iteration", type=int, default=-1)
-    parser.add_argument("--point_cloud_ply", default="")
+    parser.add_argument(
+        "--point_cloud_ply",
+        default="",
+        help="Deprecated in renderer-backed mode; load through --model_dir/--iteration instead.",
+    )
     parser.add_argument("--sr_dir", required=True)
     parser.add_argument("--anchor_dir", required=True)
     parser.add_argument("--edge_mask_dir", default="")
     parser.add_argument("--output_root", required=True)
     parser.add_argument("--mipsplatting_root", default=str(DEFAULT_MIPSPLATTING_ROOT))
     parser.add_argument("--match_policy", default="llff_train_order", choices=["stem", "order", "order_if_needed", "llff_train_order"])
-    parser.add_argument("--llffhold", type=int, default=8)
+    parser.add_argument("--llffhold", type=int, default=8, help="Accepted for CLI compatibility; Scene uses the native mip-splatting split.")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--highpass_kernel", type=int, default=9)
     parser.add_argument("--hf_percentile", type=float, default=99.0)
@@ -455,8 +403,15 @@ def main() -> None:
     parser.add_argument("--consistency_floor", type=float, default=0.0)
     parser.add_argument("--score_power", type=float, default=1.0)
     parser.add_argument("--draw_max_gaussians", type=int, default=4096)
+    parser.add_argument("--ownership_support_radius", type=float, default=1.0)
+    parser.add_argument("--ownership_edge_threshold", type=float, default=0.05)
+    parser.add_argument("--ownership_edge_power", type=float, default=0.0)
+    parser.add_argument("--white_background", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
+
+    if str(args.point_cloud_ply).strip():
+        raise ValueError("Renderer-backed CAVE uses Scene/GaussianModel; do not pass --point_cloud_ply.")
 
     scene_root = Path(args.scene_root).expanduser().resolve()
     model_dir = Path(args.model_dir).expanduser().resolve()
@@ -465,10 +420,19 @@ def main() -> None:
     dirs = _view_dirs(output_root)
 
     _ensure_mipsplatting_imports(Path(args.mipsplatting_root))
-    from scene.dataset_readers import readColmapSceneInfo  # type: ignore
+    from gaussian_renderer import render  # type: ignore
+    from hybrid_sdfgs.blocks import SOFPriorBlock, SOFPriorConfig  # type: ignore
+    from scene import Scene  # type: ignore
+    from scene.gaussian_model import GaussianModel  # type: ignore
 
-    scene_info = readColmapSceneInfo(str(scene_root), images=str(args.images_subdir), eval=True, llffhold=int(args.llffhold))
-    train_cameras = _select_views(scene_info.train_cameras, int(args.limit))
+    iteration = _resolve_iteration(model_dir, int(args.iteration))
+    dataset = _build_dataset_args(str(scene_root), str(model_dir), str(args.images_subdir), bool(args.white_background))
+    pipe = _build_pipe_args()
+    gaussians = GaussianModel(dataset.sh_degree)
+    scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+    loaded_iter = int(scene.loaded_iter if scene.loaded_iter is not None else iteration)
+    all_train_cameras = list(scene.getTrainCameras())
+    train_cameras = _select_views(all_train_cameras, int(args.limit))
     if not train_cameras:
         raise RuntimeError("No train cameras selected.")
 
@@ -494,25 +458,43 @@ def main() -> None:
             match_policy=str(args.match_policy),
         )
 
-    point_cloud_ply = _resolve_point_cloud(model_dir, int(args.iteration), str(args.point_cloud_ply or ""))
-    cloud = _load_gaussians(point_cloud_ply)
-    print(f"[cave-hf-v0] scene       : {scene_root}")
-    print(f"[cave-hf-v0] model       : {model_dir}")
-    print(f"[cave-hf-v0] ply         : {point_cloud_ply}")
-    print(f"[cave-hf-v0] output      : {output_root}")
-    print(f"[cave-hf-v0] views       : {len(train_cameras)}")
-    print(f"[cave-hf-v0] gaussians   : {cloud.xyz.shape[0]}")
-    print(f"[cave-hf-v0] match sr    : {sr_summary}")
-    print(f"[cave-hf-v0] match anchor: {anchor_summary}")
+    try:
+        gaussians.compute_3D_filter(all_train_cameras.copy(), CUDA=not bool(pipe.compute_filter3D_python))
+    except TypeError:
+        gaussians.compute_3D_filter(all_train_cameras.copy())
+
+    device = gaussians.get_xyz.device
+    background = torch.tensor([1, 1, 1] if args.white_background else [0, 0, 0], dtype=torch.float32, device=device)
+    xyz_np = gaussians.get_xyz.detach().cpu().numpy().astype(np.float32, copy=False)
+    opacity_np = gaussians.get_opacity_with_3D_filter.detach().cpu().numpy().reshape(-1).astype(np.float32, copy=False)
+    opacity_t = torch.from_numpy(opacity_np).to(device=device)
+    total_gaussians = int(xyz_np.shape[0])
+    touch_block = SOFPriorBlock(
+        SOFPriorConfig(
+            prior_edge_touch_min_radius_px=float(args.min_radius_px),
+            prior_edge_touch_radius_scale=float(args.candidate_radius_scale),
+            prior_edge_touch_max_radius_px=float(args.max_radius_px),
+        )
+    )
+
+    print(f"[cave-hf-v1] scene       : {scene_root}")
+    print(f"[cave-hf-v1] model       : {model_dir}")
+    print(f"[cave-hf-v1] iteration   : {loaded_iter}")
+    print(f"[cave-hf-v1] output      : {output_root}")
+    print(f"[cave-hf-v1] views       : {len(train_cameras)}")
+    print(f"[cave-hf-v1] gaussians   : {total_gaussians}")
+    print(f"[cave-hf-v1] match sr    : {sr_summary}")
+    print(f"[cave-hf-v1] match anchor: {anchor_summary}")
     if edge_summary is not None:
-        print(f"[cave-hf-v0] match mask  : {edge_summary}")
+        print(f"[cave-hf-v1] match mask  : {edge_summary}")
+    print("[cave-hf-v1] gaussian path: Scene/GaussianModel + gaussian_renderer.render radii/visibility + SOFPriorBlock touch")
 
     signed_maps: Dict[str, np.ndarray] = {}
     abs_maps: Dict[str, np.ndarray] = {}
     mask_maps: Dict[str, np.ndarray] = {}
     for cam in train_cameras:
-        width = _camera_width(cam)
-        height = _camera_height(cam)
+        width = int(cam.image_width)
+        height = int(cam.image_height)
         sr = _load_rgb(sr_map[str(cam.image_name)], width, height)
         anchor = _load_rgb(anchor_map[str(cam.image_name)], width, height)
         signed = _signed_hf_residual(sr, anchor, int(args.highpass_kernel))
@@ -527,6 +509,38 @@ def main() -> None:
         abs_maps[str(cam.image_name)] = abs_hf
         mask_maps[str(cam.image_name)] = mask
 
+    render_cache: Dict[int, Dict[str, object]] = {}
+
+    def get_render_meta(index: int) -> Dict[str, object]:
+        if index in render_cache:
+            return render_cache[index]
+        cam = train_cameras[index]
+        with torch.no_grad():
+            pkg = render(cam, gaussians, pipe, background, kernel_size=float(dataset.kernel_size))
+        radii_t = pkg["radii"].detach().to(device=device, dtype=torch.float32).reshape(-1)
+        visible_t = pkg["visibility_filter"].detach().to(device=device, dtype=torch.bool).reshape(-1)
+        radii_np = radii_t.detach().cpu().numpy().astype(np.float32, copy=False)
+        visible_np = visible_t.detach().cpu().numpy().astype(bool, copy=False)
+        proj = _project_points(xyz_np, cam)
+        meta = {
+            "radii_t": radii_t,
+            "visible_t": visible_t,
+            "radii": radii_np,
+            "visible": visible_np,
+            "x": proj.x,
+            "y": proj.y,
+            "z": proj.z,
+            "project_valid": proj.valid,
+        }
+        render_cache[index] = meta
+        keep = max(2 * int(args.neighbor_radius) + 5, 8)
+        if len(render_cache) > keep:
+            for key in sorted(render_cache):
+                if abs(key - index) > int(args.neighbor_radius) + 2:
+                    render_cache.pop(key, None)
+                    break
+        return meta
+
     grid, weights = _canonical_grid(float(args.profile_grid_radius), int(args.profile_grid_steps))
     manifest_frames = []
     all_scores = []
@@ -537,73 +551,86 @@ def main() -> None:
         name = str(cam.image_name)
         out_npz = dirs["per_view"] / f"{name}.npz"
         if out_npz.exists() and not bool(args.overwrite):
+            print(f"[cave-hf-v1] skip existing {view_index + 1}/{len(train_cameras)} {name}", flush=True)
             continue
-        width = _camera_width(cam)
-        height = _camera_height(cam)
+
+        width = int(cam.image_width)
+        height = int(cam.image_height)
         abs_hf = abs_maps[name]
         signed = signed_maps[name]
         mask = mask_maps[name]
-        proj = _project_points(cloud.xyz, cam)
-        approx_radius = cloud.max_scale * max(_camera_focal_x(cam), _camera_focal_y(cam)) / np.maximum(proj.z, 1e-6)
-        approx_radius = np.clip(approx_radius * float(args.candidate_radius_scale), float(args.min_radius_px), float(args.max_radius_px))
-        in_bounds = (
-            proj.valid
-            & (cloud.opacity >= float(args.min_opacity))
-            & (proj.x >= -approx_radius)
-            & (proj.y >= -approx_radius)
-            & (proj.x < width + approx_radius)
-            & (proj.y < height + approx_radius)
+        proposal = (abs_hf * mask).astype(np.float32, copy=False)
+        meta = get_render_meta(view_index)
+
+        proposal_t = torch.from_numpy(proposal).to(device=device, dtype=torch.float32)
+        touch_mask = touch_block.build_touch_mask(
+            viewpoint_cam=cam,
+            gaussians=gaussians,
+            image_mask=proposal_t,
+            visibility_filter=meta["visible_t"],
+            radii=meta["radii_t"],
+            min_radius_px=float(args.min_radius_px),
+            radius_scale=float(args.candidate_radius_scale),
+            max_radius_px=float(args.max_radius_px),
+            mask_threshold=float(args.min_center_hf),
         )
-        center_hf, center_valid = _sample_bilinear(abs_hf * mask, proj.x, proj.y)
-        candidate_score = center_hf * center_valid.astype(np.float32) * in_bounds.astype(np.float32)
-        candidate_score *= np.sqrt(cloud.opacity.clip(0.0, 1.0))
-        candidate = candidate_score >= float(args.min_center_hf)
-        ids = np.nonzero(candidate)[0].astype(np.int64)
+        if touch_mask is None:
+            touch_mask = torch.zeros((total_gaussians,), dtype=torch.bool, device=device)
+        candidate_t = touch_mask & (opacity_t >= float(args.min_opacity))
+        raw_candidates = int(candidate_t.sum().item())
+        visible_gaussians = int(meta["visible_t"].sum().item())
+        ids = candidate_t.nonzero(as_tuple=True)[0].detach().cpu().numpy().astype(np.int64)
+
         if ids.shape[0] > int(args.max_gaussians_per_view) > 0:
-            scores = candidate_score[ids]
-            keep = np.argpartition(-scores, int(args.max_gaussians_per_view) - 1)[: int(args.max_gaussians_per_view)]
+            center_hf, center_valid = _sample_bilinear(proposal, meta["x"][ids], meta["y"][ids])
+            radii_rank = np.clip(meta["radii"][ids], 0.0, float(args.max_radius_px)) / max(float(args.max_radius_px), 1e-6)
+            rank = (center_hf + 0.10 * radii_rank) * np.sqrt(opacity_np[ids].clip(0.0, 1.0))
+            rank *= center_valid.astype(np.float32)
+            keep = np.argpartition(-rank, int(args.max_gaussians_per_view) - 1)[: int(args.max_gaussians_per_view)]
             ids = ids[keep]
+
         if ids.shape[0] == 0:
             score_map = np.zeros((height, width), dtype=np.float32)
             _save_gray(dirs["hf_edge"] / f"{name}.png", abs_hf)
+            _save_gray(dirs["carrier_score"] / f"{name}.png", score_map)
             _save_gray(dirs["ownership_score"] / f"{name}.png", score_map)
             _save_gray(dirs["validated_edge"] / f"{name}.png", score_map)
             continue
 
-        cx, cy, chol, valid_ellipse = _ellipse_cholesky_for_ids(
-            cloud,
-            ids,
-            cam,
-            sigma_scale=1.0,
-            min_sigma_px=float(args.min_radius_px),
-            max_sigma_px=float(args.max_radius_px),
-        )
-        profiles, hit, valid_ratio = _sample_profiles(signed, abs_hf * mask, cx, cy, chol, grid, weights)
+        radii = np.clip(
+            meta["radii"][ids] * float(args.candidate_radius_scale),
+            float(args.min_radius_px),
+            float(args.max_radius_px),
+        ).astype(np.float32, copy=False)
+        cx = meta["x"][ids].astype(np.float32, copy=False)
+        cy = meta["y"][ids].astype(np.float32, copy=False)
+        valid_current = meta["visible"][ids] & meta["project_valid"][ids]
+        profiles, hit, valid_ratio = _sample_profiles_isotropic(signed, proposal, cx, cy, radii, grid, weights)
+
         neighbor_scores = []
         neighbor_count = np.zeros((ids.shape[0],), dtype=np.float32)
         for ni in _neighbor_indices(view_index, len(train_cameras), int(args.neighbor_radius)):
             ncam = train_cameras[ni]
             nname = str(ncam.image_name)
-            ncx, ncy, nchol, nvalid_ellipse = _ellipse_cholesky_for_ids(
-                cloud,
-                ids,
-                ncam,
-                sigma_scale=1.0,
-                min_sigma_px=float(args.min_radius_px),
-                max_sigma_px=float(args.max_radius_px),
-            )
-            nprofiles, nhit, nvalid_ratio = _sample_profiles(
+            nmeta = get_render_meta(ni)
+            nradii = np.clip(
+                nmeta["radii"][ids] * float(args.candidate_radius_scale),
+                float(args.min_radius_px),
+                float(args.max_radius_px),
+            ).astype(np.float32, copy=False)
+            nprofiles, nhit, nvalid_ratio = _sample_profiles_isotropic(
                 signed_maps[nname],
                 abs_maps[nname] * mask_maps[nname],
-                ncx,
-                ncy,
-                nchol,
+                nmeta["x"][ids],
+                nmeta["y"][ids],
+                nradii,
                 grid,
                 weights,
             )
             ncc = _profile_ncc(profiles, nprofiles)
             nvisible = (
-                nvalid_ellipse
+                nmeta["visible"][ids]
+                & nmeta["project_valid"][ids]
                 & (nvalid_ratio >= float(args.profile_min_valid))
                 & (nhit > 0.0)
             )
@@ -621,13 +648,27 @@ def main() -> None:
         score = hit_norm * np.clip(consistency, 0.0, 1.0)
         if float(args.score_power) != 1.0:
             score = np.power(np.clip(score, 0.0, 1.0), float(args.score_power))
-        score *= (valid_ellipse & (valid_ratio >= float(args.profile_min_valid))).astype(np.float32)
-        radius = np.sqrt(np.maximum(np.linalg.eigvalsh(np.matmul(chol, np.transpose(chol, (0, 2, 1))))[:, 1], 0.0))
-        score_map = _draw_score_map(width, height, cx, cy, radius, score, max_draw=int(args.draw_max_gaussians))
-        validated = abs_hf * np.clip(score_map, 0.0, 1.0)
+        score *= (valid_current & (valid_ratio >= float(args.profile_min_valid))).astype(np.float32)
+
+        carrier_map = _draw_carrier_score_map(width, height, cx, cy, radii, score, max_draw=int(args.draw_max_gaussians))
+        score_map = _draw_renderer_supported_score_map(
+            width,
+            height,
+            proposal,
+            cx,
+            cy,
+            radii,
+            score,
+            support_radius_scale=float(args.ownership_support_radius),
+            edge_threshold=float(args.ownership_edge_threshold),
+            edge_power=float(args.ownership_edge_power),
+            max_draw=int(args.draw_max_gaussians),
+        )
+        validated = proposal * np.clip(score_map, 0.0, 1.0)
         overlay = np.stack([abs_hf, np.maximum(abs_hf * 0.35, validated), abs_hf * 0.25], axis=2)
 
         _save_gray(dirs["hf_edge"] / f"{name}.png", abs_hf)
+        _save_gray(dirs["carrier_score"] / f"{name}.png", carrier_map)
         _save_gray(dirs["ownership_score"] / f"{name}.png", score_map)
         _save_gray(dirs["validated_edge"] / f"{name}.png", validated)
         _save_rgb(dirs["overlay"] / f"{name}.png", overlay)
@@ -641,25 +682,32 @@ def main() -> None:
             score=score.astype(np.float32),
             x=cx.astype(np.float32),
             y=cy.astype(np.float32),
-            radius=radius.astype(np.float32),
+            radius=radii.astype(np.float32),
+            raw_candidates=np.asarray([raw_candidates], dtype=np.int64),
+            visible_gaussians=np.asarray([visible_gaussians], dtype=np.int64),
         )
         frame = {
             "image_name": name,
             "candidates": int(ids.shape[0]),
+            "raw_candidates": int(raw_candidates),
+            "visible_gaussians": int(visible_gaussians),
+            "candidate_ratio": float(raw_candidates / max(visible_gaussians, 1)),
             "hit_mean": float(hit.mean()) if hit.size else 0.0,
             "consistency_mean": float(consistency.mean()) if consistency.size else 0.0,
             "score_mean": float(score.mean()) if score.size else 0.0,
             "score_p90": float(np.percentile(score, 90)) if score.size else 0.0,
+            "score_p95": float(np.percentile(score, 95)) if score.size else 0.0,
             "validated_ratio": float((score_map > 0.05).mean()),
+            "carrier_ratio": float((carrier_map > 0.05).mean()),
         }
         manifest_frames.append(frame)
         all_scores.append(score)
         all_cons.append(consistency)
         all_hits.append(hit)
         print(
-            f"[cave-hf-v0] {view_index + 1}/{len(train_cameras)} {name} "
-            f"cand={ids.shape[0]} hit={frame['hit_mean']:.4f} "
-            f"cons={frame['consistency_mean']:.4f} score={frame['score_mean']:.4f}",
+            f"[cave-hf-v1] {view_index + 1}/{len(train_cameras)} {name} "
+            f"touch={raw_candidates} cand={ids.shape[0]} visible={visible_gaussians} "
+            f"hit={frame['hit_mean']:.4f} cons={frame['consistency_mean']:.4f} score={frame['score_mean']:.4f}",
             flush=True,
         )
 
@@ -672,14 +720,15 @@ def main() -> None:
         return float(arr.mean())
 
     summary = {
+        "version": "renderer_backed_v1",
         "scene_root": str(scene_root),
         "model_dir": str(model_dir),
-        "point_cloud_ply": str(point_cloud_ply),
+        "iteration": int(loaded_iter),
         "sr_dir": str(Path(args.sr_dir).expanduser().resolve()),
         "anchor_dir": str(Path(args.anchor_dir).expanduser().resolve()),
         "edge_mask_dir": str(Path(args.edge_mask_dir).expanduser().resolve()) if str(args.edge_mask_dir).strip() else "",
         "num_views": int(len(train_cameras)),
-        "num_gaussians": int(cloud.xyz.shape[0]),
+        "num_gaussians": int(total_gaussians),
         "score_mean": _cat_mean(all_scores),
         "consistency_mean": _cat_mean(all_cons),
         "hit_mean": _cat_mean(all_hits),
@@ -687,7 +736,7 @@ def main() -> None:
     }
     manifest_path = output_root / "manifest.json"
     manifest_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    print(f"[cave-hf-v0] manifest: {manifest_path}")
+    print(f"[cave-hf-v1] manifest: {manifest_path}")
     print(json.dumps({k: summary[k] for k in ("score_mean", "consistency_mean", "hit_mean", "num_views")}, indent=2))
 
 
