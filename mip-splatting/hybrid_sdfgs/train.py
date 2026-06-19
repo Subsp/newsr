@@ -2167,6 +2167,24 @@ def load_gaussian_update_mask_payload(path: str, key: str, total_gaussians: int)
     raise KeyError(f"Mask payload must contain '{key}' or 'selected_ids': {path}")
 
 
+def load_gaussian_float_payload(path: str, key: str, total_gaussians: int):
+    if not path or not key:
+        return None
+    payload = torch.load(path, map_location="cpu")
+    if key not in payload:
+        raise KeyError(f"Float payload must contain '{key}': {path}")
+    values = payload[key]
+    if not torch.is_tensor(values):
+        values = torch.as_tensor(values)
+    values = values.reshape(-1)
+    if values.shape[0] != int(total_gaussians):
+        raise ValueError(
+            f"Gaussian float payload '{key}' length mismatch: "
+            f"{tuple(values.shape)} vs total_gaussians={total_gaussians}"
+        )
+    return values.to(device="cuda", dtype=torch.float32)
+
+
 def build_prior_edge_camera_pool(train_cameras, prior_index, mask_index_or_dir):
     cameras = []
     missing_prior = []
@@ -3749,6 +3767,19 @@ class LayerFrequencyRegularizer:
         from_iter: int = 0,
         until_iter: int = 0,
         dynamic_roots: bool = False,
+        transfer_score=None,
+        transfer_candidate_mask=None,
+        transfer_start_ratio: float = 0.0,
+        transfer_final_ratio: float = 0.0,
+        transfer_min_score: float = 0.0,
+        transfer_from_iter: int = -1,
+        transfer_until_iter: int = -1,
+        transfer_curve: str = "linear",
+        transfer_include_base_surface: bool = True,
+        transfer_complement_to_non_surface: bool = False,
+        surface_subset_hf: bool = False,
+        lambda_surface_lowfreq_energy: float = 0.0,
+        surface_lowfreq_kernel: int = 15,
     ):
         self.gaussians = gaussians
         self.lambda_non_surface_hf = float(lambda_non_surface_hf)
@@ -3757,6 +3788,8 @@ class LayerFrequencyRegularizer:
         self.lambda_non_surface_alpha_mass = float(lambda_non_surface_alpha_mass)
         self.lambda_surface_hf_closure = float(lambda_surface_hf_closure)
         self.lambda_surface_start_hf_preserve = float(lambda_surface_start_hf_preserve)
+        self.lambda_surface_lowfreq_energy = float(lambda_surface_lowfreq_energy)
+        self.surface_lowfreq_kernel = int(surface_lowfreq_kernel)
         self.start_hf_lowfreq_kernel = int(start_hf_lowfreq_kernel)
         self.start_hf_lowfreq_threshold = float(start_hf_lowfreq_threshold)
         self.start_hf_energy_threshold = float(start_hf_energy_threshold)
@@ -3765,12 +3798,26 @@ class LayerFrequencyRegularizer:
         self.from_iter = int(from_iter)
         self.until_iter = int(until_iter)
         self.dynamic_roots = bool(dynamic_roots)
+        self.transfer_start_ratio = float(transfer_start_ratio)
+        self.transfer_final_ratio = float(transfer_final_ratio)
+        self.transfer_min_score = float(transfer_min_score)
+        self.transfer_from_iter = int(transfer_from_iter)
+        self.transfer_until_iter = int(transfer_until_iter)
+        self.transfer_curve = str(transfer_curve or "linear").strip().lower()
+        self.transfer_include_base_surface = bool(transfer_include_base_surface)
+        self.transfer_complement_to_non_surface = bool(transfer_complement_to_non_surface)
+        self.surface_subset_hf = bool(surface_subset_hf)
         self.surface_mask = None
+        self.non_surface_mask = None
         self.non_surface_gaussians = None
         self.base_non_surface_mask = None
         self.base_surface_mask = None
+        self.base_transfer_score = None
+        self.base_transfer_candidate_mask = None
+        self.transfer_sorted_scores = None
         self.has_non_surface_mask = False
         self.has_surface_mask = False
+        self.transfer_enabled = False
 
         if (
             self.lambda_non_surface_hf > 0.0
@@ -3793,12 +3840,45 @@ class LayerFrequencyRegularizer:
         if (
             self.lambda_surface_hf_closure > 0.0
             or self.lambda_surface_start_hf_preserve > 0.0
+            or self.lambda_surface_lowfreq_energy > 0.0
         ) and surface_mask is not None:
             surface_mask = surface_mask.to(device=gaussians.get_xyz.device, dtype=torch.bool)
             if int(surface_mask.sum().item()) > 0:
                 self.base_surface_mask = surface_mask.detach().clone()
                 self.has_surface_mask = True
                 self.surface_mask = surface_mask if not self.dynamic_roots else surface_mask.detach().clone()
+
+        if transfer_score is not None:
+            transfer_score = transfer_score.to(device=gaussians.get_xyz.device, dtype=torch.float32).reshape(-1)
+            if int(transfer_score.shape[0]) != int(gaussians.get_xyz.shape[0]):
+                raise ValueError(
+                    "Layer-frequency transfer score must be aligned with the current Gaussian count: "
+                    f"{int(transfer_score.shape[0])} vs {int(gaussians.get_xyz.shape[0])}"
+                )
+            if transfer_candidate_mask is None:
+                transfer_candidate_mask = transfer_score > 0.0
+            else:
+                transfer_candidate_mask = transfer_candidate_mask.to(
+                    device=gaussians.get_xyz.device,
+                    dtype=torch.bool,
+                ).reshape(-1)
+                if int(transfer_candidate_mask.shape[0]) != int(transfer_score.shape[0]):
+                    raise ValueError(
+                        "Layer-frequency transfer candidate mask length mismatch: "
+                        f"{int(transfer_candidate_mask.shape[0])} vs {int(transfer_score.shape[0])}"
+                    )
+            valid_scores = transfer_candidate_mask & torch.isfinite(transfer_score) & (transfer_score > 0.0)
+            if int(valid_scores.sum().item()) > 0 and max(self.transfer_start_ratio, self.transfer_final_ratio) > 0.0:
+                self.base_transfer_score = transfer_score.detach().clone()
+                self.base_transfer_candidate_mask = transfer_candidate_mask.detach().clone()
+                self.transfer_sorted_scores = torch.sort(self.base_transfer_score[valid_scores].float()).values
+                self.transfer_enabled = True
+                if (
+                    self.lambda_surface_hf_closure > 0.0
+                    or self.lambda_surface_start_hf_preserve > 0.0
+                    or self.lambda_surface_lowfreq_energy > 0.0
+                ):
+                    self.has_surface_mask = True
 
     def active(self, iteration: int) -> bool:
         if iteration < self.from_iter:
@@ -3818,22 +3898,111 @@ class LayerFrequencyRegularizer:
                 f"{label} is fixed-topology but gaussian count changed: "
                 f"mask={int(base_mask.shape[0])}, current={total}. "
                 "Enable --layer_frequency_dynamic_roots or disable densification/pruning."
-            )
+        )
         return base_mask
 
-    def _current_non_surface_gaussians(self, metrics):
+    def _current_values(self, base_values, *, label: str):
+        if base_values is None:
+            return None
         if self.dynamic_roots:
-            mask = self._current_mask(self.base_non_surface_mask, label="layer-frequency non-surface mask")
-            if mask is None:
-                return None
-            selected = int(mask.sum().item())
-            metrics["ns_count"] = float(selected)
-            if selected <= 0:
-                return None
-            if selected == int(mask.shape[0]):
-                return self.gaussians
-            return GaussianSubsetView(self.gaussians, mask)
-        return self.non_surface_gaussians
+            return _expand_root_aligned_values(base_values, self.gaussians, label=label)
+        total = int(self.gaussians.get_xyz.shape[0])
+        if int(base_values.shape[0]) != total:
+            raise RuntimeError(
+                f"{label} is fixed-topology but gaussian count changed: "
+                f"values={int(base_values.shape[0])}, current={total}. "
+                "Enable --layer_frequency_dynamic_roots or disable densification/pruning."
+            )
+        return base_values
+
+    def _transfer_progress(self, iteration: int) -> float:
+        start_iter = self.transfer_from_iter if self.transfer_from_iter >= 0 else self.from_iter
+        until_iter = self.transfer_until_iter if self.transfer_until_iter >= 0 else self.until_iter
+        if until_iter <= start_iter:
+            progress = 1.0
+        else:
+            progress = (float(iteration) - float(start_iter)) / max(float(until_iter - start_iter), 1.0)
+            progress = float(np.clip(progress, 0.0, 1.0))
+        if self.transfer_curve == "smoothstep":
+            progress = progress * progress * (3.0 - 2.0 * progress)
+        return float(progress)
+
+    def _threshold_for_transfer_ratio(self, keep_ratio: float) -> float:
+        if self.transfer_sorted_scores is None or int(self.transfer_sorted_scores.numel()) <= 0:
+            return float("inf")
+        keep_ratio = float(np.clip(keep_ratio, 0.0, 1.0))
+        if keep_ratio <= 0.0:
+            return float("inf")
+        if keep_ratio >= 1.0:
+            return float(self.transfer_min_score)
+        sorted_scores = self.transfer_sorted_scores
+        n = int(sorted_scores.numel())
+        index = int(math.floor((1.0 - keep_ratio) * float(max(n - 1, 0))))
+        index = max(0, min(index, n - 1))
+        return max(float(self.transfer_min_score), float(sorted_scores[index].detach().item()))
+
+    def _current_surface_mask(self, iteration: int, metrics):
+        base_surface = self._current_mask(self.base_surface_mask, label="layer-frequency surface mask")
+        if not self.transfer_enabled:
+            return base_surface
+
+        score = self._current_values(
+            self.base_transfer_score,
+            label="layer-frequency transfer score",
+        )
+        candidate = self._current_mask(
+            self.base_transfer_candidate_mask,
+            label="layer-frequency transfer candidate mask",
+        )
+        if score is None or candidate is None:
+            return base_surface
+
+        progress = self._transfer_progress(iteration)
+        keep_ratio = self.transfer_start_ratio + progress * (
+            self.transfer_final_ratio - self.transfer_start_ratio
+        )
+        keep_ratio = float(np.clip(keep_ratio, 0.0, 1.0))
+        threshold = self._threshold_for_transfer_ratio(keep_ratio)
+        scheduled = candidate & torch.isfinite(score) & (score >= float(threshold))
+        if self.transfer_min_score > 0.0:
+            scheduled = scheduled & (score >= float(self.transfer_min_score))
+        if self.transfer_include_base_surface and base_surface is not None:
+            surface_mask = scheduled | base_surface
+        else:
+            surface_mask = scheduled
+
+        metrics["transfer_p"] = float(progress)
+        metrics["transfer_keep"] = float(keep_ratio)
+        metrics["transfer_thr"] = float(threshold) if math.isfinite(float(threshold)) else 0.0
+        metrics["transfer_candidates"] = float(int(candidate.sum().item()))
+        metrics["transfer_hf"] = float(int(surface_mask.sum().item()))
+        return surface_mask
+
+    def _current_non_surface_mask(self, surface_mask, metrics):
+        mask = self._current_mask(self.base_non_surface_mask, label="layer-frequency non-surface mask")
+        if self.transfer_enabled and self.transfer_complement_to_non_surface:
+            candidate = self._current_mask(
+                self.base_transfer_candidate_mask,
+                label="layer-frequency transfer candidate mask",
+            )
+            if candidate is not None and surface_mask is not None:
+                transfer_lf = candidate & (~surface_mask)
+                mask = transfer_lf if mask is None else (mask | transfer_lf)
+        if mask is not None and surface_mask is not None:
+            mask = mask & (~surface_mask)
+        if mask is not None:
+            metrics["ns_count"] = float(int(mask.sum().item()))
+        return mask
+
+    def _gaussian_view_from_mask(self, mask):
+        if mask is None:
+            return None
+        selected = int(mask.sum().item())
+        if selected <= 0:
+            return None
+        if selected == int(mask.shape[0]):
+            return self.gaussians
+        return GaussianSubsetView(self.gaussians, mask)
 
     def compute(
         self,
@@ -3894,7 +4063,13 @@ class LayerFrequencyRegularizer:
             metrics["start_lowerr"] = low_err.mean().detach().item()
             metrics["start_energy"] = start_energy.mean().detach().item()
 
-        non_surface_gaussians = self._current_non_surface_gaussians(metrics)
+        surface_mask = self._current_surface_mask(iteration, metrics)
+        self.surface_mask = surface_mask
+        if surface_mask is not None:
+            metrics["surf_count"] = float(int(surface_mask.sum().item()))
+        non_surface_mask = self._current_non_surface_mask(surface_mask, metrics)
+        self.non_surface_mask = non_surface_mask
+        non_surface_gaussians = self._gaussian_view_from_mask(non_surface_mask)
         if non_surface_gaussians is not None:
             black_background = torch.zeros_like(background)
             non_surface_pkg = render_fn(
@@ -3945,18 +4120,35 @@ class LayerFrequencyRegularizer:
             elif self.lambda_non_surface_alpha_hf > 0.0 or self.lambda_non_surface_alpha_mass > 0.0:
                 metrics["ns_alpha_missing"] = 1.0
 
-        surface_mask = self._current_mask(self.base_surface_mask, label="layer-frequency surface mask")
-        self.surface_mask = surface_mask
-        if surface_mask is not None:
-            metrics["surf_count"] = float(int(surface_mask.sum().item()))
         if surface_mask is not None and int(surface_mask.sum().item()) > 0:
             target_hf = _laplacian_highfreq(gt_image.detach())
-            pred_hf = _laplacian_highfreq(render_image)
+            surface_image = render_image
+            if self.surface_subset_hf or self.lambda_surface_lowfreq_energy > 0.0:
+                surface_gaussians = self._gaussian_view_from_mask(surface_mask)
+                if surface_gaussians is not None:
+                    black_background = torch.zeros_like(background)
+                    surface_pkg = render_fn(
+                        viewpoint_camera,
+                        surface_gaussians,
+                        pipe,
+                        black_background,
+                        kernel_size=kernel_size,
+                        subpixel_offset=subpixel_offset,
+                    )
+                    surface_image = surface_pkg["render"]
+                    metrics["surf_subset"] = 1.0
+            pred_hf = _laplacian_highfreq(surface_image if self.surface_subset_hf else render_image)
             if self.lambda_surface_hf_closure > 0.0:
                 loss_surface_hf = (pred_hf - target_hf).abs().mean()
                 surface_loss = self.lambda_surface_hf_closure * loss_surface_hf
                 metrics["surf_hf"] = loss_surface_hf.detach().item()
                 metrics["surf_hf_w"] = surface_loss.detach().item()
+            if self.lambda_surface_lowfreq_energy > 0.0:
+                surface_low = _box_lowpass(surface_image, self.surface_lowfreq_kernel).abs().mean()
+                weighted = self.lambda_surface_lowfreq_energy * surface_low
+                surface_loss = weighted if surface_loss is None else surface_loss + weighted
+                metrics["surf_lf"] = surface_low.detach().item()
+                metrics["surf_lf_w"] = weighted.detach().item()
             if (
                 self.lambda_surface_start_hf_preserve > 0.0
                 and start_hf is not None
@@ -5920,6 +6112,7 @@ def training(
         or float(hybrid_args.lambda_non_surface_alpha_mass) > 0.0
         or float(hybrid_args.lambda_surface_hf_closure) > 0.0
         or float(hybrid_args.lambda_surface_start_hf_preserve) > 0.0
+        or float(hybrid_args.lambda_surface_lowfreq_energy) > 0.0
     )
     prior_direct_xyz_nudge_mask = None
     prior_direct_xyz_nudge_requested = float(hybrid_args.prior_direct_xyz_nudge_lr) > 0.0
@@ -5930,11 +6123,14 @@ def training(
         layer_frequency_dynamic_roots = bool(getattr(hybrid_args, "layer_frequency_dynamic_roots", False))
         layer_non_surface_mask = None
         layer_surface_mask = None
+        layer_transfer_score = None
+        layer_transfer_candidate_mask = None
         needs_non_surface_mask = (
             float(hybrid_args.lambda_non_surface_hf) > 0.0
             or float(hybrid_args.lambda_non_surface_rgb_energy) > 0.0
             or float(hybrid_args.lambda_non_surface_alpha_hf) > 0.0
             or float(hybrid_args.lambda_non_surface_alpha_mass) > 0.0
+            or bool(getattr(hybrid_args, "layer_frequency_transfer_complement_to_non_surface", False))
         )
         if not layer_payload:
             print(
@@ -5951,6 +6147,7 @@ def training(
             needs_surface_mask = (
                 float(hybrid_args.lambda_surface_hf_closure) > 0.0
                 or float(hybrid_args.lambda_surface_start_hf_preserve) > 0.0
+                or float(hybrid_args.lambda_surface_lowfreq_energy) > 0.0
             )
             if needs_surface_mask:
                 layer_surface_mask = load_gaussian_update_mask_payload(
@@ -5958,6 +6155,22 @@ def training(
                     str(hybrid_args.layer_frequency_surface_key),
                     total_gaussians=gaussians.get_xyz.shape[0],
                 )
+            transfer_score_key = str(getattr(hybrid_args, "layer_frequency_transfer_score_key", "") or "").strip()
+            transfer_candidate_key = str(
+                getattr(hybrid_args, "layer_frequency_transfer_candidate_key", "") or ""
+            ).strip()
+            if transfer_score_key:
+                layer_transfer_score = load_gaussian_float_payload(
+                    layer_payload,
+                    transfer_score_key,
+                    total_gaussians=gaussians.get_xyz.shape[0],
+                )
+                if transfer_candidate_key:
+                    layer_transfer_candidate_mask = load_gaussian_update_mask_payload(
+                        layer_payload,
+                        transfer_candidate_key,
+                        total_gaussians=gaussians.get_xyz.shape[0],
+                    )
             if layer_frequency_dynamic_roots:
                 initialize_gaussian_root_ids_for_dynamic_masks(
                     gaussians,
@@ -5973,6 +6186,8 @@ def training(
                 lambda_non_surface_alpha_mass=float(hybrid_args.lambda_non_surface_alpha_mass),
                 lambda_surface_hf_closure=float(hybrid_args.lambda_surface_hf_closure),
                 lambda_surface_start_hf_preserve=float(hybrid_args.lambda_surface_start_hf_preserve),
+                lambda_surface_lowfreq_energy=float(hybrid_args.lambda_surface_lowfreq_energy),
+                surface_lowfreq_kernel=int(hybrid_args.layer_frequency_surface_lowfreq_kernel),
                 start_hf_lowfreq_kernel=int(hybrid_args.layer_frequency_start_hf_lowfreq_kernel),
                 start_hf_lowfreq_threshold=float(hybrid_args.layer_frequency_start_hf_lowfreq_threshold),
                 start_hf_energy_threshold=float(hybrid_args.layer_frequency_start_hf_energy_threshold),
@@ -5981,6 +6196,17 @@ def training(
                 from_iter=int(hybrid_args.layer_frequency_from_iter),
                 until_iter=int(hybrid_args.layer_frequency_until_iter),
                 dynamic_roots=layer_frequency_dynamic_roots,
+                transfer_score=layer_transfer_score,
+                transfer_candidate_mask=layer_transfer_candidate_mask,
+                transfer_start_ratio=float(hybrid_args.layer_frequency_transfer_start_ratio),
+                transfer_final_ratio=float(hybrid_args.layer_frequency_transfer_final_ratio),
+                transfer_min_score=float(hybrid_args.layer_frequency_transfer_min_score),
+                transfer_from_iter=int(hybrid_args.layer_frequency_transfer_from_iter),
+                transfer_until_iter=int(hybrid_args.layer_frequency_transfer_until_iter),
+                transfer_curve=str(hybrid_args.layer_frequency_transfer_curve),
+                transfer_include_base_surface=bool(int(hybrid_args.layer_frequency_transfer_include_base_surface)),
+                transfer_complement_to_non_surface=bool(hybrid_args.layer_frequency_transfer_complement_to_non_surface),
+                surface_subset_hf=bool(hybrid_args.layer_frequency_surface_subset_hf),
             )
             if float(hybrid_args.lambda_surface_start_hf_preserve) > 0.0:
                 start_hf_checkpoint = str(hybrid_args.layer_frequency_start_hf_checkpoint or "").strip()
@@ -6024,10 +6250,13 @@ def training(
                 f"lambda_ns_alpha={float(hybrid_args.lambda_non_surface_alpha_mass):.6f} "
                 f"lambda_surf_hf={float(hybrid_args.lambda_surface_hf_closure):.6f} "
                 f"lambda_start_hf={float(hybrid_args.lambda_surface_start_hf_preserve):.6f} "
+                f"lambda_surf_lf={float(hybrid_args.lambda_surface_lowfreq_energy):.6f} "
                 f"surface_target={str(getattr(hybrid_args, 'layer_frequency_surface_target', 'gt'))} "
                 f"from={int(hybrid_args.layer_frequency_from_iter)} "
                 f"until={int(hybrid_args.layer_frequency_until_iter)} "
-                f"dynamic_roots={int(layer_frequency_dynamic_roots)}"
+                f"dynamic_roots={int(layer_frequency_dynamic_roots)} "
+                f"subset_hf={int(bool(hybrid_args.layer_frequency_surface_subset_hf))} "
+                f"transfer={transfer_score_key or '<none>'}"
             )
             if needs_non_surface_mask and not layer_frequency_regularizer.has_non_surface_mask:
                 print("[LAYER-FREQ] warning: non-surface mask is empty; non-surface HF terms are disabled.")
@@ -8963,8 +9192,15 @@ def training(
                     layer_parts.append(f"ns_count={layer_freq_metrics['ns_count']:.0f}")
                 if "surf_count" in layer_freq_metrics:
                     layer_parts.append(f"surf_count={layer_freq_metrics['surf_count']:.0f}")
+                if "transfer_p" in layer_freq_metrics:
+                    layer_parts.append(f"transfer_p={layer_freq_metrics['transfer_p']:.3f}")
+                    layer_parts.append(f"keep={layer_freq_metrics.get('transfer_keep', 0.0):.3f}")
+                    layer_parts.append(f"thr={layer_freq_metrics.get('transfer_thr', 0.0):.4f}")
+                    layer_parts.append(f"hf={layer_freq_metrics.get('transfer_hf', 0.0):.0f}")
                 if "target" in layer_freq_metrics:
                     layer_parts.append(f"target={layer_freq_metrics['target']}")
+                if "surf_subset" in layer_freq_metrics:
+                    layer_parts.append("surf_subset=1")
                 if "guidance_scale" in layer_freq_metrics and layer_freq_metrics["guidance_scale"] < 0.999:
                     layer_parts.append(f"guide={layer_freq_metrics['guidance_scale']:.2f}")
                 if "ns_rgb" in layer_freq_metrics:
@@ -9007,6 +9243,13 @@ def training(
                     )
                     layer_parts.append(
                         f"surf_hf_w={layer_freq_metrics['surf_hf_w']:.6f}"
+                    )
+                if "surf_lf" in layer_freq_metrics:
+                    layer_parts.append(
+                        f"surf_lf={layer_freq_metrics['surf_lf']:.6f}"
+                    )
+                    layer_parts.append(
+                        f"surf_lf_w={layer_freq_metrics['surf_lf_w']:.6f}"
                     )
                 if "start_hf" in layer_freq_metrics:
                     layer_parts.append(
@@ -9988,12 +10231,25 @@ def make_parser():
     parser.add_argument("--lambda_non_surface_alpha_mass", type=float, default=0.0)
     parser.add_argument("--lambda_surface_hf_closure", type=float, default=0.0)
     parser.add_argument("--lambda_surface_start_hf_preserve", type=float, default=0.0)
+    parser.add_argument("--lambda_surface_lowfreq_energy", type=float, default=0.0)
+    parser.add_argument("--layer_frequency_surface_lowfreq_kernel", type=int, default=15)
     parser.add_argument("--layer_frequency_start_hf_checkpoint", type=str, default="")
     parser.add_argument("--layer_frequency_start_hf_lowfreq_kernel", type=int, default=15)
     parser.add_argument("--layer_frequency_start_hf_lowfreq_threshold", type=float, default=0.05)
     parser.add_argument("--layer_frequency_start_hf_energy_threshold", type=float, default=0.01)
     parser.add_argument("--layer_frequency_start_hf_mask_power", type=float, default=1.0)
     parser.add_argument("--layer_frequency_start_hf_protect_non_surface", action="store_true")
+    parser.add_argument("--layer_frequency_surface_subset_hf", action="store_true")
+    parser.add_argument("--layer_frequency_transfer_score_key", type=str, default="")
+    parser.add_argument("--layer_frequency_transfer_candidate_key", type=str, default="")
+    parser.add_argument("--layer_frequency_transfer_start_ratio", type=float, default=0.0)
+    parser.add_argument("--layer_frequency_transfer_final_ratio", type=float, default=0.0)
+    parser.add_argument("--layer_frequency_transfer_min_score", type=float, default=0.0)
+    parser.add_argument("--layer_frequency_transfer_from_iter", type=int, default=-1)
+    parser.add_argument("--layer_frequency_transfer_until_iter", type=int, default=-1)
+    parser.add_argument("--layer_frequency_transfer_curve", type=str, default="linear", choices=["linear", "smoothstep"])
+    parser.add_argument("--layer_frequency_transfer_include_base_surface", type=int, default=1)
+    parser.add_argument("--layer_frequency_transfer_complement_to_non_surface", action="store_true")
     parser.add_argument("--surface_hf_update_scale", type=float, default=1.0)
     parser.add_argument("--layer_frequency_from_iter", type=int, default=0)
     parser.add_argument("--layer_frequency_until_iter", type=int, default=0)

@@ -45,6 +45,7 @@ SURFACE_STATE_PROFILE="${SURFACE_STATE_PROFILE:-relaxed_carrier_v1}"
 SURFACE_STATE_RUN_TAG="${SURFACE_STATE_RUN_TAG:-${RUN_TAG}_surface_state_${SURFACE_STATE_PROFILE}}"
 SURFACE_STATE_DIR="${SURFACE_STATE_DIR:-${OUTPUT_ROOT}/gaussian_surface_state_v0/${SCENE_NAME}/${SURFACE_STATE_RUN_TAG}}"
 SURFACE_STATE_PAYLOAD="${SURFACE_STATE_PAYLOAD:-${SURFACE_STATE_DIR}/gaussian_surface_state_v0.pt}"
+LAYER_FREQUENCY_MASK_PAYLOAD="${LAYER_FREQUENCY_MASK_PAYLOAD:-${SURFACE_STATE_PAYLOAD}}"
 FORCE_REBUILD_SURFACE_STATE="${FORCE_REBUILD_SURFACE_STATE:-0}"
 
 TRAIN_PORT="${TRAIN_PORT:-6009}"
@@ -80,6 +81,19 @@ LAYER_FREQUENCY_FROM_ITER="${LAYER_FREQUENCY_FROM_ITER:-${INPUT_ITERATION}}"
 LAYER_FREQUENCY_UNTIL_ITER="${LAYER_FREQUENCY_UNTIL_ITER:-${FINAL_ITER}}"
 LAYER_FREQUENCY_LOG_INTERVAL="${LAYER_FREQUENCY_LOG_INTERVAL:-100}"
 LAYER_FREQUENCY_DYNAMIC_ROOTS="${LAYER_FREQUENCY_DYNAMIC_ROOTS:-0}"
+LAYER_FREQUENCY_SURFACE_SUBSET_HF="${LAYER_FREQUENCY_SURFACE_SUBSET_HF:-0}"
+LAYER_FREQUENCY_TRANSFER_SCORE_KEY="${LAYER_FREQUENCY_TRANSFER_SCORE_KEY:-}"
+LAYER_FREQUENCY_TRANSFER_CANDIDATE_KEY="${LAYER_FREQUENCY_TRANSFER_CANDIDATE_KEY:-}"
+LAYER_FREQUENCY_TRANSFER_START_RATIO="${LAYER_FREQUENCY_TRANSFER_START_RATIO:-0.0}"
+LAYER_FREQUENCY_TRANSFER_FINAL_RATIO="${LAYER_FREQUENCY_TRANSFER_FINAL_RATIO:-0.0}"
+LAYER_FREQUENCY_TRANSFER_MIN_SCORE="${LAYER_FREQUENCY_TRANSFER_MIN_SCORE:-0.0}"
+LAYER_FREQUENCY_TRANSFER_FROM_ITER="${LAYER_FREQUENCY_TRANSFER_FROM_ITER:--1}"
+LAYER_FREQUENCY_TRANSFER_UNTIL_ITER="${LAYER_FREQUENCY_TRANSFER_UNTIL_ITER:--1}"
+LAYER_FREQUENCY_TRANSFER_CURVE="${LAYER_FREQUENCY_TRANSFER_CURVE:-smoothstep}"
+LAYER_FREQUENCY_TRANSFER_INCLUDE_BASE_SURFACE="${LAYER_FREQUENCY_TRANSFER_INCLUDE_BASE_SURFACE:-1}"
+LAYER_FREQUENCY_TRANSFER_COMPLEMENT_TO_NON_SURFACE="${LAYER_FREQUENCY_TRANSFER_COMPLEMENT_TO_NON_SURFACE:-0}"
+LAMBDA_SURFACE_LOWFREQ_ENERGY="${LAMBDA_SURFACE_LOWFREQ_ENERGY:-0.0}"
+LAYER_FREQUENCY_SURFACE_LOWFREQ_KERNEL="${LAYER_FREQUENCY_SURFACE_LOWFREQ_KERNEL:-15}"
 
 EXTERNAL_PRIOR_ROOT="${EXTERNAL_PRIOR_ROOT:-}"
 EXTERNAL_PRIOR_SUBDIR="${EXTERNAL_PRIOR_SUBDIR:-priors}"
@@ -267,7 +281,8 @@ if is_nonzero "${LAMBDA_NON_SURFACE_HF}" \
   || is_nonzero "${LAMBDA_NON_SURFACE_ALPHA_HF}" \
   || is_nonzero "${LAMBDA_NON_SURFACE_ALPHA_MASS}" \
   || is_nonzero "${LAMBDA_SURFACE_HF_CLOSURE}" \
-  || is_nonzero "${LAMBDA_SURFACE_START_HF_PRESERVE}"; then
+  || is_nonzero "${LAMBDA_SURFACE_START_HF_PRESERVE}" \
+  || is_nonzero "${LAMBDA_SURFACE_LOWFREQ_ENERGY}"; then
   NEED_LAYER_FREQUENCY=1
 fi
 NEED_LOCAL_SURFACE=0
@@ -275,7 +290,9 @@ if is_nonzero "${LAMBDA_PRIOR_LOCAL_SURFACE}"; then
   NEED_LOCAL_SURFACE=1
 fi
 NEED_SURFACE_STATE=0
-if [[ "${NEED_LAYER_FREQUENCY}" == "1" || "${SURFACE_NORMAL_LOCK}" == "1" || "${NEED_LOCAL_SURFACE}" == "1" ]]; then
+if [[ "${SURFACE_NORMAL_LOCK}" == "1" || "${NEED_LOCAL_SURFACE}" == "1" ]]; then
+  NEED_SURFACE_STATE=1
+elif [[ "${NEED_LAYER_FREQUENCY}" == "1" && "${LAYER_FREQUENCY_MASK_PAYLOAD}" == "${SURFACE_STATE_PAYLOAD}" ]]; then
   NEED_SURFACE_STATE=1
 fi
 
@@ -340,7 +357,7 @@ echo "[nosr-layerfreq-cleanup-v0] train target      : ${TRAIN_IMAGES_SUBDIR}"
 echo "[nosr-layerfreq-cleanup-v0] output model      : ${MODEL_DIR}"
 echo "[nosr-layerfreq-cleanup-v0] iter schedule     : ${INPUT_ITERATION} -> ${FINAL_ITER}"
 echo "[nosr-layerfreq-cleanup-v0] save checkpoint   : ${SAVE_CHECKPOINT_AFTER}"
-echo "[nosr-layerfreq-cleanup-v0] layer freq        : ns=${LAMBDA_NON_SURFACE_HF} surf=${LAMBDA_SURFACE_HF_CLOSURE} start_hf=${LAMBDA_SURFACE_START_HF_PRESERVE} scale=${SURFACE_HF_UPDATE_SCALE} target=${LAYER_FREQUENCY_SURFACE_TARGET} dynamic_roots=${LAYER_FREQUENCY_DYNAMIC_ROOTS}"
+echo "[nosr-layerfreq-cleanup-v0] layer freq        : payload=${LAYER_FREQUENCY_MASK_PAYLOAD} ns=${LAMBDA_NON_SURFACE_HF} surf=${LAMBDA_SURFACE_HF_CLOSURE} start_hf=${LAMBDA_SURFACE_START_HF_PRESERVE} surf_lf=${LAMBDA_SURFACE_LOWFREQ_ENERGY} scale=${SURFACE_HF_UPDATE_SCALE} target=${LAYER_FREQUENCY_SURFACE_TARGET} subset_hf=${LAYER_FREQUENCY_SURFACE_SUBSET_HF} transfer=${LAYER_FREQUENCY_TRANSFER_SCORE_KEY:-none} dynamic_roots=${LAYER_FREQUENCY_DYNAMIC_ROOTS}"
 if [[ -n "${EXTERNAL_PRIOR_ROOT}" ]]; then
   echo "[nosr-layerfreq-cleanup-v0] external prior   : root=${EXTERNAL_PRIOR_ROOT} subdir=${EXTERNAL_PRIOR_SUBDIR} mask=${EXTERNAL_PRIOR_MASK_SUBDIR:-none}"
   if [[ "${PRIOR_LOSS_MODE}" == "ie_srgs_fusion_v0" && -z "${PRIOR_ANCHOR_DIR}" ]]; then
@@ -434,6 +451,10 @@ if [[ "${NEED_SURFACE_STATE}" == "1" && ! -f "${SURFACE_STATE_PAYLOAD}" ]]; then
   echo "[nosr-layerfreq-cleanup-v0] surface-state payload was not created: ${SURFACE_STATE_PAYLOAD}" >&2
   exit 1
 fi
+if [[ "${NEED_LAYER_FREQUENCY}" == "1" && ! -f "${LAYER_FREQUENCY_MASK_PAYLOAD}" ]]; then
+  echo "[nosr-layerfreq-cleanup-v0] layer-frequency payload not found: ${LAYER_FREQUENCY_MASK_PAYLOAD}" >&2
+  exit 1
+fi
 
 echo
 echo "[2/4] run fixed-topology NoSR layer-frequency cleanup"
@@ -469,7 +490,7 @@ if [[ "${FORCE_RERUN}" == "1" || ! -f "${TRAIN_DONE_PATH}" ]]; then
   fi
   if [[ "${NEED_LAYER_FREQUENCY}" == "1" ]]; then
     TRAIN_ARGS+=(
-      --layer_frequency_mask_payload "${SURFACE_STATE_PAYLOAD}"
+      --layer_frequency_mask_payload "${LAYER_FREQUENCY_MASK_PAYLOAD}"
       --layer_frequency_non_surface_key "${LAYER_FREQUENCY_NON_SURFACE_KEY}"
       --layer_frequency_surface_key "${LAYER_FREQUENCY_SURFACE_KEY}"
       --layer_frequency_surface_target "${LAYER_FREQUENCY_SURFACE_TARGET}"
@@ -479,6 +500,8 @@ if [[ "${FORCE_RERUN}" == "1" || ! -f "${TRAIN_DONE_PATH}" ]]; then
       --lambda_non_surface_alpha_mass "${LAMBDA_NON_SURFACE_ALPHA_MASS}"
       --lambda_surface_hf_closure "${LAMBDA_SURFACE_HF_CLOSURE}"
       --lambda_surface_start_hf_preserve "${LAMBDA_SURFACE_START_HF_PRESERVE}"
+      --lambda_surface_lowfreq_energy "${LAMBDA_SURFACE_LOWFREQ_ENERGY}"
+      --layer_frequency_surface_lowfreq_kernel "${LAYER_FREQUENCY_SURFACE_LOWFREQ_KERNEL}"
       --layer_frequency_start_hf_checkpoint "${LAYER_FREQUENCY_START_HF_CHECKPOINT}"
       --layer_frequency_start_hf_lowfreq_kernel "${LAYER_FREQUENCY_START_HF_LOWFREQ_KERNEL}"
       --layer_frequency_start_hf_lowfreq_threshold "${LAYER_FREQUENCY_START_HF_LOWFREQ_THRESHOLD}"
@@ -488,6 +511,15 @@ if [[ "${FORCE_RERUN}" == "1" || ! -f "${TRAIN_DONE_PATH}" ]]; then
       --layer_frequency_from_iter "${LAYER_FREQUENCY_FROM_ITER}"
       --layer_frequency_until_iter "${LAYER_FREQUENCY_UNTIL_ITER}"
       --layer_frequency_log_interval "${LAYER_FREQUENCY_LOG_INTERVAL}"
+      --layer_frequency_transfer_score_key "${LAYER_FREQUENCY_TRANSFER_SCORE_KEY}"
+      --layer_frequency_transfer_candidate_key "${LAYER_FREQUENCY_TRANSFER_CANDIDATE_KEY}"
+      --layer_frequency_transfer_start_ratio "${LAYER_FREQUENCY_TRANSFER_START_RATIO}"
+      --layer_frequency_transfer_final_ratio "${LAYER_FREQUENCY_TRANSFER_FINAL_RATIO}"
+      --layer_frequency_transfer_min_score "${LAYER_FREQUENCY_TRANSFER_MIN_SCORE}"
+      --layer_frequency_transfer_from_iter "${LAYER_FREQUENCY_TRANSFER_FROM_ITER}"
+      --layer_frequency_transfer_until_iter "${LAYER_FREQUENCY_TRANSFER_UNTIL_ITER}"
+      --layer_frequency_transfer_curve "${LAYER_FREQUENCY_TRANSFER_CURVE}"
+      --layer_frequency_transfer_include_base_surface "${LAYER_FREQUENCY_TRANSFER_INCLUDE_BASE_SURFACE}"
     )
   fi
   if [[ -n "${PRIOR_EDGE_DIR}" || -n "${PRIOR_EDGE_MASK_DIR}" ]]; then
@@ -677,6 +709,12 @@ if [[ "${FORCE_RERUN}" == "1" || ! -f "${TRAIN_DONE_PATH}" ]]; then
   fi
   if [[ "${NEED_LAYER_FREQUENCY}" == "1" && "${LAYER_FREQUENCY_DYNAMIC_ROOTS}" == "1" ]]; then
     TRAIN_ARGS+=(--layer_frequency_dynamic_roots)
+  fi
+  if [[ "${NEED_LAYER_FREQUENCY}" == "1" && "${LAYER_FREQUENCY_SURFACE_SUBSET_HF}" == "1" ]]; then
+    TRAIN_ARGS+=(--layer_frequency_surface_subset_hf)
+  fi
+  if [[ "${NEED_LAYER_FREQUENCY}" == "1" && "${LAYER_FREQUENCY_TRANSFER_COMPLEMENT_TO_NON_SURFACE}" == "1" ]]; then
+    TRAIN_ARGS+=(--layer_frequency_transfer_complement_to_non_surface)
   fi
   if [[ "${NEED_LAYER_FREQUENCY}" == "1" && "${LAYER_FREQUENCY_START_HF_PROTECT_NON_SURFACE}" == "1" ]]; then
     TRAIN_ARGS+=(--layer_frequency_start_hf_protect_non_surface)
