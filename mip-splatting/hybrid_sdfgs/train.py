@@ -3780,6 +3780,9 @@ class LayerFrequencyRegularizer:
         surface_subset_hf: bool = False,
         lambda_surface_lowfreq_energy: float = 0.0,
         surface_lowfreq_kernel: int = 15,
+        lambda_layer_handoff_low_balance: float = 0.0,
+        lambda_layer_handoff_total_hf: float = 0.0,
+        layer_handoff_lowfreq_kernel: int = 15,
     ):
         self.gaussians = gaussians
         self.lambda_non_surface_hf = float(lambda_non_surface_hf)
@@ -3790,6 +3793,9 @@ class LayerFrequencyRegularizer:
         self.lambda_surface_start_hf_preserve = float(lambda_surface_start_hf_preserve)
         self.lambda_surface_lowfreq_energy = float(lambda_surface_lowfreq_energy)
         self.surface_lowfreq_kernel = int(surface_lowfreq_kernel)
+        self.lambda_layer_handoff_low_balance = float(lambda_layer_handoff_low_balance)
+        self.lambda_layer_handoff_total_hf = float(lambda_layer_handoff_total_hf)
+        self.layer_handoff_lowfreq_kernel = int(layer_handoff_lowfreq_kernel)
         self.start_hf_lowfreq_kernel = int(start_hf_lowfreq_kernel)
         self.start_hf_lowfreq_threshold = float(start_hf_lowfreq_threshold)
         self.start_hf_energy_threshold = float(start_hf_energy_threshold)
@@ -3824,6 +3830,8 @@ class LayerFrequencyRegularizer:
             or self.lambda_non_surface_rgb_energy > 0.0
             or self.lambda_non_surface_alpha_hf > 0.0
             or self.lambda_non_surface_alpha_mass > 0.0
+            or self.lambda_layer_handoff_low_balance > 0.0
+            or self.lambda_layer_handoff_total_hf > 0.0
         ):
             if non_surface_mask is not None:
                 non_surface_mask = non_surface_mask.to(device=gaussians.get_xyz.device, dtype=torch.bool)
@@ -3841,6 +3849,8 @@ class LayerFrequencyRegularizer:
             self.lambda_surface_hf_closure > 0.0
             or self.lambda_surface_start_hf_preserve > 0.0
             or self.lambda_surface_lowfreq_energy > 0.0
+            or self.lambda_layer_handoff_low_balance > 0.0
+            or self.lambda_layer_handoff_total_hf > 0.0
         ) and surface_mask is not None:
             surface_mask = surface_mask.to(device=gaussians.get_xyz.device, dtype=torch.bool)
             if int(surface_mask.sum().item()) > 0:
@@ -3877,6 +3887,8 @@ class LayerFrequencyRegularizer:
                     self.lambda_surface_hf_closure > 0.0
                     or self.lambda_surface_start_hf_preserve > 0.0
                     or self.lambda_surface_lowfreq_energy > 0.0
+                    or self.lambda_layer_handoff_low_balance > 0.0
+                    or self.lambda_layer_handoff_total_hf > 0.0
                 ):
                     self.has_surface_mask = True
 
@@ -4023,6 +4035,9 @@ class LayerFrequencyRegularizer:
         if not self.active(iteration):
             return direct_loss, surface_loss, metrics
 
+        non_surface_image = None
+        surface_image = render_image
+        surface_subset_ready = False
         start_hf = None
         reliable_weight = None
         if (
@@ -4122,8 +4137,13 @@ class LayerFrequencyRegularizer:
 
         if surface_mask is not None and int(surface_mask.sum().item()) > 0:
             target_hf = _laplacian_highfreq(gt_image.detach())
-            surface_image = render_image
-            if self.surface_subset_hf or self.lambda_surface_lowfreq_energy > 0.0:
+            need_surface_subset_render = (
+                self.surface_subset_hf
+                or self.lambda_surface_lowfreq_energy > 0.0
+                or self.lambda_layer_handoff_low_balance > 0.0
+                or self.lambda_layer_handoff_total_hf > 0.0
+            )
+            if need_surface_subset_render:
                 surface_gaussians = self._gaussian_view_from_mask(surface_mask)
                 if surface_gaussians is not None:
                     black_background = torch.zeros_like(background)
@@ -4137,6 +4157,7 @@ class LayerFrequencyRegularizer:
                     )
                     surface_image = surface_pkg["render"]
                     metrics["surf_subset"] = 1.0
+                    surface_subset_ready = True
             pred_hf = _laplacian_highfreq(surface_image if self.surface_subset_hf else render_image)
             if self.lambda_surface_hf_closure > 0.0:
                 loss_surface_hf = (pred_hf - target_hf).abs().mean()
@@ -4162,6 +4183,36 @@ class LayerFrequencyRegularizer:
                     surface_loss = weighted if surface_loss is None else surface_loss + weighted
                     metrics["start_hf"] = loss_start_hf.detach().item()
                     metrics["start_hf_w"] = weighted.detach().item()
+
+        if (
+            non_surface_image is not None
+            and surface_image is not None
+            and surface_subset_ready
+            and (
+                self.lambda_layer_handoff_low_balance > 0.0
+                or self.lambda_layer_handoff_total_hf > 0.0
+            )
+        ):
+            # Approximate additive conservation between the two subset renders.
+            # This makes the split a transfer: LF keeps low-frequency content,
+            # while HF receives image-domain high-frequency responsibility.
+            subset_sum = surface_image + non_surface_image
+            if self.lambda_layer_handoff_low_balance > 0.0:
+                subset_low = _box_lowpass(subset_sum, self.layer_handoff_lowfreq_kernel)
+                target_low = _box_lowpass(render_image.detach(), self.layer_handoff_lowfreq_kernel)
+                loss_handoff_low = (subset_low - target_low).abs().mean()
+                weighted = self.lambda_layer_handoff_low_balance * loss_handoff_low
+                direct_loss = weighted if direct_loss is None else direct_loss + weighted
+                metrics["handoff_low"] = loss_handoff_low.detach().item()
+                metrics["handoff_low_w"] = weighted.detach().item()
+            if self.lambda_layer_handoff_total_hf > 0.0:
+                subset_hf = _laplacian_highfreq(subset_sum)
+                target_hf = _laplacian_highfreq(gt_image.detach())
+                loss_handoff_hf = (subset_hf - target_hf).abs().mean()
+                weighted = self.lambda_layer_handoff_total_hf * loss_handoff_hf
+                direct_loss = weighted if direct_loss is None else direct_loss + weighted
+                metrics["handoff_hf"] = loss_handoff_hf.detach().item()
+                metrics["handoff_hf_w"] = weighted.detach().item()
 
         weighted_total = torch.zeros((), dtype=render_image.dtype, device=render_image.device)
         if direct_loss is not None:
@@ -6113,6 +6164,8 @@ def training(
         or float(hybrid_args.lambda_surface_hf_closure) > 0.0
         or float(hybrid_args.lambda_surface_start_hf_preserve) > 0.0
         or float(hybrid_args.lambda_surface_lowfreq_energy) > 0.0
+        or float(hybrid_args.lambda_layer_handoff_low_balance) > 0.0
+        or float(hybrid_args.lambda_layer_handoff_total_hf) > 0.0
     )
     prior_direct_xyz_nudge_mask = None
     prior_direct_xyz_nudge_requested = float(hybrid_args.prior_direct_xyz_nudge_lr) > 0.0
@@ -6130,6 +6183,8 @@ def training(
             or float(hybrid_args.lambda_non_surface_rgb_energy) > 0.0
             or float(hybrid_args.lambda_non_surface_alpha_hf) > 0.0
             or float(hybrid_args.lambda_non_surface_alpha_mass) > 0.0
+            or float(hybrid_args.lambda_layer_handoff_low_balance) > 0.0
+            or float(hybrid_args.lambda_layer_handoff_total_hf) > 0.0
             or bool(getattr(hybrid_args, "layer_frequency_transfer_complement_to_non_surface", False))
         )
         if not layer_payload:
@@ -6148,6 +6203,8 @@ def training(
                 float(hybrid_args.lambda_surface_hf_closure) > 0.0
                 or float(hybrid_args.lambda_surface_start_hf_preserve) > 0.0
                 or float(hybrid_args.lambda_surface_lowfreq_energy) > 0.0
+                or float(hybrid_args.lambda_layer_handoff_low_balance) > 0.0
+                or float(hybrid_args.lambda_layer_handoff_total_hf) > 0.0
             )
             if needs_surface_mask:
                 layer_surface_mask = load_gaussian_update_mask_payload(
@@ -6188,6 +6245,9 @@ def training(
                 lambda_surface_start_hf_preserve=float(hybrid_args.lambda_surface_start_hf_preserve),
                 lambda_surface_lowfreq_energy=float(hybrid_args.lambda_surface_lowfreq_energy),
                 surface_lowfreq_kernel=int(hybrid_args.layer_frequency_surface_lowfreq_kernel),
+                lambda_layer_handoff_low_balance=float(hybrid_args.lambda_layer_handoff_low_balance),
+                lambda_layer_handoff_total_hf=float(hybrid_args.lambda_layer_handoff_total_hf),
+                layer_handoff_lowfreq_kernel=int(hybrid_args.layer_frequency_handoff_lowfreq_kernel),
                 start_hf_lowfreq_kernel=int(hybrid_args.layer_frequency_start_hf_lowfreq_kernel),
                 start_hf_lowfreq_threshold=float(hybrid_args.layer_frequency_start_hf_lowfreq_threshold),
                 start_hf_energy_threshold=float(hybrid_args.layer_frequency_start_hf_energy_threshold),
@@ -6251,6 +6311,8 @@ def training(
                 f"lambda_surf_hf={float(hybrid_args.lambda_surface_hf_closure):.6f} "
                 f"lambda_start_hf={float(hybrid_args.lambda_surface_start_hf_preserve):.6f} "
                 f"lambda_surf_lf={float(hybrid_args.lambda_surface_lowfreq_energy):.6f} "
+                f"lambda_handoff_low={float(hybrid_args.lambda_layer_handoff_low_balance):.6f} "
+                f"lambda_handoff_hf={float(hybrid_args.lambda_layer_handoff_total_hf):.6f} "
                 f"surface_target={str(getattr(hybrid_args, 'layer_frequency_surface_target', 'gt'))} "
                 f"from={int(hybrid_args.layer_frequency_from_iter)} "
                 f"until={int(hybrid_args.layer_frequency_until_iter)} "
@@ -9251,6 +9313,20 @@ def training(
                     layer_parts.append(
                         f"surf_lf_w={layer_freq_metrics['surf_lf_w']:.6f}"
                     )
+                if "handoff_low" in layer_freq_metrics:
+                    layer_parts.append(
+                        f"handoff_low={layer_freq_metrics['handoff_low']:.6f}"
+                    )
+                    layer_parts.append(
+                        f"handoff_low_w={layer_freq_metrics['handoff_low_w']:.6f}"
+                    )
+                if "handoff_hf" in layer_freq_metrics:
+                    layer_parts.append(
+                        f"handoff_hf={layer_freq_metrics['handoff_hf']:.6f}"
+                    )
+                    layer_parts.append(
+                        f"handoff_hf_w={layer_freq_metrics['handoff_hf_w']:.6f}"
+                    )
                 if "start_hf" in layer_freq_metrics:
                     layer_parts.append(
                         f"start_hf={layer_freq_metrics['start_hf']:.6f}"
@@ -10233,6 +10309,9 @@ def make_parser():
     parser.add_argument("--lambda_surface_start_hf_preserve", type=float, default=0.0)
     parser.add_argument("--lambda_surface_lowfreq_energy", type=float, default=0.0)
     parser.add_argument("--layer_frequency_surface_lowfreq_kernel", type=int, default=15)
+    parser.add_argument("--lambda_layer_handoff_low_balance", type=float, default=0.0)
+    parser.add_argument("--lambda_layer_handoff_total_hf", type=float, default=0.0)
+    parser.add_argument("--layer_frequency_handoff_lowfreq_kernel", type=int, default=15)
     parser.add_argument("--layer_frequency_start_hf_checkpoint", type=str, default="")
     parser.add_argument("--layer_frequency_start_hf_lowfreq_kernel", type=int, default=15)
     parser.add_argument("--layer_frequency_start_hf_lowfreq_threshold", type=float, default=0.05)

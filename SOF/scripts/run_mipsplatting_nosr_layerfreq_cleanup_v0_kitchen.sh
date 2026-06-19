@@ -94,6 +94,9 @@ LAYER_FREQUENCY_TRANSFER_INCLUDE_BASE_SURFACE="${LAYER_FREQUENCY_TRANSFER_INCLUD
 LAYER_FREQUENCY_TRANSFER_COMPLEMENT_TO_NON_SURFACE="${LAYER_FREQUENCY_TRANSFER_COMPLEMENT_TO_NON_SURFACE:-0}"
 LAMBDA_SURFACE_LOWFREQ_ENERGY="${LAMBDA_SURFACE_LOWFREQ_ENERGY:-0.0}"
 LAYER_FREQUENCY_SURFACE_LOWFREQ_KERNEL="${LAYER_FREQUENCY_SURFACE_LOWFREQ_KERNEL:-15}"
+LAMBDA_LAYER_HANDOFF_LOW_BALANCE="${LAMBDA_LAYER_HANDOFF_LOW_BALANCE:-0.0}"
+LAMBDA_LAYER_HANDOFF_TOTAL_HF="${LAMBDA_LAYER_HANDOFF_TOTAL_HF:-0.0}"
+LAYER_FREQUENCY_HANDOFF_LOWFREQ_KERNEL="${LAYER_FREQUENCY_HANDOFF_LOWFREQ_KERNEL:-15}"
 
 EXTERNAL_PRIOR_ROOT="${EXTERNAL_PRIOR_ROOT:-}"
 EXTERNAL_PRIOR_SUBDIR="${EXTERNAL_PRIOR_SUBDIR:-priors}"
@@ -282,7 +285,9 @@ if is_nonzero "${LAMBDA_NON_SURFACE_HF}" \
   || is_nonzero "${LAMBDA_NON_SURFACE_ALPHA_MASS}" \
   || is_nonzero "${LAMBDA_SURFACE_HF_CLOSURE}" \
   || is_nonzero "${LAMBDA_SURFACE_START_HF_PRESERVE}" \
-  || is_nonzero "${LAMBDA_SURFACE_LOWFREQ_ENERGY}"; then
+  || is_nonzero "${LAMBDA_SURFACE_LOWFREQ_ENERGY}" \
+  || is_nonzero "${LAMBDA_LAYER_HANDOFF_LOW_BALANCE}" \
+  || is_nonzero "${LAMBDA_LAYER_HANDOFF_TOTAL_HF}"; then
   NEED_LAYER_FREQUENCY=1
 fi
 NEED_LOCAL_SURFACE=0
@@ -357,7 +362,7 @@ echo "[nosr-layerfreq-cleanup-v0] train target      : ${TRAIN_IMAGES_SUBDIR}"
 echo "[nosr-layerfreq-cleanup-v0] output model      : ${MODEL_DIR}"
 echo "[nosr-layerfreq-cleanup-v0] iter schedule     : ${INPUT_ITERATION} -> ${FINAL_ITER}"
 echo "[nosr-layerfreq-cleanup-v0] save checkpoint   : ${SAVE_CHECKPOINT_AFTER}"
-echo "[nosr-layerfreq-cleanup-v0] layer freq        : payload=${LAYER_FREQUENCY_MASK_PAYLOAD} ns=${LAMBDA_NON_SURFACE_HF} surf=${LAMBDA_SURFACE_HF_CLOSURE} start_hf=${LAMBDA_SURFACE_START_HF_PRESERVE} surf_lf=${LAMBDA_SURFACE_LOWFREQ_ENERGY} scale=${SURFACE_HF_UPDATE_SCALE} target=${LAYER_FREQUENCY_SURFACE_TARGET} subset_hf=${LAYER_FREQUENCY_SURFACE_SUBSET_HF} transfer=${LAYER_FREQUENCY_TRANSFER_SCORE_KEY:-none} dynamic_roots=${LAYER_FREQUENCY_DYNAMIC_ROOTS}"
+echo "[nosr-layerfreq-cleanup-v0] layer freq        : payload=${LAYER_FREQUENCY_MASK_PAYLOAD} ns=${LAMBDA_NON_SURFACE_HF} surf=${LAMBDA_SURFACE_HF_CLOSURE} start_hf=${LAMBDA_SURFACE_START_HF_PRESERVE} surf_lf=${LAMBDA_SURFACE_LOWFREQ_ENERGY} handoff_low=${LAMBDA_LAYER_HANDOFF_LOW_BALANCE} handoff_hf=${LAMBDA_LAYER_HANDOFF_TOTAL_HF} scale=${SURFACE_HF_UPDATE_SCALE} target=${LAYER_FREQUENCY_SURFACE_TARGET} subset_hf=${LAYER_FREQUENCY_SURFACE_SUBSET_HF} transfer=${LAYER_FREQUENCY_TRANSFER_SCORE_KEY:-none} dynamic_roots=${LAYER_FREQUENCY_DYNAMIC_ROOTS}"
 if [[ -n "${EXTERNAL_PRIOR_ROOT}" ]]; then
   echo "[nosr-layerfreq-cleanup-v0] external prior   : root=${EXTERNAL_PRIOR_ROOT} subdir=${EXTERNAL_PRIOR_SUBDIR} mask=${EXTERNAL_PRIOR_MASK_SUBDIR:-none}"
   if [[ "${PRIOR_LOSS_MODE}" == "ie_srgs_fusion_v0" && -z "${PRIOR_ANCHOR_DIR}" ]]; then
@@ -502,6 +507,9 @@ if [[ "${FORCE_RERUN}" == "1" || ! -f "${TRAIN_DONE_PATH}" ]]; then
       --lambda_surface_start_hf_preserve "${LAMBDA_SURFACE_START_HF_PRESERVE}"
       --lambda_surface_lowfreq_energy "${LAMBDA_SURFACE_LOWFREQ_ENERGY}"
       --layer_frequency_surface_lowfreq_kernel "${LAYER_FREQUENCY_SURFACE_LOWFREQ_KERNEL}"
+      --lambda_layer_handoff_low_balance "${LAMBDA_LAYER_HANDOFF_LOW_BALANCE}"
+      --lambda_layer_handoff_total_hf "${LAMBDA_LAYER_HANDOFF_TOTAL_HF}"
+      --layer_frequency_handoff_lowfreq_kernel "${LAYER_FREQUENCY_HANDOFF_LOWFREQ_KERNEL}"
       --layer_frequency_start_hf_checkpoint "${LAYER_FREQUENCY_START_HF_CHECKPOINT}"
       --layer_frequency_start_hf_lowfreq_kernel "${LAYER_FREQUENCY_START_HF_LOWFREQ_KERNEL}"
       --layer_frequency_start_hf_lowfreq_threshold "${LAYER_FREQUENCY_START_HF_LOWFREQ_THRESHOLD}"
