@@ -10,10 +10,10 @@ SCENE_ROOT="${SCENE_ROOT:-${WORK_ROOT}/${SCENE_NAME}}"
 SCENE_ASSET_ROOT="${SCENE_ASSET_ROOT:-${SCENE_ROOT}/_hrgsrefiner_assets}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
-CAVE_CACHE_NAME="${CAVE_CACHE_NAME:-render_x1_restormer_cave_hf_ownership_dense_v2_smoke}"
+CAVE_CACHE_NAME="${CAVE_CACHE_NAME:-render_x1_restormer_cave_hf_ownership_dense_v2}"
 CAVE_CACHE_ROOT="${CAVE_CACHE_ROOT:-${SCENE_ASSET_ROOT}/cave_hf_ownership/${CAVE_CACHE_NAME}}"
 
-OUTPUT_NAME="${OUTPUT_NAME:-render_x1_restormer_cave_hf_reassignment_dense_v0_smoke}"
+OUTPUT_NAME="${OUTPUT_NAME:-render_x1_restormer_cave_hf_reassignment_dense_v1}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${SCENE_ASSET_ROOT}/cave_hf_reassignment/${OUTPUT_NAME}}"
 OUTPUT_PATH="${OUTPUT_PATH:-${OUTPUT_ROOT}/cave_hf_reassignment_v0.pt}"
 

@@ -7182,6 +7182,21 @@ def training(
 
         Ll1 = l1_loss(image, gt_image)
         loss_tex = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        if bool(getattr(hybrid_args, "layer_frequency_route_image_loss", False)):
+            route_kernel = int(getattr(hybrid_args, "layer_frequency_route_image_lowpass_kernel", 15))
+            image_low = _box_lowpass(image, route_kernel)
+            gt_low = _box_lowpass(gt_image, route_kernel)
+            loss_tex_low = (
+                (1.0 - opt.lambda_dssim) * l1_loss(image_low, gt_low)
+                + opt.lambda_dssim * (1.0 - ssim(image_low, gt_low))
+            )
+            full_weight = max(
+                0.0,
+                float(getattr(hybrid_args, "layer_frequency_route_image_full_weight", 0.0)),
+            )
+            loss_tex = loss_tex_low + full_weight * loss_tex
+            prior_metrics["route_img_low"] = float(loss_tex_low.detach().item())
+            prior_metrics["route_img_full_w"] = float(full_weight)
         if bool(getattr(hybrid_args, "sequence_loss_enable", False)):
             scale = max(1e-6, float(getattr(hybrid_args, "sequence_subpixel_scale", 4.0)))
             lr_height = max(1, int(round(float(image.shape[-2]) / scale)))
@@ -9076,6 +9091,9 @@ def training(
                     prior_parts.append(f"ie_ext={prior_metrics['ie_external']:.3f}")
                 if "ie_discrepancy" in prior_metrics:
                     prior_parts.append(f"ie_D={prior_metrics['ie_discrepancy']:.3f}")
+                if "route_img_low" in prior_metrics:
+                    prior_parts.append(f"route_low={prior_metrics['route_img_low']:.6f}")
+                    prior_parts.append(f"route_full_w={prior_metrics.get('route_img_full_w', 0.0):.3f}")
                 if "local_surface_w" in prior_metrics:
                     prior_parts.append(f"local3d={prior_metrics['local_surface_w']:.6f}")
                 if "local_surface_count" in prior_metrics:
@@ -10354,6 +10372,9 @@ def make_parser():
     parser.add_argument("--layer_frequency_surface_key", type=str, default="surface_carrier")
     parser.add_argument("--layer_frequency_dynamic_roots", action="store_true")
     parser.add_argument("--layer_frequency_surface_target", type=str, default="gt")
+    parser.add_argument("--layer_frequency_route_image_loss", action="store_true")
+    parser.add_argument("--layer_frequency_route_image_lowpass_kernel", type=int, default=15)
+    parser.add_argument("--layer_frequency_route_image_full_weight", type=float, default=0.0)
     parser.add_argument("--lambda_non_surface_hf", type=float, default=0.0)
     parser.add_argument("--lambda_non_surface_rgb_energy", type=float, default=0.0)
     parser.add_argument("--lambda_non_surface_alpha_hf", type=float, default=0.0)

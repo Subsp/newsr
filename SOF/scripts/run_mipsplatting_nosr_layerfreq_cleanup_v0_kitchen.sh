@@ -64,6 +64,9 @@ SAVE_CHECKPOINT_AFTER="${SAVE_CHECKPOINT_AFTER:-1}"
 LAYER_FREQUENCY_NON_SURFACE_KEY="${LAYER_FREQUENCY_NON_SURFACE_KEY:-non_surface_active}"
 LAYER_FREQUENCY_SURFACE_KEY="${LAYER_FREQUENCY_SURFACE_KEY:-surface_carrier}"
 LAYER_FREQUENCY_SURFACE_TARGET="${LAYER_FREQUENCY_SURFACE_TARGET:-gt}"
+LAYER_FREQUENCY_ROUTE_IMAGE_LOSS="${LAYER_FREQUENCY_ROUTE_IMAGE_LOSS:-0}"
+LAYER_FREQUENCY_ROUTE_IMAGE_LOWPASS_KERNEL="${LAYER_FREQUENCY_ROUTE_IMAGE_LOWPASS_KERNEL:-15}"
+LAYER_FREQUENCY_ROUTE_IMAGE_FULL_WEIGHT="${LAYER_FREQUENCY_ROUTE_IMAGE_FULL_WEIGHT:-0.0}"
 LAMBDA_NON_SURFACE_HF="${LAMBDA_NON_SURFACE_HF:-0.03}"
 LAMBDA_NON_SURFACE_RGB_ENERGY="${LAMBDA_NON_SURFACE_RGB_ENERGY:-0.0}"
 LAMBDA_NON_SURFACE_ALPHA_HF="${LAMBDA_NON_SURFACE_ALPHA_HF:-0.0}"
@@ -109,6 +112,10 @@ PRIOR_ANCHOR_DIR="${PRIOR_ANCHOR_DIR:-}"
 PRIOR_CONSISTENCY_THRESHOLD="${PRIOR_CONSISTENCY_THRESHOLD:-0.20}"
 PRIOR_MIN_VALID_RATIO="${PRIOR_MIN_VALID_RATIO:-0.30}"
 PRIOR_LOSS_MODE="${PRIOR_LOSS_MODE:-rgb_hf}"
+PRIOR_RESIDUAL_MASKED_UPDATE="${PRIOR_RESIDUAL_MASKED_UPDATE:-0}"
+PRIOR_LOSS_GAUSSIAN_MASK_PAYLOAD="${PRIOR_LOSS_GAUSSIAN_MASK_PAYLOAD:-}"
+PRIOR_LOSS_GAUSSIAN_MASK_KEY="${PRIOR_LOSS_GAUSSIAN_MASK_KEY:-selected_mask}"
+PRIOR_LOSS_GAUSSIAN_MASK_DYNAMIC_ROOTS="${PRIOR_LOSS_GAUSSIAN_MASK_DYNAMIC_ROOTS:-0}"
 PRIOR_IE_SRGS_THRESHOLD="${PRIOR_IE_SRGS_THRESHOLD:-0.9}"
 PRIOR_IE_SRGS_EPS="${PRIOR_IE_SRGS_EPS:-1e-6}"
 PRIOR_L1_WEIGHT="${PRIOR_L1_WEIGHT:-0.05}"
@@ -366,9 +373,10 @@ echo "[nosr-layerfreq-cleanup-v0] train target      : ${TRAIN_IMAGES_SUBDIR}"
 echo "[nosr-layerfreq-cleanup-v0] output model      : ${MODEL_DIR}"
 echo "[nosr-layerfreq-cleanup-v0] iter schedule     : ${INPUT_ITERATION} -> ${FINAL_ITER}"
 echo "[nosr-layerfreq-cleanup-v0] save checkpoint   : ${SAVE_CHECKPOINT_AFTER}"
-echo "[nosr-layerfreq-cleanup-v0] layer freq        : payload=${LAYER_FREQUENCY_MASK_PAYLOAD} ns=${LAMBDA_NON_SURFACE_HF} surf=${LAMBDA_SURFACE_HF_CLOSURE} start_hf=${LAMBDA_SURFACE_START_HF_PRESERVE} surf_lf=${LAMBDA_SURFACE_LOWFREQ_ENERGY} surf_support=${LAMBDA_SURFACE_HF_EDGE_SUPPORT} handoff_low=${LAMBDA_LAYER_HANDOFF_LOW_BALANCE} handoff_hf=${LAMBDA_LAYER_HANDOFF_TOTAL_HF} scale=${SURFACE_HF_UPDATE_SCALE} target=${LAYER_FREQUENCY_SURFACE_TARGET} subset_hf=${LAYER_FREQUENCY_SURFACE_SUBSET_HF} transfer=${LAYER_FREQUENCY_TRANSFER_SCORE_KEY:-none} dynamic_roots=${LAYER_FREQUENCY_DYNAMIC_ROOTS}"
+echo "[nosr-layerfreq-cleanup-v0] layer freq        : payload=${LAYER_FREQUENCY_MASK_PAYLOAD} ns=${LAMBDA_NON_SURFACE_HF} surf=${LAMBDA_SURFACE_HF_CLOSURE} start_hf=${LAMBDA_SURFACE_START_HF_PRESERVE} surf_lf=${LAMBDA_SURFACE_LOWFREQ_ENERGY} surf_support=${LAMBDA_SURFACE_HF_EDGE_SUPPORT} handoff_low=${LAMBDA_LAYER_HANDOFF_LOW_BALANCE} handoff_hf=${LAMBDA_LAYER_HANDOFF_TOTAL_HF} scale=${SURFACE_HF_UPDATE_SCALE} target=${LAYER_FREQUENCY_SURFACE_TARGET} subset_hf=${LAYER_FREQUENCY_SURFACE_SUBSET_HF} route_img=${LAYER_FREQUENCY_ROUTE_IMAGE_LOSS} transfer=${LAYER_FREQUENCY_TRANSFER_SCORE_KEY:-none} dynamic_roots=${LAYER_FREQUENCY_DYNAMIC_ROOTS}"
 if [[ -n "${EXTERNAL_PRIOR_ROOT}" ]]; then
   echo "[nosr-layerfreq-cleanup-v0] external prior   : root=${EXTERNAL_PRIOR_ROOT} subdir=${EXTERNAL_PRIOR_SUBDIR} mask=${EXTERNAL_PRIOR_MASK_SUBDIR:-none}"
+  echo "[nosr-layerfreq-cleanup-v0] prior update     : masked=${PRIOR_RESIDUAL_MASKED_UPDATE} payload=${PRIOR_LOSS_GAUSSIAN_MASK_PAYLOAD:-none} key=${PRIOR_LOSS_GAUSSIAN_MASK_KEY}"
   if [[ "${PRIOR_LOSS_MODE}" == "ie_srgs_fusion_v0" && -z "${PRIOR_ANCHOR_DIR}" ]]; then
     echo "[nosr-layerfreq-cleanup-v0] PRIOR_LOSS_MODE=ie_srgs_fusion_v0 requires PRIOR_ANCHOR_DIR as the internal 3DGS source." >&2
     exit 1
@@ -503,6 +511,8 @@ if [[ "${FORCE_RERUN}" == "1" || ! -f "${TRAIN_DONE_PATH}" ]]; then
       --layer_frequency_non_surface_key "${LAYER_FREQUENCY_NON_SURFACE_KEY}"
       --layer_frequency_surface_key "${LAYER_FREQUENCY_SURFACE_KEY}"
       --layer_frequency_surface_target "${LAYER_FREQUENCY_SURFACE_TARGET}"
+      --layer_frequency_route_image_lowpass_kernel "${LAYER_FREQUENCY_ROUTE_IMAGE_LOWPASS_KERNEL}"
+      --layer_frequency_route_image_full_weight "${LAYER_FREQUENCY_ROUTE_IMAGE_FULL_WEIGHT}"
       --lambda_non_surface_hf "${LAMBDA_NON_SURFACE_HF}"
       --lambda_non_surface_rgb_energy "${LAMBDA_NON_SURFACE_RGB_ENERGY}"
       --lambda_non_surface_alpha_hf "${LAMBDA_NON_SURFACE_ALPHA_HF}"
@@ -536,6 +546,21 @@ if [[ "${FORCE_RERUN}" == "1" || ! -f "${TRAIN_DONE_PATH}" ]]; then
       --layer_frequency_transfer_curve "${LAYER_FREQUENCY_TRANSFER_CURVE}"
       --layer_frequency_transfer_include_base_surface "${LAYER_FREQUENCY_TRANSFER_INCLUDE_BASE_SURFACE}"
     )
+  fi
+  if [[ "${LAYER_FREQUENCY_ROUTE_IMAGE_LOSS}" == "1" ]]; then
+    TRAIN_ARGS+=(--layer_frequency_route_image_loss)
+  fi
+  if [[ -n "${PRIOR_LOSS_GAUSSIAN_MASK_PAYLOAD}" ]]; then
+    TRAIN_ARGS+=(
+      --prior_loss_gaussian_mask_payload "${PRIOR_LOSS_GAUSSIAN_MASK_PAYLOAD}"
+      --prior_loss_gaussian_mask_key "${PRIOR_LOSS_GAUSSIAN_MASK_KEY}"
+    )
+  fi
+  if [[ "${PRIOR_LOSS_GAUSSIAN_MASK_DYNAMIC_ROOTS}" == "1" ]]; then
+    TRAIN_ARGS+=(--prior_loss_gaussian_mask_dynamic_roots)
+  fi
+  if [[ "${PRIOR_RESIDUAL_MASKED_UPDATE}" == "1" ]]; then
+    TRAIN_ARGS+=(--prior_residual_masked_update)
   fi
   if [[ -n "${PRIOR_EDGE_DIR}" || -n "${PRIOR_EDGE_MASK_DIR}" ]]; then
     TRAIN_ARGS+=(
