@@ -2311,6 +2311,205 @@ def compute_prior_edge_carrier_shape_loss(
     return shape_loss, metrics
 
 
+def _edge_structure_selected_indices(
+    gaussians,
+    edge_touch_mask,
+    *,
+    surface_mask=None,
+    min_gaussians: int = 32,
+    max_samples: int = 2048,
+    label: str = "edge structure",
+):
+    if edge_touch_mask is None:
+        return None, {"edge_structure_count": 0.0}
+    total = int(gaussians.get_xyz.shape[0])
+    selected = edge_touch_mask.to(device=gaussians.get_xyz.device, dtype=torch.bool).reshape(-1)
+    if int(selected.shape[0]) != total:
+        raise ValueError(f"{label} mask length mismatch: {int(selected.shape[0])} vs {total}")
+    if surface_mask is not None:
+        surface_mask = surface_mask.to(device=gaussians.get_xyz.device, dtype=torch.bool).reshape(-1)
+        if int(surface_mask.shape[0]) != total:
+            surface_mask = _expand_root_aligned_mask(
+                surface_mask,
+                gaussians,
+                label=f"{label} surface mask",
+            )
+        selected = selected & surface_mask
+    idx = torch.nonzero(selected, as_tuple=False).reshape(-1)
+    count = int(idx.shape[0])
+    metrics = {"edge_structure_count": float(count)}
+    if count < int(min_gaussians):
+        return None, metrics
+    max_samples = int(max_samples)
+    if max_samples > 0 and count > max_samples:
+        perm = torch.randperm(count, device=idx.device)[:max_samples]
+        idx = idx[perm]
+        metrics["edge_structure_sampled"] = float(int(idx.shape[0]))
+    else:
+        metrics["edge_structure_sampled"] = float(count)
+    return idx, metrics
+
+
+def _normalized_entropy_from_eigs(eigs, eps: float = 1e-8):
+    eigs = eigs.clamp(min=float(eps))
+    prob = eigs / eigs.sum(dim=-1, keepdim=True).clamp(min=float(eps))
+    entropy = -(prob * torch.log(prob.clamp(min=float(eps)))).sum(dim=-1)
+    return entropy / math.log(float(eigs.shape[-1]))
+
+
+def _local_covariance_eigs(xyz, knn: int = 8, eps: float = 1e-8):
+    count = int(xyz.shape[0])
+    if count <= 2:
+        return None
+    knn = max(2, min(int(knn), count - 1))
+    dist = torch.cdist(xyz, xyz)
+    nn_idx = torch.topk(dist, k=knn + 1, dim=1, largest=False).indices[:, 1:]
+    neighbors = xyz[nn_idx] - xyz[:, None, :]
+    cov = neighbors.transpose(1, 2).matmul(neighbors) / float(knn)
+    eye = torch.eye(3, device=xyz.device, dtype=xyz.dtype)[None]
+    return torch.linalg.eigvalsh(cov + float(eps) * eye).clamp(min=float(eps))
+
+
+def compute_prior_edge_enton_loss(
+    gaussians,
+    edge_touch_mask,
+    *,
+    surface_mask=None,
+    min_gaussians: int = 64,
+    max_samples: int = 2048,
+    knn: int = 8,
+    max_entropy: float = 0.58,
+    scale_weight: float = 0.25,
+    local_weight: float = 1.0,
+):
+    idx, metrics = _edge_structure_selected_indices(
+        gaussians,
+        edge_touch_mask,
+        surface_mask=surface_mask,
+        min_gaussians=min_gaussians,
+        max_samples=max_samples,
+        label="EntON-HF edge carrier",
+    )
+    if idx is None:
+        return None, metrics
+
+    max_entropy = float(max_entropy)
+    scale_weight = max(0.0, float(scale_weight))
+    local_weight = max(0.0, float(local_weight))
+    losses = []
+
+    scales = gaussians.get_scaling[idx].clamp(min=1e-8)
+    scale_eigs = torch.sort(scales.pow(2), dim=-1).values
+    scale_entropy = _normalized_entropy_from_eigs(scale_eigs)
+    scale_loss = torch.clamp(scale_entropy - max_entropy, min=0.0).mean()
+    if scale_weight > 0.0:
+        losses.append(scale_weight * scale_loss)
+    metrics.update(
+        {
+            "edge_enton_scale_entropy": float(scale_entropy.mean().detach().item()),
+            "edge_enton_scale_loss": float(scale_loss.detach().item()),
+        }
+    )
+
+    local_eigs = _local_covariance_eigs(gaussians.get_xyz[idx], knn=knn)
+    if local_eigs is not None:
+        local_entropy = _normalized_entropy_from_eigs(local_eigs)
+        local_loss = torch.clamp(local_entropy - max_entropy, min=0.0).mean()
+        if local_weight > 0.0:
+            losses.append(local_weight * local_loss)
+        anis = local_eigs[:, 2] / local_eigs[:, 0].clamp(min=1e-8)
+        metrics.update(
+            {
+                "edge_enton_local_entropy": float(local_entropy.mean().detach().item()),
+                "edge_enton_local_loss": float(local_loss.detach().item()),
+                "edge_enton_local_anis": float(anis.mean().detach().item()),
+            }
+        )
+
+    if not losses:
+        return None, metrics
+    loss = sum(losses)
+    metrics["edge_enton_loss"] = float(loss.detach().item())
+    return loss, metrics
+
+
+def compute_prior_edge_linegs_loss(
+    gaussians,
+    edge_touch_mask,
+    *,
+    surface_mask=None,
+    min_gaussians: int = 64,
+    max_samples: int = 2048,
+    knn: int = 8,
+    thin_ratio: float = 0.35,
+    line_ratio: float = 0.45,
+    scale_weight: float = 1.0,
+    local_weight: float = 0.5,
+    max_axis: float = 0.0,
+):
+    idx, metrics = _edge_structure_selected_indices(
+        gaussians,
+        edge_touch_mask,
+        surface_mask=surface_mask,
+        min_gaussians=min_gaussians,
+        max_samples=max_samples,
+        label="LineGS-HF edge carrier",
+    )
+    if idx is None:
+        return None, metrics
+
+    thin_ratio = float(thin_ratio)
+    line_ratio = float(line_ratio)
+    scale_weight = max(0.0, float(scale_weight))
+    local_weight = max(0.0, float(local_weight))
+    losses = []
+
+    scales = torch.sort(gaussians.get_scaling[idx].clamp(min=1e-8), dim=-1).values
+    small, mid, large = scales[:, 0], scales[:, 1], scales[:, 2]
+    scale_thin = small / mid.clamp(min=1e-8)
+    scale_line = mid / large.clamp(min=1e-8)
+    scale_thin_loss = torch.clamp(scale_thin - thin_ratio, min=0.0).mean()
+    scale_line_loss = torch.clamp(scale_line - line_ratio, min=0.0).mean()
+    scale_loss = scale_thin_loss + scale_line_loss
+    if float(max_axis) > 0.0:
+        scale_axis_loss = torch.clamp(large / float(max_axis) - 1.0, min=0.0).mean()
+        scale_loss = scale_loss + scale_axis_loss
+        metrics["edge_linegs_scale_axis_loss"] = float(scale_axis_loss.detach().item())
+    if scale_weight > 0.0:
+        losses.append(scale_weight * scale_loss)
+    metrics.update(
+        {
+            "edge_linegs_scale_loss": float(scale_loss.detach().item()),
+            "edge_linegs_scale_thin": float(scale_thin.mean().detach().item()),
+            "edge_linegs_scale_line": float(scale_line.mean().detach().item()),
+        }
+    )
+
+    local_eigs = _local_covariance_eigs(gaussians.get_xyz[idx], knn=knn)
+    if local_eigs is not None:
+        small_e, mid_e, large_e = local_eigs[:, 0], local_eigs[:, 1], local_eigs[:, 2]
+        local_line = mid_e / large_e.clamp(min=1e-8)
+        local_thin = small_e / mid_e.clamp(min=1e-8)
+        local_line_loss = torch.clamp(local_line - line_ratio, min=0.0).mean()
+        local_thin_loss = torch.clamp(local_thin - thin_ratio, min=0.0).mean()
+        local_loss = local_line_loss + 0.5 * local_thin_loss
+        if local_weight > 0.0:
+            losses.append(local_weight * local_loss)
+        metrics.update(
+            {
+                "edge_linegs_local_loss": float(local_loss.detach().item()),
+                "edge_linegs_local_thin": float(local_thin.mean().detach().item()),
+                "edge_linegs_local_line": float(local_line.mean().detach().item()),
+            }
+        )
+
+    if not losses:
+        return None, metrics
+    loss = sum(losses)
+    metrics["edge_linegs_loss"] = float(loss.detach().item())
+    return loss, metrics
+
+
 def _payload_tensor_to_cuda(payload, key: str, total_gaussians: int, *, shape_tail=None, dtype=torch.float32):
     value = payload.get(key)
     if value is None:
@@ -5488,7 +5687,14 @@ def training(
         and bool(hybrid_args.prior_edge_dir)
         and bool(hybrid_args.prior_edge_mask_dir)
     )
-    need_sof_edge_carrier = float(getattr(hybrid_args, "lambda_prior_edge_shape", 0.0)) > 0.0
+    need_sof_edge_carrier = any(
+        float(getattr(hybrid_args, key, 0.0)) > 0.0
+        for key in (
+            "lambda_prior_edge_shape",
+            "lambda_prior_edge_enton",
+            "lambda_prior_edge_linegs",
+        )
+    )
     need_sof_local_surface = float(getattr(hybrid_args, "lambda_prior_local_surface", 0.0)) > 0.0
     if (
         float(hybrid_args.lambda_prior_local) > 0.0
@@ -7613,12 +7819,12 @@ def training(
                     touched_count = float(edge_touch_mask.sum().item())
                     prior_metrics["sof_edge_touch_ratio"] = touched_count / max(visible_count, 1.0)
                     prior_metrics["sof_edge_touched"] = touched_count
+                    edge_shape_surface_mask = (
+                        layer_frequency_regularizer.surface_mask
+                        if layer_frequency_regularizer is not None
+                        else None
+                    )
                     if float(hybrid_args.lambda_prior_edge_shape) > 0.0:
-                        edge_shape_surface_mask = (
-                            layer_frequency_regularizer.surface_mask
-                            if layer_frequency_regularizer is not None
-                            else None
-                        )
                         loss_edge_shape, edge_shape_metrics = compute_prior_edge_carrier_shape_loss(
                             gaussians,
                             edge_touch_mask,
@@ -7637,6 +7843,50 @@ def training(
                             )
                             loss = loss + weighted_edge_shape
                             prior_metrics["edge_carrier_shape_w"] = float(weighted_edge_shape.detach().item())
+                    if float(hybrid_args.lambda_prior_edge_enton) > 0.0:
+                        loss_edge_enton, edge_enton_metrics = compute_prior_edge_enton_loss(
+                            gaussians,
+                            edge_touch_mask,
+                            surface_mask=edge_shape_surface_mask,
+                            min_gaussians=int(hybrid_args.prior_edge_structure_min_gaussians),
+                            max_samples=int(hybrid_args.prior_edge_structure_max_samples),
+                            knn=int(hybrid_args.prior_edge_structure_knn),
+                            max_entropy=float(hybrid_args.prior_edge_enton_max_entropy),
+                            scale_weight=float(hybrid_args.prior_edge_enton_scale_weight),
+                            local_weight=float(hybrid_args.prior_edge_enton_local_weight),
+                        )
+                        prior_metrics.update(edge_enton_metrics)
+                        if loss_edge_enton is not None:
+                            weighted_edge_enton = (
+                                float(hybrid_args.lambda_prior_edge_enton)
+                                * float(prior_guidance_scale)
+                                * loss_edge_enton
+                            )
+                            loss = loss + weighted_edge_enton
+                            prior_metrics["edge_enton_w"] = float(weighted_edge_enton.detach().item())
+                    if float(hybrid_args.lambda_prior_edge_linegs) > 0.0:
+                        loss_edge_linegs, edge_linegs_metrics = compute_prior_edge_linegs_loss(
+                            gaussians,
+                            edge_touch_mask,
+                            surface_mask=edge_shape_surface_mask,
+                            min_gaussians=int(hybrid_args.prior_edge_structure_min_gaussians),
+                            max_samples=int(hybrid_args.prior_edge_structure_max_samples),
+                            knn=int(hybrid_args.prior_edge_structure_knn),
+                            thin_ratio=float(hybrid_args.prior_edge_linegs_thin_ratio),
+                            line_ratio=float(hybrid_args.prior_edge_linegs_line_ratio),
+                            scale_weight=float(hybrid_args.prior_edge_linegs_scale_weight),
+                            local_weight=float(hybrid_args.prior_edge_linegs_local_weight),
+                            max_axis=float(hybrid_args.prior_edge_linegs_max_axis),
+                        )
+                        prior_metrics.update(edge_linegs_metrics)
+                        if loss_edge_linegs is not None:
+                            weighted_edge_linegs = (
+                                float(hybrid_args.lambda_prior_edge_linegs)
+                                * float(prior_guidance_scale)
+                                * loss_edge_linegs
+                            )
+                            loss = loss + weighted_edge_linegs
+                            prior_metrics["edge_linegs_w"] = float(weighted_edge_linegs.detach().item())
 
             if (
                 prior_local_surface_payload is not None
@@ -8519,6 +8769,16 @@ def training(
                     prior_parts.append(f"eline={prior_metrics['edge_carrier_line_ratio']:.3f}")
                 if "edge_carrier_thin_ratio" in prior_metrics:
                     prior_parts.append(f"ethin={prior_metrics['edge_carrier_thin_ratio']:.3f}")
+                if "edge_enton_w" in prior_metrics:
+                    prior_parts.append(f"enton={prior_metrics.get('edge_enton_loss', 0.0):.6f}")
+                    prior_parts.append(f"enton_w={prior_metrics['edge_enton_w']:.6f}")
+                if "edge_enton_local_entropy" in prior_metrics:
+                    prior_parts.append(f"entonH={prior_metrics['edge_enton_local_entropy']:.3f}")
+                if "edge_linegs_w" in prior_metrics:
+                    prior_parts.append(f"linegs={prior_metrics.get('edge_linegs_loss', 0.0):.6f}")
+                    prior_parts.append(f"linegs_w={prior_metrics['edge_linegs_w']:.6f}")
+                if "edge_linegs_local_line" in prior_metrics:
+                    prior_parts.append(f"line3d={prior_metrics['edge_linegs_local_line']:.3f}")
                 if "hf_seeded" in prior_metrics:
                     prior_parts.extend(
                         [
@@ -9063,6 +9323,23 @@ def training_report(
                 "edge_carrier_thin_ratio",
                 "edge_carrier_line_ratio",
                 "edge_carrier_max_axis",
+                "edge_structure_count",
+                "edge_structure_sampled",
+                "edge_enton_loss",
+                "edge_enton_w",
+                "edge_enton_scale_entropy",
+                "edge_enton_scale_loss",
+                "edge_enton_local_entropy",
+                "edge_enton_local_loss",
+                "edge_enton_local_anis",
+                "edge_linegs_loss",
+                "edge_linegs_w",
+                "edge_linegs_scale_loss",
+                "edge_linegs_scale_thin",
+                "edge_linegs_scale_line",
+                "edge_linegs_local_loss",
+                "edge_linegs_local_thin",
+                "edge_linegs_local_line",
             ):
                 if key in prior_metrics:
                     tb_writer.add_scalar(f"prior/{key}", prior_metrics[key], iteration)
@@ -9566,6 +9843,19 @@ def make_parser():
     parser.add_argument("--prior_edge_shape_thin_ratio", type=float, default=0.35)
     parser.add_argument("--prior_edge_shape_line_ratio", type=float, default=0.60)
     parser.add_argument("--prior_edge_shape_max_axis", type=float, default=0.0)
+    parser.add_argument("--lambda_prior_edge_enton", type=float, default=0.0)
+    parser.add_argument("--lambda_prior_edge_linegs", type=float, default=0.0)
+    parser.add_argument("--prior_edge_structure_min_gaussians", type=int, default=64)
+    parser.add_argument("--prior_edge_structure_max_samples", type=int, default=2048)
+    parser.add_argument("--prior_edge_structure_knn", type=int, default=8)
+    parser.add_argument("--prior_edge_enton_max_entropy", type=float, default=0.58)
+    parser.add_argument("--prior_edge_enton_scale_weight", type=float, default=0.25)
+    parser.add_argument("--prior_edge_enton_local_weight", type=float, default=1.0)
+    parser.add_argument("--prior_edge_linegs_thin_ratio", type=float, default=0.35)
+    parser.add_argument("--prior_edge_linegs_line_ratio", type=float, default=0.45)
+    parser.add_argument("--prior_edge_linegs_scale_weight", type=float, default=1.0)
+    parser.add_argument("--prior_edge_linegs_local_weight", type=float, default=0.5)
+    parser.add_argument("--prior_edge_linegs_max_axis", type=float, default=0.0)
     parser.add_argument("--densify_min_opacity", type=float, default=0.005)
     parser.add_argument("--densify_global_prune_enable", type=int, default=1)
     parser.add_argument("--prior_hf_seed_enable", action="store_true")
