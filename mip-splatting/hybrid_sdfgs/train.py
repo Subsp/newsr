@@ -725,7 +725,7 @@ def _unproject_pixels_with_camera_z(camera, pixels_xy, depth_z):
     return (xyz_cam - T.unsqueeze(0)) @ R.transpose(0, 1)
 
 
-def _gather_guidance_gradients_on_pixels(guidance_map, pixels_xy):
+def _gather_guidance_gradients_on_pixels(guidance_map, pixels_xy, structure_radius_px: int = 0):
     if guidance_map is None or pixels_xy is None or pixels_xy.numel() == 0:
         return None, None
     if guidance_map.ndim != 3:
@@ -743,6 +743,37 @@ def _gather_guidance_gradients_on_pixels(guidance_map, pixels_xy):
         grad_y[:, 1:-1, :] = 0.5 * (guidance[:, 2:, :] - guidance[:, :-2, :])
         grad_y[:, 0, :] = guidance[:, 1, :] - guidance[:, 0, :]
         grad_y[:, -1, :] = guidance[:, -1, :] - guidance[:, -2, :]
+    radius = max(int(structure_radius_px), 0)
+    if radius > 0:
+        kernel = radius * 2 + 1
+        jxx = torch_F.avg_pool2d((grad_x * grad_x)[None], kernel_size=kernel, stride=1, padding=radius)[0]
+        jxy = torch_F.avg_pool2d((grad_x * grad_y)[None], kernel_size=kernel, stride=1, padding=radius)[0]
+        jyy = torch_F.avg_pool2d((grad_y * grad_y)[None], kernel_size=kernel, stride=1, padding=radius)[0]
+        a = _gather_scalar_map_on_pixels(jxx, pixels_xy)
+        b = _gather_scalar_map_on_pixels(jxy, pixels_xy)
+        c = _gather_scalar_map_on_pixels(jyy, pixels_xy)
+        if a is None or b is None or c is None:
+            return None, None
+        delta = torch.sqrt(torch.clamp((a - c).pow(2) + 4.0 * b.pow(2), min=0.0))
+        lambda1 = 0.5 * (a + c + delta)
+        lambda2 = 0.5 * (a + c - delta)
+        normal_xy = torch.stack([b, lambda1 - a], dim=-1)
+        alt_xy = torch.stack([lambda1 - c, b], dim=-1)
+        use_alt = normal_xy.norm(dim=-1, keepdim=True) <= 1e-8
+        normal_xy = torch.where(use_alt, alt_xy, normal_xy)
+        fallback_xy = torch.stack(
+            [
+                _gather_scalar_map_on_pixels(grad_x, pixels_xy),
+                _gather_scalar_map_on_pixels(grad_y, pixels_xy),
+            ],
+            dim=-1,
+        )
+        use_fallback = normal_xy.norm(dim=-1, keepdim=True) <= 1e-8
+        normal_xy = torch.where(use_fallback, fallback_xy, normal_xy)
+        normal_norm = normal_xy.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        coherence = torch.clamp((lambda1 - lambda2) / (lambda1 + lambda2 + 1e-8), min=0.0, max=1.0)
+        normal_xy = normal_xy / normal_norm * coherence[:, None]
+        return normal_xy[:, 0], normal_xy[:, 1]
     return (
         _gather_scalar_map_on_pixels(grad_x, pixels_xy),
         _gather_scalar_map_on_pixels(grad_y, pixels_xy),
@@ -762,6 +793,7 @@ def _build_hf_seed_shape_from_guidance(
     short_ratio: float,
     normal_ratio: float,
     confidence_power: float,
+    orientation_radius_px: int = 0,
 ):
     mode = str(shape_mode or "isotropic").lower()
     if mode in {"isotropic", "legacy", "sphere", "round"}:
@@ -785,7 +817,11 @@ def _build_hf_seed_shape_from_guidance(
     tangent_xy = torch.zeros((pixels_xy.shape[0], 2), device=device, dtype=dtype)
     tangent_xy[:, 0] = 1.0
     if mode in {"hf_oriented", "guidance", "edge", "structure"}:
-        grad_x, grad_y = _gather_guidance_gradients_on_pixels(guidance_map, pixels_xy)
+        grad_x, grad_y = _gather_guidance_gradients_on_pixels(
+            guidance_map,
+            pixels_xy,
+            structure_radius_px=int(orientation_radius_px),
+        )
         if grad_x is not None and grad_y is not None:
             grad_mag = torch.sqrt(grad_x.pow(2) + grad_y.pow(2))
             max_grad = grad_mag.max().clamp(min=1e-8)
@@ -834,6 +870,7 @@ def _build_hf_seed_shape_from_guidance(
         "hf_seed_shape_normal_ratio": float(normal_ratio),
         "hf_seed_shape_orient_conf_mean": float(confidence.mean().detach().item()),
         "hf_seed_shape_orient_conf_p90": float(torch.quantile(confidence.detach().float(), 0.90).item()),
+        "hf_seed_shape_orient_radius_px": float(max(int(orientation_radius_px), 0)),
         "hf_seed_shape_mode_id": 2.0 if mode in {"hf_oriented", "guidance", "edge", "structure"} else 1.0,
     }
 
@@ -919,6 +956,7 @@ def _build_prior_residual_seed_births(
     shape_short_ratio,
     shape_normal_ratio,
     shape_confidence_power,
+    shape_orientation_radius_px,
     base_opacity,
     jitter_scale,
     color_residual_gain,
@@ -1177,6 +1215,7 @@ def _build_prior_residual_seed_births(
         short_ratio=float(shape_short_ratio),
         normal_ratio=float(shape_normal_ratio),
         confidence_power=float(shape_confidence_power),
+        orientation_radius_px=int(shape_orientation_radius_px),
     )
     new_scaling = gaussians.scaling_inverse_activation(
         seed_scales.to(device=device, dtype=dtype).clamp(min=1e-7)
@@ -9052,6 +9091,7 @@ def training(
                         shape_short_ratio=float(hybrid_args.prior_hf_seed_shape_short_ratio),
                         shape_normal_ratio=float(hybrid_args.prior_hf_seed_shape_normal_ratio),
                         shape_confidence_power=float(hybrid_args.prior_hf_seed_shape_confidence_power),
+                        shape_orientation_radius_px=int(hybrid_args.prior_hf_seed_shape_orientation_radius_px),
                         base_opacity=float(hybrid_args.prior_hf_seed_opacity),
                         jitter_scale=float(hybrid_args.prior_hf_seed_jitter_scale),
                         color_residual_gain=float(hybrid_args.prior_hf_seed_color_residual_gain),
@@ -10445,6 +10485,7 @@ def make_parser():
     parser.add_argument("--prior_hf_seed_shape_short_ratio", type=float, default=1.0)
     parser.add_argument("--prior_hf_seed_shape_normal_ratio", type=float, default=1.0)
     parser.add_argument("--prior_hf_seed_shape_confidence_power", type=float, default=1.0)
+    parser.add_argument("--prior_hf_seed_shape_orientation_radius_px", type=int, default=0)
     parser.add_argument("--prior_hf_seed_diag_large_scale", type=float, default=0.0)
     parser.add_argument("--prior_hf_seed_scale_clamp_enable", action="store_true")
     parser.add_argument("--prior_hf_seed_scale_clamp_max_axis", type=float, default=0.0)
