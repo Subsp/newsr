@@ -50,6 +50,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda_l1", type=float, default=0.5)
     parser.add_argument("--lambda_l2", type=float, default=0.5)
     parser.add_argument("--init_random", action="store_true")
+    parser.add_argument("--init_min_score", type=float, default=0.035)
+    parser.add_argument("--init_nms_radius_px", type=int, default=2)
+    parser.add_argument("--init_max_candidates", type=int, default=0)
+    parser.add_argument("--init_weight_power", type=float, default=0.5)
+    parser.add_argument("--init_orientation_radius_px", type=int, default=5)
+    parser.add_argument("--init_sigma_long_px", type=float, default=5.0)
+    parser.add_argument("--init_sigma_short_px", type=float, default=0.8)
+    parser.add_argument("--init_coherence_long_boost", type=float, default=0.75)
     parser.add_argument("--neutral_outside_mask", action="store_true")
     parser.add_argument("--no_neutral_outside_mask", dest="neutral_outside_mask", action="store_false")
     parser.set_defaults(neutral_outside_mask=False)
@@ -117,6 +125,161 @@ def _box_blur_rgb(image: np.ndarray, kernel: int) -> np.ndarray:
         - integral[k:, :-k]
         + integral[:-k, :-k]
     ).astype(np.float32) / float(k * k)
+
+
+def _central_grad(gray: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    gray = gray.astype(np.float32, copy=False)
+    gx = np.zeros_like(gray, dtype=np.float32)
+    gy = np.zeros_like(gray, dtype=np.float32)
+    gx[:, 1:-1] = 0.5 * (gray[:, 2:] - gray[:, :-2])
+    gx[:, 0] = gray[:, 1] - gray[:, 0]
+    gx[:, -1] = gray[:, -1] - gray[:, -2]
+    gy[1:-1, :] = 0.5 * (gray[2:, :] - gray[:-2, :])
+    gy[0, :] = gray[1, :] - gray[0, :]
+    gy[-1, :] = gray[-1, :] - gray[-2, :]
+    return gx, gy
+
+
+def _box_sum(gray: np.ndarray, radius: int) -> np.ndarray:
+    r = max(0, int(radius))
+    if r <= 0:
+        return gray.astype(np.float32, copy=True)
+    k = 2 * r + 1
+    padded = np.pad(gray.astype(np.float32), ((r, r), (r, r)), mode="reflect")
+    integral = np.pad(padded, ((1, 0), (1, 0)), mode="constant").cumsum(axis=0).cumsum(axis=1)
+    return (integral[k:, k:] - integral[:-k, k:] - integral[k:, :-k] + integral[:-k, :-k]).astype(np.float32)
+
+
+def _structure_tensor_tangent(energy: np.ndarray, radius: int) -> Tuple[np.ndarray, np.ndarray]:
+    gx, gy = _central_grad(energy)
+    jxx = _box_sum(gx * gx, radius)
+    jyy = _box_sum(gy * gy, radius)
+    jxy = _box_sum(gx * gy, radius)
+    grad_theta = 0.5 * np.arctan2(2.0 * jxy, jxx - jyy + 1e-12)
+    tangent = grad_theta + np.float32(math.pi * 0.5)
+    trace = jxx + jyy
+    coherence = np.sqrt((jxx - jyy) ** 2 + 4.0 * (jxy ** 2)) / np.maximum(trace, 1e-8)
+    return tangent.astype(np.float32), np.clip(coherence, 0.0, 1.0).astype(np.float32)
+
+
+def _select_energy_pixels(
+    energy: np.ndarray,
+    count: int,
+    min_score: float,
+    nms_radius_px: int,
+    max_candidates: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    h, w = energy.shape
+    total = int(h * w)
+    count = max(0, int(count))
+    if count <= 0:
+        return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=np.float32)
+    topk = int(max_candidates) if int(max_candidates) > 0 else max(count * 32, count)
+    topk = min(max(topk, count), total)
+    flat = energy.reshape(-1)
+    if topk < total:
+        candidates = np.argpartition(flat, -topk)[-topk:]
+        candidates = candidates[np.argsort(flat[candidates])[::-1]]
+    else:
+        candidates = np.argsort(flat)[::-1]
+    suppressed = np.zeros((h, w), dtype=bool)
+    r = max(0, int(nms_radius_px))
+    coords: List[Tuple[int, int]] = []
+    scores: List[float] = []
+    for idx in candidates.tolist():
+        score = float(flat[idx])
+        if score < float(min_score):
+            break
+        y = int(idx // w)
+        x = int(idx - y * w)
+        if suppressed[y, x]:
+            continue
+        coords.append((x, y))
+        scores.append(score)
+        if len(coords) >= count:
+            break
+        if r > 0:
+            suppressed[max(0, y - r) : min(h, y + r + 1), max(0, x - r) : min(w, x + r + 1)] = True
+        else:
+            suppressed[y, x] = True
+    if not coords:
+        return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=np.float32)
+    return np.asarray(coords, dtype=np.float32), np.asarray(scores, dtype=np.float32)
+
+
+def _cholesky_from_orientation(theta: np.ndarray, sigma_long: np.ndarray, sigma_short: np.ndarray) -> np.ndarray:
+    out = np.zeros((theta.shape[0], 3), dtype=np.float32)
+    for i in range(theta.shape[0]):
+        c = float(math.cos(float(theta[i])))
+        s = float(math.sin(float(theta[i])))
+        sl = max(float(sigma_long[i]), 1e-3)
+        ss = max(float(sigma_short[i]), 1e-3)
+        rot = np.asarray([[c, -s], [s, c]], dtype=np.float32)
+        cov = rot @ np.diag([sl * sl, ss * ss]).astype(np.float32) @ rot.T
+        chol = np.linalg.cholesky(cov + np.eye(2, dtype=np.float32) * 1e-5)
+        out[i, 0] = chol[0, 0]
+        out[i, 1] = chol[1, 0]
+        out[i, 2] = chol[1, 1]
+    return out
+
+
+def _target_init_gaussianimage(
+    model,
+    signed_target: np.ndarray,
+    residual: np.ndarray,
+    weight: np.ndarray,
+    residual_clip: float,
+    args: argparse.Namespace,
+) -> None:
+    h, w = signed_target.shape[:2]
+    n = int(model._xyz.shape[0])
+    energy = np.clip(np.abs(residual).mean(axis=2) / max(float(residual_clip), 1e-8), 0.0, 1.0)
+    energy = (energy * (np.clip(weight, 0.0, 1.0) ** max(float(args.init_weight_power), 0.0))).astype(np.float32)
+    coords, scores = _select_energy_pixels(
+        energy,
+        n,
+        float(args.init_min_score),
+        int(args.init_nms_radius_px),
+        int(args.init_max_candidates),
+    )
+    if coords.shape[0] < n:
+        missing = n - int(coords.shape[0])
+        rng = np.random.default_rng(12345)
+        extra_xy = np.stack(
+            [
+                rng.uniform(0.0, max(float(w - 1), 1.0), size=missing),
+                rng.uniform(0.0, max(float(h - 1), 1.0), size=missing),
+            ],
+            axis=1,
+        ).astype(np.float32)
+        coords = np.concatenate([coords, extra_xy], axis=0)
+        scores = np.concatenate([scores, np.zeros((missing,), dtype=np.float32)], axis=0)
+    xy_int = np.rint(coords).astype(np.int64)
+    xs = np.clip(xy_int[:, 0], 0, w - 1)
+    ys = np.clip(xy_int[:, 1], 0, h - 1)
+    tangent, coherence = _structure_tensor_tangent(energy, int(args.init_orientation_radius_px))
+    theta = tangent[ys, xs]
+    coh = coherence[ys, xs]
+    sigma_long = float(args.init_sigma_long_px) * (1.0 + float(args.init_coherence_long_boost) * coh)
+    sigma_short = np.full_like(sigma_long, float(args.init_sigma_short_px), dtype=np.float32)
+    cholesky = _cholesky_from_orientation(theta.astype(np.float32), sigma_long.astype(np.float32), sigma_short)
+    means = np.empty((n, 2), dtype=np.float32)
+    means[:, 0] = np.clip(coords[:, 0] / max(float(w - 1), 1.0) * 2.0 - 1.0, -0.999, 0.999)
+    means[:, 1] = np.clip(coords[:, 1] / max(float(h - 1), 1.0) * 2.0 - 1.0, -0.999, 0.999)
+    xyz = np.arctanh(means).astype(np.float32)
+    colors = signed_target[ys, xs, :].astype(np.float32)
+    bound = np.asarray([0.5, 0.0, 0.5], dtype=np.float32)[None, :]
+    cholesky_param = cholesky - bound
+    device = model._xyz.device
+    with torch.no_grad():
+        model._xyz.copy_(torch.from_numpy(xyz).to(device=device, dtype=model._xyz.dtype))
+        model._features_dc.copy_(torch.from_numpy(colors).to(device=device, dtype=model._features_dc.dtype))
+        if hasattr(model, "_cholesky"):
+            model._cholesky.copy_(torch.from_numpy(cholesky_param).to(device=device, dtype=model._cholesky.dtype))
+        if hasattr(model, "_opacity"):
+            model._opacity.fill_(1.0)
+        if hasattr(model, "background"):
+            model.background.fill_(0.5)
 
 
 def _import_gaussianimage(repo_root: Path, model_name: str):
@@ -203,6 +366,7 @@ def _target_signed_hf(
 def _fit_gaussianimage(
     module,
     signed_target: np.ndarray,
+    target_residual: np.ndarray,
     weight: np.ndarray,
     num_gaussians: int,
     model_name: str,
@@ -213,6 +377,7 @@ def _fit_gaussianimage(
     lambda_l1: float,
     lambda_l2: float,
     background_weight: float,
+    args: argparse.Namespace,
 ) -> Tuple[np.ndarray, object, List[float]]:
     if not torch.cuda.is_available():
         raise RuntimeError("GaussianImage fitting requires CUDA for diff_gaussian_rasterization.")
@@ -234,6 +399,17 @@ def _fit_gaussianimage(
         lr=float(lr),
         quantize=False,
     ).to(device)
+    if hasattr(model, "background"):
+        model.background.fill_(0.5)
+    if not bool(args.init_random):
+        _target_init_gaussianimage(
+            model,
+            signed_target,
+            target_residual,
+            weight,
+            float(args.residual_clip),
+            args,
+        )
     losses: List[float] = []
     for _ in range(int(iterations)):
         model.optimizer.zero_grad(set_to_none=True)
@@ -493,6 +669,7 @@ def main() -> None:
         signed_render, model, losses = _fit_gaussianimage(
             module,
             signed_target,
+            target_residual,
             weight,
             int(args.num_gaussians),
             str(args.model),
@@ -503,6 +680,7 @@ def main() -> None:
             float(args.lambda_l1),
             float(args.lambda_l2),
             float(args.background_weight),
+            args,
         )
         recon_residual = _signed_to_residual(signed_render, float(args.residual_clip))
         error = recon_residual - target_residual

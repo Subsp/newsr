@@ -40,6 +40,15 @@ LAMBDA_L1="${LAMBDA_L1:-0.5}"
 LAMBDA_L2="${LAMBDA_L2:-0.5}"
 BACKGROUND_WEIGHT="${BACKGROUND_WEIGHT:-0.005}"
 NEUTRAL_OUTSIDE_MASK="${NEUTRAL_OUTSIDE_MASK:-0}"
+INIT_RANDOM="${INIT_RANDOM:-0}"
+INIT_MIN_SCORE="${INIT_MIN_SCORE:-0.035}"
+INIT_NMS_RADIUS_PX="${INIT_NMS_RADIUS_PX:-2}"
+INIT_MAX_CANDIDATES="${INIT_MAX_CANDIDATES:-0}"
+INIT_WEIGHT_POWER="${INIT_WEIGHT_POWER:-0.5}"
+INIT_ORIENTATION_RADIUS_PX="${INIT_ORIENTATION_RADIUS_PX:-5}"
+INIT_SIGMA_LONG_PX="${INIT_SIGMA_LONG_PX:-5.0}"
+INIT_SIGMA_SHORT_PX="${INIT_SIGMA_SHORT_PX:-0.8}"
+INIT_COHERENCE_LONG_BOOST="${INIT_COHERENCE_LONG_BOOST:-0.75}"
 SAVE_PT="${SAVE_PT:-0}"
 
 for required in "${EXTERNAL_REPO_ROOT}" "${TARGET_DIR}" "${MASK_DIR}" "${ANCHOR_DIR}"; do
@@ -74,9 +83,21 @@ ARGS=(
   --lambda_l1 "${LAMBDA_L1}"
   --lambda_l2 "${LAMBDA_L2}"
   --background_weight "${BACKGROUND_WEIGHT}"
+  --init_min_score "${INIT_MIN_SCORE}"
+  --init_nms_radius_px "${INIT_NMS_RADIUS_PX}"
+  --init_max_candidates "${INIT_MAX_CANDIDATES}"
+  --init_weight_power "${INIT_WEIGHT_POWER}"
+  --init_orientation_radius_px "${INIT_ORIENTATION_RADIUS_PX}"
+  --init_sigma_long_px "${INIT_SIGMA_LONG_PX}"
+  --init_sigma_short_px "${INIT_SIGMA_SHORT_PX}"
+  --init_coherence_long_boost "${INIT_COHERENCE_LONG_BOOST}"
   --limit "${LIMIT}"
   --debug_limit "${DEBUG_LIMIT}"
 )
+
+if [[ "${INIT_RANDOM}" == "1" ]]; then
+  ARGS+=(--init_random)
+fi
 
 if [[ "${NEUTRAL_OUTSIDE_MASK}" == "1" ]]; then
   ARGS+=(--neutral_outside_mask)
