@@ -119,12 +119,13 @@ def _box_blur_rgb(image: np.ndarray, kernel: int) -> np.ndarray:
     ).astype(np.float32) / float(k * k)
 
 
-def _import_gaussianimage(repo_root: Path):
+def _import_gaussianimage(repo_root: Path, model_name: str):
     cholesky_py = repo_root / "gaussianimage_cholesky.py"
     rs_py = repo_root / "gaussianimage_rs.py"
-    if not cholesky_py.is_file() or not rs_py.is_file():
+    selected_py = cholesky_py if model_name == "cholesky" else rs_py
+    if not selected_py.is_file():
         raise FileNotFoundError(
-            f"GaussianImage model files not found under {repo_root}. "
+            f"GaussianImage model file not found under {repo_root}: {selected_py.name}. "
             "Clone it with: git clone --recursive https://github.com/Xinjie-Q/GaussianImage.git"
         )
     # GaussianImage imports quantize.py and pytorch_msssim at module import time,
@@ -141,8 +142,16 @@ def _import_gaussianimage(repo_root: Path):
         def _unused_msssim(*_args, **_kwargs):
             raise RuntimeError("pytorch_msssim is stubbed; this adapter does not use GaussianImage SSIM losses.")
 
+        class _UnusedSSIM:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def __call__(self, *_args, **_kwargs):
+                return _unused_msssim()
+
         msssim_stub.ms_ssim = _unused_msssim
         msssim_stub.ssim = _unused_msssim
+        msssim_stub.SSIM = _UnusedSSIM
         sys.modules["pytorch_msssim"] = msssim_stub
     sys.path.insert(0, str(repo_root))
     gsplat_root = repo_root / "gsplat"
@@ -157,16 +166,15 @@ def _import_gaussianimage(repo_root: Path):
         spec.loader.exec_module(module)
         return module
 
-    cholesky_module = _load(cholesky_py, "gaussianimage_cholesky")
+    if model_name == "cholesky":
+        cholesky_module = _load(cholesky_py, "gaussianimage_cholesky")
+        if not hasattr(cholesky_module, "GaussianImage_Cholesky"):
+            raise ImportError(f"Missing GaussianImage_Cholesky in {cholesky_py}")
+        return {"GaussianImage_Cholesky": cholesky_module.GaussianImage_Cholesky}
     rs_module = _load(rs_py, "gaussianimage_rs")
-    if not hasattr(cholesky_module, "GaussianImage_Cholesky"):
-        raise ImportError(f"Missing GaussianImage_Cholesky in {cholesky_py}")
     if not hasattr(rs_module, "GaussianImage_RS"):
         raise ImportError(f"Missing GaussianImage_RS in {rs_py}")
-    return {
-        "GaussianImage_Cholesky": cholesky_module.GaussianImage_Cholesky,
-        "GaussianImage_RS": rs_module.GaussianImage_RS,
-    }
+    return {"GaussianImage_RS": rs_module.GaussianImage_RS}
 
 
 def _target_signed_hf(
@@ -422,7 +430,7 @@ def main() -> None:
     output_dir = Path(args.output_dir).expanduser().resolve()
     if output_dir.exists() and any(output_dir.iterdir()) and not bool(args.overwrite):
         raise FileExistsError(f"Output dir is not empty; use --overwrite: {output_dir}")
-    module = _import_gaussianimage(repo_root)
+    module = _import_gaussianimage(repo_root, str(args.model))
 
     target_paths = _list_images(target_dir)
     anchor_paths = _list_images(anchor_dir)
