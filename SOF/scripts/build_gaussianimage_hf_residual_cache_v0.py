@@ -127,14 +127,23 @@ def _import_gaussianimage(repo_root: Path):
             f"GaussianImage model files not found under {repo_root}. "
             "Clone it with: git clone --recursive https://github.com/Xinjie-Q/GaussianImage.git"
         )
-    # GaussianImage imports quantize.py at module import time, but our HF fitting
-    # path always uses quantize=False. A tiny stub avoids pulling optional codec
-    # dependencies (vector_quantize_pytorch, constriction, compressai) for this
-    # diagnostic adapter.
+    # GaussianImage imports quantize.py and pytorch_msssim at module import time,
+    # but our HF fitting path always uses quantize=False and computes its own
+    # weighted L1/L2 loss. Tiny stubs avoid pulling optional codec/SSIM
+    # dependencies that would otherwise try to upgrade the existing torch env.
     if "quantize" not in sys.modules:
         stub = types.ModuleType("quantize")
         stub.__all__ = []
         sys.modules["quantize"] = stub
+    if "pytorch_msssim" not in sys.modules:
+        msssim_stub = types.ModuleType("pytorch_msssim")
+
+        def _unused_msssim(*_args, **_kwargs):
+            raise RuntimeError("pytorch_msssim is stubbed; this adapter does not use GaussianImage SSIM losses.")
+
+        msssim_stub.ms_ssim = _unused_msssim
+        msssim_stub.ssim = _unused_msssim
+        sys.modules["pytorch_msssim"] = msssim_stub
     sys.path.insert(0, str(repo_root))
     gsplat_root = repo_root / "gsplat"
     if gsplat_root.is_dir():
