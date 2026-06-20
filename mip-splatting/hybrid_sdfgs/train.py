@@ -449,6 +449,48 @@ def _extract_2d_sr_proposals(guidance_map, topk, min_value):
     return pixels, vals
 
 
+def _extract_2d_sr_ridge_proposals(guidance_map, topk, min_value, nms_radius_px):
+    """Select local maxima from a guidance map to avoid dense per-pixel seeding."""
+    if guidance_map is None:
+        return None, None
+    if guidance_map.ndim != 3 or guidance_map.shape[0] != 1:
+        raise ValueError(
+            f"guidance_map must be [1,H,W], got shape {tuple(guidance_map.shape)}"
+        )
+    radius = max(int(nms_radius_px), 0)
+    if radius <= 0:
+        return _extract_2d_sr_proposals(guidance_map, topk=topk, min_value=min_value)
+
+    guidance = guidance_map[:1].clamp(min=0.0)
+    flat = guidance.reshape(-1)
+    if flat.numel() == 0:
+        return None, None
+    kernel = radius * 2 + 1
+    pooled = torch_F.max_pool2d(guidance[None], kernel_size=kernel, stride=1, padding=radius)[0]
+    keep = (guidance >= pooled - 1e-12) & (guidance >= float(min_value))
+    keep_flat = keep.reshape(-1)
+    count = int(keep_flat.sum().item())
+    if count <= 0:
+        return None, None
+
+    k = min(max(int(topk), 0), count)
+    if k <= 0:
+        return None, None
+    candidate_idx = torch.nonzero(keep_flat, as_tuple=False).reshape(-1)
+    candidate_vals = flat[candidate_idx]
+    vals, order = torch.topk(candidate_vals, k=k, largest=True, sorted=False)
+    idx = candidate_idx[order]
+
+    h = guidance_map.shape[1]
+    w = guidance_map.shape[2]
+    y = torch.div(idx, w, rounding_mode="floor")
+    x = idx - y * w
+    pixels = torch.stack([x, y], dim=-1).to(dtype=torch.float32)
+    pixels[:, 0] = pixels[:, 0].clamp(min=0.0, max=float(w - 1))
+    pixels[:, 1] = pixels[:, 1].clamp(min=0.0, max=float(h - 1))
+    return pixels, vals
+
+
 def _extract_thresholded_sr_pixels(guidance_map, threshold, max_points):
     """Select all pixels above a threshold, with optional random cap."""
     if guidance_map is None:
@@ -866,6 +908,7 @@ def _build_prior_residual_seed_births(
     max_points,
     prior_delta_clip,
     guidance_threshold,
+    nms_radius_px,
     scale_multiplier,
     scale_mode,
     min_pixel_radius,
@@ -889,6 +932,7 @@ def _build_prior_residual_seed_births(
 ):
     metrics = {
         "hf_seed_threshold": float(guidance_threshold),
+        "hf_seed_nms_radius_px": float(max(int(nms_radius_px), 0)),
     }
     if (
         gaussians is None
@@ -914,7 +958,15 @@ def _build_prior_residual_seed_births(
     center_budget = int(max_points)
     if ray_fan_rays_eff > 1:
         center_budget = max(1, int(math.ceil(float(max_points) / float(ray_fan_rays_eff))))
-    if float(guidance_threshold) > 0.0:
+    if int(nms_radius_px) > 0:
+        min_guidance = max(float(guidance_threshold), float(torch.finfo(guidance_map.dtype).eps), 1e-8)
+        pixels_xy, guidance_vals = _extract_2d_sr_ridge_proposals(
+            guidance_map=guidance_map,
+            topk=int(center_budget),
+            min_value=min_guidance,
+            nms_radius_px=int(nms_radius_px),
+        )
+    elif float(guidance_threshold) > 0.0:
         pixels_xy, guidance_vals = _extract_thresholded_sr_pixels(
             guidance_map=guidance_map,
             threshold=float(guidance_threshold),
@@ -8989,6 +9041,7 @@ def training(
                         max_points=min(int(hybrid_args.prior_hf_seed_max_per_iter), remaining),
                         prior_delta_clip=float(hybrid_args.prior_delta_clip),
                         guidance_threshold=float(hybrid_args.prior_hf_seed_guidance_threshold),
+                        nms_radius_px=int(hybrid_args.prior_hf_seed_nms_radius_px),
                         scale_multiplier=float(hybrid_args.prior_hf_seed_scale_multiplier),
                         scale_mode=str(hybrid_args.prior_hf_seed_scale_mode),
                         min_pixel_radius=float(hybrid_args.prior_hf_seed_min_pixel_radius),
@@ -10415,6 +10468,7 @@ def make_parser():
     parser.add_argument("--prior_hf_seed_jitter_scale", type=float, default=0.15)
     parser.add_argument("--prior_hf_seed_color_residual_gain", type=float, default=1.0)
     parser.add_argument("--prior_hf_seed_guidance_threshold", type=float, default=0.0)
+    parser.add_argument("--prior_hf_seed_nms_radius_px", type=int, default=0)
     parser.add_argument("--prior_hf_seed_edge_highpass_kernel", type=int, default=0)
     parser.add_argument("--prior_hf_seed_edge_guidance_power", type=float, default=1.0)
     parser.add_argument("--prior_hf_seed_ray_fan_enable", action="store_true")
