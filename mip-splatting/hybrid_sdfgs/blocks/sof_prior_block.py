@@ -34,6 +34,7 @@ class SOFPriorConfig:
     prior_edge_contrast_radius: int = 1
     prior_edge_contrast_target_gain: float = 1.0
     prior_edge_contrast_target_clip: float = 0.0
+    prior_edge_subset_energy_weight: float = 0.0
     prior_edge_subset_lowfreq_weight: float = 0.0
 
 
@@ -460,14 +461,23 @@ class SOFPriorBlock:
 
         detail_alpha = max(0.0, min(1.0, float(detail_alpha)))
         carrier_high = highpass_image_chw(carrier_image, blur_kernel)
+        target_scaled = (detail_alpha * target_residual).detach()
         carrier_loss = compute_weighted_l1_loss(
             carrier_high,
-            (detail_alpha * target_residual).detach(),
+            target_scaled,
             confidence,
         )
         if carrier_loss is None:
             return None
         total_loss = float(self.cfg.prior_edge_detail_weight) * carrier_loss
+
+        energy_weight = float(self.cfg.prior_edge_subset_energy_weight)
+        if energy_weight > 0.0:
+            carrier_energy = torch.sqrt(torch.mean(carrier_high * carrier_high, dim=0) + 1e-8)
+            target_energy = torch.sqrt(torch.mean(target_scaled * target_scaled, dim=0) + 1e-8)
+            missing_energy = torch.clamp(target_energy - carrier_energy, min=0.0)
+            energy_loss = (missing_energy * confidence).sum() / confidence.sum().clamp_min(1.0)
+            total_loss = total_loss + energy_weight * energy_loss
 
         lowfreq_weight = float(self.cfg.prior_edge_subset_lowfreq_weight)
         if lowfreq_weight > 0.0:

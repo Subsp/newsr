@@ -6050,6 +6050,7 @@ def training(
                 prior_edge_contrast_radius=hybrid_args.prior_edge_contrast_radius,
                 prior_edge_contrast_target_gain=hybrid_args.prior_edge_contrast_target_gain,
                 prior_edge_contrast_target_clip=hybrid_args.prior_edge_contrast_target_clip,
+                prior_edge_subset_energy_weight=hybrid_args.prior_edge_subset_energy_weight,
                 prior_edge_subset_lowfreq_weight=hybrid_args.prior_edge_subset_lowfreq_weight,
             )
         )
@@ -6060,7 +6061,10 @@ def training(
             f"mode={hybrid_args.prior_edge_loss_mode} "
             f"edge_subset={hybrid_args.prior_edge_subset_mode} "
             f"full_w={hybrid_args.prior_edge_full_loss_weight:.3f} "
+            f"subset_energy={hybrid_args.prior_edge_subset_energy_weight:.3f} "
             f"subset_lf={hybrid_args.prior_edge_subset_lowfreq_weight:.3f} "
+            f"subset_opacity_floor={hybrid_args.prior_edge_subset_opacity_floor:.4f}/"
+            f"{hybrid_args.prior_edge_subset_opacity_floor_weight:.3f} "
             f"contrast={hybrid_args.prior_edge_contrast_weight:.3f} "
             f"hf_clip={hybrid_args.prior_edge_hf_residual_clip:.3f} "
             f"shape={hybrid_args.lambda_prior_edge_shape:.3f} "
@@ -8244,6 +8248,19 @@ def training(
                             detail_alpha=subset_alpha,
                             anchor_image=edge_anchor_image,
                         )
+                        opacity_floor = float(hybrid_args.prior_edge_subset_opacity_floor)
+                        opacity_floor_weight = float(hybrid_args.prior_edge_subset_opacity_floor_weight)
+                        if opacity_floor > 0.0 and opacity_floor_weight > 0.0:
+                            subset_opacity = gaussians.get_opacity[subset_mask].reshape(-1)
+                            if int(subset_opacity.numel()) > 0:
+                                floor_loss = torch.clamp(opacity_floor - subset_opacity, min=0.0).mean()
+                                subset_edge_loss = (
+                                    opacity_floor_weight * floor_loss
+                                    if subset_edge_loss is None
+                                    else subset_edge_loss + opacity_floor_weight * floor_loss
+                                )
+                                prior_metrics["sof_edge_subset_opacity_mean"] = subset_opacity.detach().mean().item()
+                                prior_metrics["sof_edge_subset_opacity_floor"] = floor_loss.detach().item()
                         if subset_edge_loss is not None:
                             loss_prior_edge = subset_edge_loss if loss_prior_edge is None else loss_prior_edge + subset_edge_loss
                             edge_alpha = subset_alpha if edge_alpha is None else edge_alpha
@@ -10333,7 +10350,10 @@ def make_parser():
         choices=["none", "source_prior", "source_added", "edge_touched", "source_prior_or_edge_touched"],
     )
     parser.add_argument("--prior_edge_full_loss_weight", type=float, default=1.0)
+    parser.add_argument("--prior_edge_subset_energy_weight", type=float, default=0.0)
     parser.add_argument("--prior_edge_subset_lowfreq_weight", type=float, default=0.0)
+    parser.add_argument("--prior_edge_subset_opacity_floor", type=float, default=0.0)
+    parser.add_argument("--prior_edge_subset_opacity_floor_weight", type=float, default=0.0)
     parser.add_argument("--prior_edge_subset_min_gaussians", type=int, default=16)
     parser.add_argument("--lambda_prior_edge_shape", type=float, default=0.0)
     parser.add_argument("--prior_edge_shape_min_gaussians", type=int, default=32)
