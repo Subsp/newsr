@@ -104,6 +104,8 @@ class Scene:
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+        if hasattr(self.gaussians, "save_tracking_metadata"):
+            self.gaussians.save_tracking_metadata(os.path.join(point_cloud_path, "gaussian_tags.pt"))
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]
