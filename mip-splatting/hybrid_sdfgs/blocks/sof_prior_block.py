@@ -34,6 +34,7 @@ class SOFPriorConfig:
     prior_edge_contrast_radius: int = 1
     prior_edge_contrast_target_gain: float = 1.0
     prior_edge_contrast_target_clip: float = 0.0
+    prior_edge_subset_lowfreq_weight: float = 0.0
 
 
 def _normalize_mask_hw(mask: Optional[torch.Tensor], *, dtype: torch.dtype, device: torch.device) -> Optional[torch.Tensor]:
@@ -401,6 +402,89 @@ class SOFPriorBlock:
             )
             if contrast_loss is not None:
                 total_loss = total_loss + contrast_weight * contrast_loss
+
+        return total_loss
+
+    def compute_prior_edge_hf_carrier_loss(
+        self,
+        carrier_image: torch.Tensor,
+        prior_target: torch.Tensor,
+        image_mask: Optional[torch.Tensor],
+        *,
+        detail_alpha: float,
+        anchor_image: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        image_mask = _normalize_mask_hw(image_mask, dtype=carrier_image.dtype, device=carrier_image.device)
+        if image_mask is None:
+            return None
+        if float(image_mask.sum().item()) <= 0:
+            return None
+        if anchor_image is None:
+            return None
+
+        blur_kernel = int(self.cfg.prior_edge_detail_blur_kernel)
+        anchor = anchor_image.detach()
+        prior_low = blur_image_chw(prior_target, blur_kernel)
+        anchor_low = blur_image_chw(anchor, blur_kernel)
+        prior_high = highpass_image_chw(prior_target, blur_kernel)
+        anchor_high = highpass_image_chw(anchor, blur_kernel)
+
+        target_residual = prior_high - anchor_high
+        residual_clip = float(self.cfg.prior_edge_hf_residual_clip)
+        if residual_clip > 0.0:
+            target_residual = target_residual.clamp(min=-residual_clip, max=residual_clip)
+
+        lowfreq_diff = torch.abs(prior_low - anchor_low).mean(dim=0)
+        lowfreq_threshold = float(self.cfg.prior_edge_lowfreq_threshold)
+        if lowfreq_threshold > 0.0:
+            confidence = torch.clamp(1.0 - lowfreq_diff / lowfreq_threshold, min=0.0, max=1.0)
+        else:
+            confidence = torch.ones_like(image_mask)
+
+        detail_min_gain = float(self.cfg.prior_edge_detail_min_gain)
+        if detail_min_gain > 0.0:
+            target_detail = torch.abs(target_residual).mean(dim=0)
+            detail_confidence = torch.clamp(
+                (target_detail - detail_min_gain) / detail_min_gain,
+                min=0.0,
+                max=1.0,
+            )
+            confidence = confidence * detail_confidence
+
+        confidence_power = float(self.cfg.prior_edge_confidence_power)
+        if confidence_power != 1.0:
+            confidence = torch.clamp(confidence, min=0.0, max=1.0).pow(confidence_power)
+        confidence = confidence * image_mask
+        if float(confidence.sum().item()) < float(self.cfg.prior_edge_min_pixels):
+            return None
+
+        detail_alpha = max(0.0, min(1.0, float(detail_alpha)))
+        carrier_high = highpass_image_chw(carrier_image, blur_kernel)
+        carrier_loss = compute_weighted_l1_loss(
+            carrier_high,
+            (detail_alpha * target_residual).detach(),
+            confidence,
+        )
+        if carrier_loss is None:
+            return None
+        total_loss = float(self.cfg.prior_edge_detail_weight) * carrier_loss
+
+        lowfreq_weight = float(self.cfg.prior_edge_subset_lowfreq_weight)
+        if lowfreq_weight > 0.0:
+            carrier_low = blur_image_chw(carrier_image, blur_kernel)
+            low_loss = compute_weighted_l1_loss(carrier_low, torch.zeros_like(carrier_low), image_mask)
+            if low_loss is not None:
+                total_loss = total_loss + lowfreq_weight * low_loss
+
+        grad_weight = float(self.cfg.prior_edge_grad_weight)
+        if grad_weight > 0.0:
+            grad_loss = compute_weighted_gradient_l1_loss(
+                carrier_high,
+                (detail_alpha * target_residual).detach(),
+                confidence,
+            )
+            if grad_loss is not None:
+                total_loss = total_loss + grad_weight * grad_loss
 
         return total_loss
 

@@ -2021,6 +2021,49 @@ def count_trainable_source_tag_gaussians(gaussians, source_update_mask) -> int:
     return int(source_update_mask.sum().item())
 
 
+def build_prior_edge_subset_mask(gaussians, mode: str, edge_touch_mask=None):
+    mode = str(mode or "none").strip().lower()
+    if mode in {"", "none", "off", "0"}:
+        return None
+    total = int(gaussians.get_xyz.shape[0])
+    device = gaussians.get_xyz.device
+    source_tag = getattr(gaussians, "_source_tag", None)
+    if source_tag is not None and int(source_tag.shape[0]) != total:
+        source_tag = None
+    touch = None
+    if edge_touch_mask is not None:
+        touch = edge_touch_mask.to(device=device, dtype=torch.bool).reshape(-1)
+        if int(touch.shape[0]) != total:
+            touch = None
+
+    if mode == "source_prior":
+        if source_tag is None:
+            return None
+        return source_tag.to(device=device) == int(GaussianSourceTag.PRIOR_INJECTED)
+    if mode == "source_added":
+        if source_tag is None:
+            return None
+        return source_tag.to(device=device) != int(GaussianSourceTag.ORIGINAL)
+    if mode == "edge_touched":
+        return touch
+    if mode == "source_prior_or_edge_touched":
+        masks = []
+        if source_tag is not None:
+            masks.append(source_tag.to(device=device) == int(GaussianSourceTag.PRIOR_INJECTED))
+        if touch is not None:
+            masks.append(touch)
+        if not masks:
+            return None
+        out = masks[0]
+        for mask in masks[1:]:
+            out = out | mask
+        return out
+    raise ValueError(
+        "Unsupported --prior_edge_subset_mode="
+        f"{mode}; use none/source_prior/source_added/edge_touched/source_prior_or_edge_touched."
+    )
+
+
 def _select_evenly_spaced_views(cameras, max_views: int):
     cameras = list(cameras)
     max_views = int(max_views)
@@ -6007,6 +6050,7 @@ def training(
                 prior_edge_contrast_radius=hybrid_args.prior_edge_contrast_radius,
                 prior_edge_contrast_target_gain=hybrid_args.prior_edge_contrast_target_gain,
                 prior_edge_contrast_target_clip=hybrid_args.prior_edge_contrast_target_clip,
+                prior_edge_subset_lowfreq_weight=hybrid_args.prior_edge_subset_lowfreq_weight,
             )
         )
         print(
@@ -6014,6 +6058,9 @@ def training(
             f"local={hybrid_args.lambda_prior_local:.3f} "
             f"edge={hybrid_args.lambda_prior_edge:.3f} "
             f"mode={hybrid_args.prior_edge_loss_mode} "
+            f"edge_subset={hybrid_args.prior_edge_subset_mode} "
+            f"full_w={hybrid_args.prior_edge_full_loss_weight:.3f} "
+            f"subset_lf={hybrid_args.prior_edge_subset_lowfreq_weight:.3f} "
             f"contrast={hybrid_args.prior_edge_contrast_weight:.3f} "
             f"hf_clip={hybrid_args.prior_edge_hf_residual_clip:.3f} "
             f"shape={hybrid_args.lambda_prior_edge_shape:.3f} "
@@ -8123,26 +8170,6 @@ def training(
                             1.0 if edge_seed_feature_pack.get("guidance") is not None else 0.0
                         )
                         seed_gate_diag["hf_seed_edge_pack"] = 1.0
-                lowfreq_anchor = sof_gt_image if hybrid_args.prior_edge_lowfreq_anchor == "gt" else None
-                loss_prior_edge, edge_alpha = sof_prior_block.compute_edge_loss(
-                    render_image=render_for_sof_prior,
-                    prior_image=edge_prior_image,
-                    prior_mask=edge_prior_mask,
-                    iteration=iteration,
-                    train_start_iter=train_start_iter,
-                    lowfreq_anchor=lowfreq_anchor,
-                    anchor_image=edge_anchor_image,
-                )
-                if loss_prior_edge is not None:
-                    weighted_prior_edge = hybrid_args.lambda_prior_edge * loss_prior_edge
-                    if current_prior_loss_update_mask is not None:
-                        masked_prior_loss = weighted_prior_edge if masked_prior_loss is None else masked_prior_loss + weighted_prior_edge
-                    else:
-                        loss = loss + weighted_prior_edge
-                    prior_metrics["sof_edge"] = loss_prior_edge.detach().item()
-                if edge_alpha is not None:
-                    prior_metrics["sof_edge_alpha"] = float(edge_alpha)
-
                 edge_touch_mask = sof_prior_block.build_touch_mask(
                     viewpoint_cam=camera_for_sof_prior,
                     gaussians=gaussians,
@@ -8154,7 +8181,6 @@ def training(
                     touch_update_mask = combine_gaussian_update_masks(external_update_mask, current_prior_loss_update_mask)
                     if touch_update_mask is not None:
                         edge_touch_mask = edge_touch_mask & touch_update_mask
-                    edge_touch_mask_for_local_surface = edge_touch_mask
                     if hasattr(gaussians, "mark_edge_touched"):
                         gaussians.mark_edge_touched(edge_touch_mask, iteration)
                     visible_count = float(
@@ -8165,6 +8191,78 @@ def training(
                     touched_count = float(edge_touch_mask.sum().item())
                     prior_metrics["sof_edge_touch_ratio"] = touched_count / max(visible_count, 1.0)
                     prior_metrics["sof_edge_touched"] = touched_count
+
+                lowfreq_anchor = sof_gt_image if hybrid_args.prior_edge_lowfreq_anchor == "gt" else None
+                loss_prior_edge = None
+                edge_alpha = None
+                full_loss_weight = max(0.0, float(getattr(hybrid_args, "prior_edge_full_loss_weight", 1.0)))
+                if full_loss_weight > 0.0:
+                    full_edge_loss, edge_alpha = sof_prior_block.compute_edge_loss(
+                        render_image=render_for_sof_prior,
+                        prior_image=edge_prior_image,
+                        prior_mask=edge_prior_mask,
+                        iteration=iteration,
+                        train_start_iter=train_start_iter,
+                        lowfreq_anchor=lowfreq_anchor,
+                        anchor_image=edge_anchor_image,
+                    )
+                    if full_edge_loss is not None:
+                        loss_prior_edge = full_loss_weight * full_edge_loss
+                        prior_metrics["sof_edge_full"] = full_edge_loss.detach().item()
+                        prior_metrics["sof_edge_full_w"] = float(full_loss_weight)
+
+                subset_mode = str(getattr(hybrid_args, "prior_edge_subset_mode", "none")).strip().lower()
+                if (
+                    subset_mode not in {"", "none", "off", "0"}
+                    and edge_prior_image is not None
+                    and edge_prior_mask is not None
+                    and edge_anchor_image is not None
+                    and int(iteration) >= int(hybrid_args.prior_edge_from_iter)
+                ):
+                    subset_mask = build_prior_edge_subset_mask(
+                        gaussians,
+                        subset_mode,
+                        edge_touch_mask=edge_touch_mask,
+                    )
+                    subset_count = 0 if subset_mask is None else int(subset_mask.sum().item())
+                    prior_metrics["sof_edge_subset_count"] = float(subset_count)
+                    if subset_mask is not None and subset_count >= int(hybrid_args.prior_edge_subset_min_gaussians):
+                        edge_subset_gaussians = GaussianSubsetView(gaussians, subset_mask)
+                        edge_subset_pkg = train_render_fn(
+                            camera_for_sof_prior,
+                            edge_subset_gaussians,
+                            pipe,
+                            torch.zeros_like(background),
+                            kernel_size=dataset.kernel_size,
+                            subpixel_offset=(subpixel_offset if camera_for_sof_prior is viewpoint_cam else None),
+                        )
+                        subset_alpha = sof_prior_block.get_prior_edge_detail_alpha(iteration, train_start_iter)
+                        subset_edge_loss = sof_prior_block.compute_prior_edge_hf_carrier_loss(
+                            carrier_image=edge_subset_pkg["render"],
+                            prior_target=edge_prior_image,
+                            image_mask=edge_prior_mask,
+                            detail_alpha=subset_alpha,
+                            anchor_image=edge_anchor_image,
+                        )
+                        if subset_edge_loss is not None:
+                            loss_prior_edge = subset_edge_loss if loss_prior_edge is None else loss_prior_edge + subset_edge_loss
+                            edge_alpha = subset_alpha if edge_alpha is None else edge_alpha
+                            prior_metrics["sof_edge_subset"] = subset_edge_loss.detach().item()
+                            prior_metrics["sof_edge_subset_alpha"] = float(subset_alpha)
+                    else:
+                        prior_metrics["sof_edge_subset_skip"] = 1.0
+                if loss_prior_edge is not None:
+                    weighted_prior_edge = hybrid_args.lambda_prior_edge * loss_prior_edge
+                    if current_prior_loss_update_mask is not None:
+                        masked_prior_loss = weighted_prior_edge if masked_prior_loss is None else masked_prior_loss + weighted_prior_edge
+                    else:
+                        loss = loss + weighted_prior_edge
+                    prior_metrics["sof_edge"] = loss_prior_edge.detach().item()
+                if edge_alpha is not None:
+                    prior_metrics["sof_edge_alpha"] = float(edge_alpha)
+
+                if edge_touch_mask is not None:
+                    edge_touch_mask_for_local_surface = edge_touch_mask
                     edge_shape_surface_mask = (
                         layer_frequency_regularizer.surface_mask
                         if layer_frequency_regularizer is not None
@@ -10228,6 +10326,15 @@ def make_parser():
     parser.add_argument("--prior_edge_contrast_radius", type=int, default=1)
     parser.add_argument("--prior_edge_contrast_target_gain", type=float, default=1.0)
     parser.add_argument("--prior_edge_contrast_target_clip", type=float, default=0.0)
+    parser.add_argument(
+        "--prior_edge_subset_mode",
+        type=str,
+        default="none",
+        choices=["none", "source_prior", "source_added", "edge_touched", "source_prior_or_edge_touched"],
+    )
+    parser.add_argument("--prior_edge_full_loss_weight", type=float, default=1.0)
+    parser.add_argument("--prior_edge_subset_lowfreq_weight", type=float, default=0.0)
+    parser.add_argument("--prior_edge_subset_min_gaussians", type=int, default=16)
     parser.add_argument("--lambda_prior_edge_shape", type=float, default=0.0)
     parser.add_argument("--prior_edge_shape_min_gaussians", type=int, default=32)
     parser.add_argument("--prior_edge_shape_thin_ratio", type=float, default=0.35)
