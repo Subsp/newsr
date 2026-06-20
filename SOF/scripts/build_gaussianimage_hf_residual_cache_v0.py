@@ -7,6 +7,7 @@ import importlib.util
 import json
 import math
 import sys
+import types
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -42,6 +43,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--background_weight", type=float, default=0.02)
     parser.add_argument("--num_gaussians", type=int, default=4096)
     parser.add_argument("--model", default="cholesky", choices=["cholesky", "rs"])
+    parser.add_argument("--optimizer", default="adam", choices=["adam", "adan"])
     parser.add_argument("--iterations", type=int, default=700)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--loss", default="l1_l2", choices=["l1", "l2", "l1_l2"])
@@ -125,7 +127,18 @@ def _import_gaussianimage(repo_root: Path):
             f"GaussianImage model files not found under {repo_root}. "
             "Clone it with: git clone --recursive https://github.com/Xinjie-Q/GaussianImage.git"
         )
+    # GaussianImage imports quantize.py at module import time, but our HF fitting
+    # path always uses quantize=False. A tiny stub avoids pulling optional codec
+    # dependencies (vector_quantize_pytorch, constriction, compressai) for this
+    # diagnostic adapter.
+    if "quantize" not in sys.modules:
+        stub = types.ModuleType("quantize")
+        stub.__all__ = []
+        sys.modules["quantize"] = stub
     sys.path.insert(0, str(repo_root))
+    gsplat_root = repo_root / "gsplat"
+    if gsplat_root.is_dir():
+        sys.path.insert(0, str(gsplat_root))
 
     def _load(path: Path, module_name: str):
         spec = importlib.util.spec_from_file_location(module_name, path)
@@ -178,6 +191,7 @@ def _fit_gaussianimage(
     model_name: str,
     iterations: int,
     lr: float,
+    optimizer: str,
     loss_name: str,
     lambda_l1: float,
     lambda_l2: float,
@@ -193,7 +207,7 @@ def _fit_gaussianimage(
     model_cls = module["GaussianImage_Cholesky"] if model_name == "cholesky" else module["GaussianImage_RS"]
     model = model_cls(
         loss_type="L2",
-        opt_type="adan",
+        opt_type=str(optimizer),
         num_points=int(num_gaussians),
         H=int(h),
         W=int(w),
@@ -466,6 +480,7 @@ def main() -> None:
             str(args.model),
             int(args.iterations),
             float(args.lr),
+            str(args.optimizer),
             str(args.loss),
             float(args.lambda_l1),
             float(args.lambda_l2),
