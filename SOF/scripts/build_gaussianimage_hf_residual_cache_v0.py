@@ -52,7 +52,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--init_random", action="store_true")
     parser.add_argument("--neutral_outside_mask", action="store_true")
     parser.add_argument("--no_neutral_outside_mask", dest="neutral_outside_mask", action="store_false")
-    parser.set_defaults(neutral_outside_mask=True)
+    parser.set_defaults(neutral_outside_mask=False)
     parser.add_argument("--save_pt", action="store_true")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--debug_limit", type=int, default=24)
@@ -392,16 +392,17 @@ def _write_sheet(
     error: np.ndarray,
     weight: np.ndarray,
     primitive_overlay: np.ndarray,
+    residual_clip: float,
 ) -> None:
-    target_abs = _abs_vis(target_residual, 0.08)
-    recon_abs = _abs_vis(recon_residual, 0.08)
+    target_abs = _abs_vis(target_residual, residual_clip)
+    recon_abs = _abs_vis(recon_residual, residual_clip)
     panels = [
         _panel(signed_target, "target signed HF"),
         _panel(signed_render, "GaussianImage signed HF"),
         _panel(target_abs, "target abs HF"),
         _panel(recon_abs, "GaussianImage abs HF"),
         _panel(np.repeat(np.clip(weight[..., None], 0.0, 1.0), 3, axis=2), "weighted trust edge"),
-        _panel(_abs_vis(error, 0.08), "abs residual error"),
+        _panel(_abs_vis(error, residual_clip), "abs residual error"),
         _panel(_overlay(target_abs[..., 0], recon_abs[..., 0], weight), "overlay target=red 2DGS=cyan"),
         _panel(primitive_overlay, "exported 2D Gaussian primitives"),
     ]
@@ -529,6 +530,7 @@ def main() -> None:
                 error,
                 weight,
                 primitive_overlay,
+                float(args.residual_clip),
             )
         np.savez_compressed(dirs["primitives"] / f"{stem}.npz", **primitives, losses=np.asarray(losses, dtype=np.float32))
         if bool(args.save_pt):
