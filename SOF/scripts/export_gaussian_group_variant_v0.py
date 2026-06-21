@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import math
 import sys
@@ -57,6 +58,16 @@ from export_gaussian_mask_subset_v0 import (
     _save_rgb,
     _select_uniform,
 )
+
+
+def _make_scene(dataset, gaussians, *, load_iteration: int):
+    kwargs = {"load_iteration": load_iteration, "shuffle": False}
+    params = inspect.signature(Scene.__init__).parameters
+    if "skip_test" in params:
+        kwargs["skip_test"] = False
+    if "skip_train" in params:
+        kwargs["skip_train"] = False
+    return Scene(dataset, gaussians, **kwargs)
 
 
 def _save_gray(path: Path, image_hw: torch.Tensor) -> None:
@@ -323,7 +334,7 @@ def export_variant(
 ) -> Dict[str, object]:
     dataset = _build_dataset_args(str(scene_root), str(model_path), images_subdir, white_background)
     gaussians = GaussianModel(dataset.sh_degree)
-    scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False, skip_test=False, skip_train=False)
+    scene = _make_scene(dataset, gaussians, load_iteration=iteration)
     loaded_iter = int(scene.loaded_iter if scene.loaded_iter is not None else iteration)
     selected_mask = _load_selection_mask(
         model_path=model_path,
@@ -358,14 +369,7 @@ def export_variant(
 
     render_dataset = _build_dataset_args(str(scene_root), str(variant_root), images_subdir, white_background)
     render_gaussians = GaussianModel(render_dataset.sh_degree)
-    render_scene = Scene(
-        render_dataset,
-        render_gaussians,
-        load_iteration=loaded_iter,
-        shuffle=False,
-        skip_test=False,
-        skip_train=False,
-    )
+    render_scene = _make_scene(render_dataset, render_gaussians, load_iteration=loaded_iter)
     render_gaussians.compute_3D_filter(render_scene.getTrainCameras().copy(), CUDA=False)
     background = torch.tensor([1, 1, 1] if white_background else [0, 0, 0], dtype=torch.float32, device="cuda")
 
