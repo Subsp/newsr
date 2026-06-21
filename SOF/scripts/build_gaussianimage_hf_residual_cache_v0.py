@@ -1029,6 +1029,10 @@ def main() -> None:
         "rgb_delta_recon": output_dir / "rgb_delta_recon",
         "rgb_delta_apply": output_dir / "rgb_delta_apply",
         "rgb_delta_apply_error": output_dir / "rgb_delta_apply_error",
+        "rgb_delta_recon_trust": output_dir / "rgb_delta_recon_trust",
+        "rgb_delta_apply_trust": output_dir / "rgb_delta_apply_trust",
+        "rgb_delta_apply_trust_error": output_dir / "rgb_delta_apply_trust_error",
+        "rgb_delta_extra_outside": output_dir / "rgb_delta_extra_outside",
         "rgb_target_hf": output_dir / "rgb_target_hf",
         "rgb_recon_hf": output_dir / "rgb_recon_hf",
         "rgb_recon_hf_weighted": output_dir / "rgb_recon_hf_weighted",
@@ -1170,6 +1174,18 @@ def main() -> None:
         error = recon_residual - target_residual
         target_abs = np.clip(np.abs(target_residual).mean(axis=2) / max(float(args.residual_clip), 1e-8), 0.0, 1.0)
         recon_abs = np.clip(np.abs(recon_residual).mean(axis=2) / max(float(args.residual_clip), 1e-8), 0.0, 1.0)
+        recon_residual_trust = recon_residual * np.clip(weight[..., None], 0.0, 1.0)
+        signed_render_trust = np.clip(
+            0.5 + recon_residual_trust / (2.0 * max(float(args.residual_clip), 1e-8)),
+            0.0,
+            1.0,
+        ).astype(np.float32)
+        rgb_render_trust = np.clip(anchor + recon_residual_trust, 0.0, 1.0)
+        extra_outside = np.clip(
+            np.abs(recon_residual).mean(axis=2) * (1.0 - np.clip(weight, 0.0, 1.0)) / max(float(args.residual_clip), 1e-8),
+            0.0,
+            1.0,
+        )
         overlay = _overlay(target_abs, recon_abs, weight)
         target_rgb_hf = _rgb_with_hf(anchor, target_residual)
         recon_rgb_hf = _rgb_with_hf(anchor, recon_residual)
@@ -1210,6 +1226,10 @@ def main() -> None:
         _save_rgb(dirs["rgb_delta_recon"] / f"{stem}.png", signed_render)
         _save_rgb(dirs["rgb_delta_apply"] / f"{stem}.png", rgb_render)
         _save_rgb(dirs["rgb_delta_apply_error"] / f"{stem}.png", np.repeat(np.clip(np.abs(rgb_render - target).mean(axis=2, keepdims=True) * 4.0, 0.0, 1.0), 3, axis=2))
+        _save_rgb(dirs["rgb_delta_recon_trust"] / f"{stem}.png", signed_render_trust)
+        _save_rgb(dirs["rgb_delta_apply_trust"] / f"{stem}.png", rgb_render_trust)
+        _save_rgb(dirs["rgb_delta_apply_trust_error"] / f"{stem}.png", np.repeat(np.clip(np.abs(rgb_render_trust - target).mean(axis=2, keepdims=True) * 4.0, 0.0, 1.0), 3, axis=2))
+        _save_gray(dirs["rgb_delta_extra_outside"] / f"{stem}.png", extra_outside)
         _save_rgb(dirs["rgb_target_hf"] / f"{stem}.png", target_rgb_hf)
         _save_rgb(dirs["rgb_recon_hf"] / f"{stem}.png", recon_rgb_hf)
         _save_rgb(dirs["rgb_recon_hf_weighted"] / f"{stem}.png", recon_rgb_hf_weighted)
