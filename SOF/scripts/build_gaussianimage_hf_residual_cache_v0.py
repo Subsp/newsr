@@ -41,9 +41,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--confidence_power", type=float, default=1.5)
     parser.add_argument("--mask_power", type=float, default=1.0)
     parser.add_argument("--background_weight", type=float, default=0.02)
-    parser.add_argument("--fit_target_mode", default="hf_residual", choices=["hf_residual", "rgb", "rgb_delta"])
+    parser.add_argument("--fit_target_mode", default="hf_residual", choices=["hf_residual", "rgb", "rgb_delta", "evidence_rgb"])
     parser.add_argument("--rgb_loss_weight_mode", default="full", choices=["full", "trust", "trust_plus_background"])
     parser.add_argument("--output_profile", default="full", choices=["full", "carrier_only"])
+    parser.add_argument("--model_background", type=float, default=0.5)
     parser.add_argument("--num_gaussians", type=int, default=4096)
     parser.add_argument("--model", default="cholesky", choices=["cholesky", "rs"])
     parser.add_argument("--optimizer", default="adam", choices=["adam", "adan"])
@@ -479,7 +480,7 @@ def _target_init_gaussianimage(
         if hasattr(model, "_opacity"):
             model._opacity.fill_(1.0)
         if hasattr(model, "background"):
-            model.background.fill_(0.5)
+            model.background.fill_(float(args.model_background))
     return {
         "means_norm": means.astype(np.float32),
         "cholesky": cholesky.astype(np.float32),
@@ -629,7 +630,7 @@ def _fit_gaussianimage(
     ).to(device)
     if hasattr(model, "background"):
         with torch.no_grad():
-            model.background.fill_(0.5)
+            model.background.fill_(float(args.model_background))
     init_meta: Dict[str, np.ndarray] = {}
     if not bool(args.init_random):
         init_meta = _target_init_gaussianimage(
@@ -1043,6 +1044,10 @@ def main() -> None:
         "carrier_rgb_target": output_dir / "carrier_rgb_target",
         "carrier_rgb_anchor": output_dir / "carrier_rgb_anchor",
         "carrier_rgb_target_over_anchor": output_dir / "carrier_rgb_target_over_anchor",
+        "evidence_target": output_dir / "evidence_target",
+        "evidence_render": output_dir / "evidence_render",
+        "evidence_alpha": output_dir / "evidence_alpha",
+        "evidence_primitives": output_dir / "evidence_primitives",
         "gs_delta_signed": output_dir / "gs_delta_signed",
         "gs_delta_rgb_signed": output_dir / "gs_delta_rgb_signed",
         "gs_delta_rgb_pos": output_dir / "gs_delta_rgb_pos",
@@ -1077,6 +1082,10 @@ def main() -> None:
             "gs_delta_abs": dirs["gs_delta_abs"],
             "gs_delta_alpha": dirs["gs_delta_alpha"],
             "gs_delta_primitives": dirs["gs_delta_primitives"],
+            "evidence_target": dirs["evidence_target"],
+            "evidence_render": dirs["evidence_render"],
+            "evidence_alpha": dirs["evidence_alpha"],
+            "evidence_primitives": dirs["evidence_primitives"],
             "primitives": dirs["primitives"],
         }
         if bool(args.save_pt):
@@ -1141,6 +1150,18 @@ def main() -> None:
             else:
                 fit_weight = weight
             init_color_image = None
+        elif str(args.fit_target_mode) == "evidence_rgb":
+            signed_target = target
+            target_residual = target
+            fit_target = target
+            weight = np.clip(mask, 0.0, 1.0) ** max(float(args.mask_power), 0.0)
+            if str(args.rgb_loss_weight_mode) == "full":
+                fit_weight = np.ones_like(weight, dtype=np.float32)
+            elif str(args.rgb_loss_weight_mode) == "trust_plus_background":
+                fit_weight = np.clip(weight + float(args.background_weight), 0.0, 1.0).astype(np.float32)
+            else:
+                fit_weight = weight
+            init_color_image = target
         elif str(args.fit_target_mode) == "rgb":
             signed_target = signed_hf_target
             target_residual = hf_target_residual
@@ -1180,6 +1201,11 @@ def main() -> None:
             recon_residual = _signed_to_residual(signed_render, float(args.residual_clip))
             rgb_render = np.clip(anchor + recon_residual, 0.0, 1.0)
             rgb_l1 = _weighted_l1(rgb_render, target, np.ones_like(weight, dtype=np.float32))
+        elif str(args.fit_target_mode) == "evidence_rgb":
+            rgb_render = fit_render
+            recon_residual = rgb_render
+            signed_render = fit_render
+            rgb_l1 = _weighted_l1(rgb_render, target, weight)
         elif str(args.fit_target_mode) == "rgb":
             rgb_render = fit_render
             recon_residual = float(args.detail_alpha) * (
@@ -1255,6 +1281,11 @@ def main() -> None:
             _save_gray(dirs["gs_delta_abs"] / f"{stem}.png", recon_abs)
             _save_gray(dirs["gs_delta_alpha"] / f"{stem}.png", carrier_alpha)
             _save_rgb(dirs["gs_delta_primitives"] / f"{stem}.png", primitive_overlay)
+        if str(args.fit_target_mode) == "evidence_rgb":
+            _save_rgb(dirs["evidence_target"] / f"{stem}.png", target)
+            _save_rgb(dirs["evidence_render"] / f"{stem}.png", rgb_render)
+            _save_gray(dirs["evidence_alpha"] / f"{stem}.png", carrier_alpha)
+            _save_rgb(dirs["evidence_primitives"] / f"{stem}.png", primitive_overlay)
         if str(args.output_profile) != "carrier_only":
             _save_rgb(dirs["target_hf"] / f"{stem}.png", signed_target)
             _save_rgb(dirs["recon_hf"] / f"{stem}.png", signed_render)
