@@ -9,6 +9,7 @@ SCENE_NAME="${SCENE_NAME:-kitchen}"
 SCENE_ROOT="${SCENE_ROOT:-${WORK_ROOT}/${SCENE_NAME}}"
 SCENE_ASSET_ROOT="${SCENE_ASSET_ROOT:-${SCENE_ROOT}/_hrgsrefiner_assets}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
+MIPSPLATTING_ROOT="${MIPSPLATTING_ROOT:-$(cd -- "${SOF_ROOT}/.." && pwd)/mip-splatting}"
 
 BASE_EXPERIMENT_NAME="${BASE_EXPERIMENT_NAME:-mip30k_rerun_check_directsrc_r1_v0}"
 BASE_MODEL_DIR="${BASE_MODEL_DIR:-${SCENE_ASSET_ROOT}/kitchen_mip_vanilla_images8_v1/${BASE_EXPERIMENT_NAME}}"
@@ -117,7 +118,7 @@ if [[ ! -f "${NEWBORN_PLY}" ]]; then
 fi
 
 cd "${SOF_ROOT}"
-export PYTHONPATH="${SOF_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${SOF_ROOT}:${MIPSPLATTING_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 if [[ -z "${MERGE_SCRIPT}" ]]; then
   if [[ -f "${SOF_ROOT}/merge_gaussian_plys_v0.py" ]]; then
     MERGE_SCRIPT="${SOF_ROOT}/merge_gaussian_plys_v0.py"

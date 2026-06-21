@@ -3,11 +3,21 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 from argparse import ArgumentParser
 from pathlib import Path
 
 import torch
 from torch import nn
+
+SCRIPT_PATH = Path(__file__).resolve()
+SOF_ROOT = SCRIPT_PATH.parents[1]
+REPO_ROOT = SOF_ROOT.parent
+for candidate in (SOF_ROOT, REPO_ROOT / "mip-splatting"):
+    if candidate.is_dir():
+        candidate_str = str(candidate)
+        if candidate_str not in sys.path:
+            sys.path.insert(0, candidate_str)
 
 from arguments import ModelParams
 from scene.gaussian_model import GaussianModel, GaussianSourceTag
@@ -40,20 +50,31 @@ def copy_render_config(src_model_path: str, dst_model_path: Path) -> None:
 
 
 def concat_tracking(base: GaussianModel, extra: GaussianModel):
-    return {
+    state = {
         "source_tag": torch.cat((base._source_tag, extra._source_tag), dim=0),
         "seed_id": torch.cat((base._seed_id, extra._seed_id), dim=0),
         "generation": torch.cat((base._generation, extra._generation), dim=0),
         "edge_touched": torch.cat((base._edge_touched, extra._edge_touched), dim=0),
         "edge_touch_iter": torch.cat((base._edge_touch_iter, extra._edge_touch_iter), dim=0),
     }
+    if hasattr(base, "_root_id") and hasattr(extra, "_root_id"):
+        state["root_id"] = torch.cat((base._root_id, extra._root_id), dim=0)
+    return state
+
+
+def new_gaussian_like(base: GaussianModel) -> GaussianModel:
+    if hasattr(base, "use_SBs"):
+        return GaussianModel(base.max_sh_degree, use_SBs=base.use_SBs)
+    return GaussianModel(base.max_sh_degree)
 
 
 def merge_models(base: GaussianModel, extra: GaussianModel) -> GaussianModel:
-    if base.use_SBs != extra.use_SBs:
+    base_use_sbs = getattr(base, "use_SBs", None)
+    extra_use_sbs = getattr(extra, "use_SBs", None)
+    if base_use_sbs is not None and extra_use_sbs is not None and base_use_sbs != extra_use_sbs:
         raise ValueError(
-            f"Cannot merge different feature layouts: base.use_SBs={base.use_SBs}, "
-            f"extra.use_SBs={extra.use_SBs}"
+            f"Cannot merge different feature layouts: base.use_SBs={base_use_sbs}, "
+            f"extra.use_SBs={extra_use_sbs}"
         )
     if base._features_dc.shape[1:] != extra._features_dc.shape[1:]:
         raise ValueError(f"DC feature shape mismatch: {base._features_dc.shape} vs {extra._features_dc.shape}")
@@ -62,7 +83,7 @@ def merge_models(base: GaussianModel, extra: GaussianModel) -> GaussianModel:
             f"SH feature shape mismatch: {base._features_rest.shape} vs {extra._features_rest.shape}"
         )
 
-    merged = GaussianModel(base.max_sh_degree, use_SBs=base.use_SBs)
+    merged = new_gaussian_like(base)
     merged.active_sh_degree = max(base.active_sh_degree, extra.active_sh_degree)
     merged.spatial_lr_scale = base.spatial_lr_scale
     merged._xyz = nn.Parameter(torch.cat((base._xyz.detach(), extra._xyz.detach()), dim=0), requires_grad=False)
