@@ -386,7 +386,7 @@ def _fill_new_vertices(base_dtype: np.dtype, newborn: Dict[str, np.ndarray]) -> 
         if name.startswith("f_rest_"):
             out[name] = 0.0
     if "opacity" in names:
-        out["opacity"] = _logit(newborn["opacity"])
+        out["opacity"] = _logit(newborn["opacity"]).reshape(-1)
     scales = np.log(np.clip(newborn["scale"], 1e-8, None)).astype(np.float32)
     for i in range(scales.shape[1]):
         name = f"scale_{i}"
