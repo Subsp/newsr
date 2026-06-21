@@ -1044,6 +1044,9 @@ def main() -> None:
         "carrier_rgb_anchor": output_dir / "carrier_rgb_anchor",
         "carrier_rgb_target_over_anchor": output_dir / "carrier_rgb_target_over_anchor",
         "gs_delta_signed": output_dir / "gs_delta_signed",
+        "gs_delta_rgb_signed": output_dir / "gs_delta_rgb_signed",
+        "gs_delta_rgb_pos": output_dir / "gs_delta_rgb_pos",
+        "gs_delta_rgb_neg": output_dir / "gs_delta_rgb_neg",
         "gs_delta_abs": output_dir / "gs_delta_abs",
         "gs_delta_alpha": output_dir / "gs_delta_alpha",
         "gs_delta_primitives": output_dir / "gs_delta_primitives",
@@ -1066,6 +1069,9 @@ def main() -> None:
     if str(args.output_profile) == "carrier_only":
         active_dirs = {
             "gs_delta_signed": dirs["gs_delta_signed"],
+            "gs_delta_rgb_signed": dirs["gs_delta_rgb_signed"],
+            "gs_delta_rgb_pos": dirs["gs_delta_rgb_pos"],
+            "gs_delta_rgb_neg": dirs["gs_delta_rgb_neg"],
             "gs_delta_abs": dirs["gs_delta_abs"],
             "gs_delta_alpha": dirs["gs_delta_alpha"],
             "gs_delta_primitives": dirs["gs_delta_primitives"],
@@ -1235,7 +1241,14 @@ def main() -> None:
 
         stem = target_path.stem
         if str(args.fit_target_mode) == "rgb_delta":
+            residual_scale = max(float(args.residual_clip), 1e-8)
+            gs_delta_rgb_signed = np.clip(0.5 + recon_residual / (2.0 * residual_scale), 0.0, 1.0)
+            gs_delta_rgb_pos = np.clip(recon_residual, 0.0, residual_scale) / residual_scale
+            gs_delta_rgb_neg = np.clip(-recon_residual, 0.0, residual_scale) / residual_scale
             _save_rgb(dirs["gs_delta_signed"] / f"{stem}.png", signed_render)
+            _save_rgb(dirs["gs_delta_rgb_signed"] / f"{stem}.png", gs_delta_rgb_signed)
+            _save_rgb(dirs["gs_delta_rgb_pos"] / f"{stem}.png", gs_delta_rgb_pos)
+            _save_rgb(dirs["gs_delta_rgb_neg"] / f"{stem}.png", gs_delta_rgb_neg)
             _save_gray(dirs["gs_delta_abs"] / f"{stem}.png", recon_abs)
             _save_gray(dirs["gs_delta_alpha"] / f"{stem}.png", carrier_alpha)
             _save_rgb(dirs["gs_delta_primitives"] / f"{stem}.png", primitive_overlay)
