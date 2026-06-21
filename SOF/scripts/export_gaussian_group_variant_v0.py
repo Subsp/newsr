@@ -13,8 +13,12 @@ import torch
 from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+PROJECT_ROOT = REPO_ROOT.parent
+for candidate in reversed((REPO_ROOT, PROJECT_ROOT / "mip-splatting")):
+    if candidate.is_dir():
+        candidate_str = str(candidate)
+        if candidate_str not in sys.path:
+            sys.path.insert(0, candidate_str)
 
 from gaussian_renderer import render_simple
 from scene import Scene

@@ -13,7 +13,7 @@ from torch import nn
 SCRIPT_PATH = Path(__file__).resolve()
 SOF_ROOT = SCRIPT_PATH.parents[1]
 REPO_ROOT = SOF_ROOT.parent
-for candidate in (SOF_ROOT, REPO_ROOT / "mip-splatting"):
+for candidate in reversed((SOF_ROOT, REPO_ROOT / "mip-splatting")):
     if candidate.is_dir():
         candidate_str = str(candidate)
         if candidate_str not in sys.path:
