@@ -47,6 +47,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--texture_coherence_min", type=float, default=0.35)
     parser.add_argument("--noise_coherence_max", type=float, default=0.28)
     parser.add_argument("--geometry_texture_suppression", type=float, default=0.50)
+    parser.add_argument("--geometry_edge_band_radius", type=int, default=2)
+    parser.add_argument("--geometry_trust_floor", type=float, default=0.15)
+    parser.add_argument("--anchor_edge_weight", type=float, default=0.85)
     parser.add_argument("--carrier_texture_weight", type=float, default=0.35)
     parser.add_argument("--carrier_noise_weight", type=float, default=0.0)
     parser.add_argument("--max_primitives_per_frame", type=int, default=32768)
@@ -132,6 +135,19 @@ def _box_sum(gray: np.ndarray, radius: int) -> np.ndarray:
     padded = np.pad(gray.astype(np.float32), ((r, r), (r, r)), mode="reflect")
     integral = np.pad(padded, ((1, 0), (1, 0)), mode="constant").cumsum(axis=0).cumsum(axis=1)
     return (integral[k:, k:] - integral[:-k, k:] - integral[k:, :-k] + integral[:-k, :-k]).astype(np.float32)
+
+
+def _max_filter(gray: np.ndarray, radius: int) -> np.ndarray:
+    r = max(0, int(radius))
+    if r <= 0:
+        return gray.astype(np.float32, copy=True)
+    padded = np.pad(gray.astype(np.float32), ((r, r), (r, r)), mode="edge")
+    out = np.zeros_like(gray, dtype=np.float32)
+    k = 2 * r + 1
+    for dy in range(k):
+        for dx in range(k):
+            out = np.maximum(out, padded[dy : dy + gray.shape[0], dx : dx + gray.shape[1]])
+    return out
 
 
 def _luma(rgb: np.ndarray) -> np.ndarray:
@@ -382,7 +398,13 @@ def main() -> None:
         else:
             mask_path = None
             trust = np.ones(sr.shape[:2], dtype=np.float32)
-        trust = np.clip(trust, 0.0, 1.0) ** max(float(args.mask_power), 0.0)
+        trust_raw = np.clip(trust, 0.0, 1.0)
+        trust = trust_raw ** max(float(args.mask_power), 0.0)
+        trust_band = _max_filter(trust_raw, int(args.geometry_edge_band_radius))
+        geometry_trust = np.maximum(
+            trust,
+            float(args.geometry_trust_floor) * trust_band,
+        ).astype(np.float32)
 
         sr_hf = sr - _box_blur_rgb(sr, int(args.highpass_kernel))
         lr_hf = lr - _box_blur_rgb(lr, int(args.highpass_kernel))
@@ -393,18 +415,26 @@ def main() -> None:
         lr_edge = _grad_mag(_luma(lr))
         edge_gain = np.maximum(sr_edge - lr_edge, 0.0).astype(np.float32)
 
-        hf_n = _norm_by_percentile(hf_abs * (0.25 + 0.75 * trust), float(args.hf_percentile))
+        hf_n = _norm_by_percentile(hf_abs * (0.25 + 0.75 * geometry_trust), float(args.hf_percentile))
         sr_edge_n = _norm_by_percentile(sr_edge, float(args.edge_percentile))
+        lr_edge_n = _norm_by_percentile(lr_edge, float(args.edge_percentile))
         edge_gain_n = _norm_by_percentile(edge_gain, float(args.edge_percentile), floor=1e-5)
+        edge_support = np.maximum.reduce(
+            [
+                sr_edge_n,
+                float(args.anchor_edge_weight) * lr_edge_n,
+                edge_gain_n,
+            ]
+        ).astype(np.float32)
         flat_thr = float(np.percentile(lr_edge, float(args.flat_percentile)))
         flat = (lr_edge <= flat_thr).astype(np.float32)
         nonflat = 1.0 - flat
 
         geometry_score = (
             hf_n
-            * np.maximum(sr_edge_n, edge_gain_n)
+            * edge_support
             * (0.35 + 0.65 * coherence)
-            * (0.35 + 0.65 * trust)
+            * (0.35 + 0.65 * geometry_trust)
         ).astype(np.float32)
         texture_score = (
             hf_n

@@ -736,6 +736,30 @@ def _weighted_energy(value: np.ndarray, weight: np.ndarray) -> float:
     return float((np.abs(value) * weight[..., None]).sum() / denom)
 
 
+def _mse(a: np.ndarray, b: np.ndarray, weight: Optional[np.ndarray] = None) -> float:
+    diff = (a.astype(np.float32) - b.astype(np.float32)) ** 2
+    channels = diff.shape[2] if diff.ndim == 3 else 1
+    if weight is None:
+        return float(diff.mean())
+    weight = np.clip(weight.astype(np.float32), 0.0, 1.0)
+    denom = float(weight.sum()) * channels
+    if denom <= 1e-8:
+        return float("nan")
+    if diff.ndim == 3:
+        return float((diff * weight[..., None]).sum() / denom)
+    return float((diff * weight).sum() / denom)
+
+
+def _psnr(a: np.ndarray, b: np.ndarray, weight: Optional[np.ndarray] = None, peak: float = 1.0) -> float:
+    mse = _mse(a, b, weight)
+    if not np.isfinite(mse):
+        return float("nan")
+    if mse <= 1e-12:
+        return 99.0
+    peak = max(float(peak), 1e-8)
+    return float(20.0 * math.log10(peak) - 10.0 * math.log10(mse))
+
+
 def _pearson_abs(a: np.ndarray, b: np.ndarray, weight: np.ndarray) -> float:
     aa = np.abs(a).mean(axis=2).reshape(-1)
     bb = np.abs(b).mean(axis=2).reshape(-1)
@@ -1350,6 +1374,7 @@ def main() -> None:
         if bool(args.save_pt):
             torch.save(model.state_dict(), dirs["pt"] / f"{stem}.pt")
 
+        residual_peak = 1.0 if str(args.fit_target_mode) == "evidence_rgb" else max(2.0 * float(args.residual_clip), 1e-8)
         row = {
             "index": float(index),
             "num_primitives": float(args.num_gaussians),
@@ -1360,6 +1385,13 @@ def main() -> None:
             "l1": _weighted_l1(recon_residual, target_residual, weight),
             "corr_abs": _pearson_abs(recon_residual, target_residual, weight),
             "rgb_l1": rgb_l1,
+            "fit_psnr": _psnr(fit_render, fit_target),
+            "fit_psnr_weighted": _psnr(fit_render, fit_target, fit_weight),
+            "fit_psnr_masked": _psnr(fit_render, fit_target, weight),
+            "residual_psnr": _psnr(recon_residual, target_residual, peak=residual_peak),
+            "residual_psnr_weighted": _psnr(recon_residual, target_residual, weight, peak=residual_peak),
+            "rgb_psnr": _psnr(rgb_render, target),
+            "rgb_psnr_weighted": _psnr(rgb_render, target, weight),
             "weight_mean": float(weight.mean()),
         }
         rows.append(row)
@@ -1397,6 +1429,13 @@ def main() -> None:
         "rgb_l1_mean": _mean(rows, "rgb_l1"),
         "l1_mean": _mean(rows, "l1"),
         "corr_abs_mean": _mean(rows, "corr_abs"),
+        "fit_psnr_mean": _mean(rows, "fit_psnr"),
+        "fit_psnr_weighted_mean": _mean(rows, "fit_psnr_weighted"),
+        "fit_psnr_masked_mean": _mean(rows, "fit_psnr_masked"),
+        "residual_psnr_mean": _mean(rows, "residual_psnr"),
+        "residual_psnr_weighted_mean": _mean(rows, "residual_psnr_weighted"),
+        "rgb_psnr_mean": _mean(rows, "rgb_psnr"),
+        "rgb_psnr_weighted_mean": _mean(rows, "rgb_psnr_weighted"),
         "target_energy_mean": _mean(rows, "target_energy"),
         "recon_energy_mean": _mean(rows, "recon_energy"),
         "weight_mean": _mean(rows, "weight_mean"),
@@ -1417,6 +1456,13 @@ def main() -> None:
                 "l1",
                 "corr_abs",
                 "rgb_l1",
+                "fit_psnr",
+                "fit_psnr_weighted",
+                "fit_psnr_masked",
+                "residual_psnr",
+                "residual_psnr_weighted",
+                "rgb_psnr",
+                "rgb_psnr_weighted",
                 "weight_mean",
             ],
         )
