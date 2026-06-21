@@ -12,8 +12,8 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 
 SR_PRIOR_NAME="${SR_PRIOR_NAME:-qwen_steps1_seed42_rcgm_aligned_images2_train244_v0}"
 EVIDENCE_NAME="${EVIDENCE_NAME:-${SR_PRIOR_NAME}_sr_hf_evidence_v0}"
-MASK_SUBDIR="${MASK_SUBDIR:-geometry_weight}"
-CARRIER_OUTPUT_NAME="${CARRIER_OUTPUT_NAME:-${EVIDENCE_NAME}_geometry_carrier_rgb_2dgs_v0}"
+MASK_SUBDIR="${MASK_SUBDIR:-effective_hf_weight}"
+CARRIER_OUTPUT_NAME="${CARRIER_OUTPUT_NAME:-${EVIDENCE_NAME}_effective_hf_carrier_rgb_2dgs_v0}"
 
 CARRIER_ROOT="${CARRIER_ROOT:-${SOF_ROOT}/output/2dgs_sr_hf_evidence_carrier/${CARRIER_OUTPUT_NAME}}"
 TARGET_DIR="${TARGET_DIR:-${CARRIER_ROOT}/evidence_target}"

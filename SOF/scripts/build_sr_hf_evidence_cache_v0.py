@@ -26,7 +26,8 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Build an SR high-frequency evidence cache. The cache separates SR-added HF into "
-            "geometry-like edge evidence, surface texture evidence, and likely hallucination/noise."
+            "geometry-like edge evidence, surface texture evidence, likely hallucination/noise, "
+            "and a wider effective-HF carrier for downstream 2DGS fitting."
         )
     )
     parser.add_argument("--sr_dir", required=True)
@@ -52,6 +53,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--anchor_edge_weight", type=float, default=0.85)
     parser.add_argument("--carrier_texture_weight", type=float, default=0.35)
     parser.add_argument("--carrier_noise_weight", type=float, default=0.0)
+    parser.add_argument("--effective_score_threshold", type=float, default=0.13)
+    parser.add_argument("--effective_texture_weight", type=float, default=0.85)
+    parser.add_argument("--effective_min_coherence", type=float, default=0.22)
+    parser.add_argument("--effective_noise_suppression", type=float, default=0.80)
+    parser.add_argument("--effective_context_floor", type=float, default=0.20)
     parser.add_argument("--max_primitives_per_frame", type=int, default=32768)
     parser.add_argument("--primitive_nms_radius_px", type=int, default=2)
     parser.add_argument("--sigma_long_px", type=float, default=2.4)
@@ -300,6 +306,7 @@ def _write_sheet(
     sr: np.ndarray,
     lr: np.ndarray,
     evidence_type: np.ndarray,
+    effective_weight: np.ndarray,
     hf_abs: np.ndarray,
     geometry_score: np.ndarray,
     texture_score: np.ndarray,
@@ -310,6 +317,7 @@ def _write_sheet(
         ("LR", lr),
         ("SR", sr),
         ("type R=edge Y=texture B=noise", evidence_type),
+        ("effective HF weight", np.repeat(np.clip(effective_weight, 0.0, 1.0)[..., None], 3, axis=2)),
         ("HF evidence", np.repeat(np.clip(hf_abs / 0.15, 0.0, 1.0)[..., None], 3, axis=2)),
         ("geometry score", np.repeat(np.clip(geometry_score, 0.0, 1.0)[..., None], 3, axis=2)),
         ("texture score", np.repeat(np.clip(texture_score, 0.0, 1.0)[..., None], 3, axis=2)),
@@ -361,9 +369,12 @@ def main() -> None:
         "texture_weight": output_root / "texture_weight",
         "noise_weight": output_root / "noise_weight",
         "structure_weight": output_root / "structure_weight",
+        "effective_hf_score": output_root / "effective_hf_score",
+        "effective_hf_weight": output_root / "effective_hf_weight",
         "geometry_carrier_rgb": output_root / "geometry_carrier_rgb",
         "texture_carrier_rgb": output_root / "texture_carrier_rgb",
         "structure_carrier_rgb": output_root / "structure_carrier_rgb",
+        "effective_hf_carrier_rgb": output_root / "effective_hf_carrier_rgb",
         "evidence_type": output_root / "evidence_type",
         "hf_abs": output_root / "hf_abs",
         "coherence": output_root / "coherence",
@@ -426,6 +437,21 @@ def main() -> None:
                 edge_gain_n,
             ]
         ).astype(np.float32)
+        effective_context = np.clip(
+            np.maximum.reduce(
+                [
+                    geometry_trust,
+                    0.65 * edge_support,
+                    0.45 * coherence,
+                ]
+            ),
+            float(args.effective_context_floor),
+            1.0,
+        ).astype(np.float32)
+        effective_hf_n = _norm_by_percentile(
+            hf_abs * (0.15 + 0.85 * effective_context),
+            float(args.hf_percentile),
+        )
         flat_thr = float(np.percentile(lr_edge, float(args.flat_percentile)))
         flat = (lr_edge <= flat_thr).astype(np.float32)
         nonflat = 1.0 - flat
@@ -449,6 +475,21 @@ def main() -> None:
             * (1.0 - np.clip(texture_score, 0.0, 1.0))
             * np.maximum((1.0 - coherence), (1.0 - trust))
         ).astype(np.float32)
+        effective_texture_score = (
+            effective_hf_n
+            * np.maximum(flat, 0.35 * edge_support)
+            * (0.25 + 0.75 * coherence)
+            * (0.20 + 0.80 * effective_context)
+            * (1.0 - 0.35 * np.clip(noise_score, 0.0, 1.0))
+        ).astype(np.float32)
+        effective_score = np.maximum(
+            geometry_score,
+            float(args.effective_texture_weight) * effective_texture_score,
+        )
+        effective_score = (
+            effective_score
+            * (1.0 - float(args.effective_noise_suppression) * np.clip(noise_score, 0.0, 1.0))
+        ).astype(np.float32)
 
         texture_gate = coherence >= float(args.texture_coherence_min)
         noise_gate = (coherence <= float(args.noise_coherence_max)) | (trust <= 0.25)
@@ -463,8 +504,15 @@ def main() -> None:
             noise_score,
             0.0,
         ).astype(np.float32)
+        effective_gate = (coherence >= float(args.effective_min_coherence)) | (edge_support >= 0.25)
+        effective_weight = np.where(
+            (effective_score >= float(args.effective_score_threshold)) & effective_gate,
+            effective_score,
+            0.0,
+        ).astype(np.float32)
         texture_weight = texture_weight * (geometry_weight <= 1e-6)
         noise_weight = noise_weight * (geometry_weight <= 1e-6) * (texture_weight <= 1e-6)
+        effective_weight = effective_weight * (noise_weight <= 1e-6)
         structure_weight = np.clip(
             geometry_weight
             + float(args.carrier_texture_weight) * texture_weight
@@ -476,6 +524,7 @@ def main() -> None:
         geometry_carrier = sr * geometry_weight[..., None]
         texture_carrier = sr * texture_weight[..., None]
         structure_carrier = sr * structure_weight[..., None]
+        effective_carrier = sr * effective_weight[..., None]
         evidence_type = np.zeros((*sr.shape[:2], 3), dtype=np.float32)
         evidence_type[..., 0] = np.maximum(geometry_weight, texture_weight)
         evidence_type[..., 1] = texture_weight
@@ -525,9 +574,12 @@ def main() -> None:
         _save_gray(dirs["texture_weight"] / f"{stem}.png", texture_weight)
         _save_gray(dirs["noise_weight"] / f"{stem}.png", noise_weight)
         _save_gray(dirs["structure_weight"] / f"{stem}.png", structure_weight)
+        _save_gray(dirs["effective_hf_score"] / f"{stem}.png", effective_score)
+        _save_gray(dirs["effective_hf_weight"] / f"{stem}.png", effective_weight)
         _save_rgb(dirs["geometry_carrier_rgb"] / f"{stem}.png", geometry_carrier)
         _save_rgb(dirs["texture_carrier_rgb"] / f"{stem}.png", texture_carrier)
         _save_rgb(dirs["structure_carrier_rgb"] / f"{stem}.png", structure_carrier)
+        _save_rgb(dirs["effective_hf_carrier_rgb"] / f"{stem}.png", effective_carrier)
         _save_rgb(dirs["evidence_type"] / f"{stem}.png", evidence_type)
         _save_gray(dirs["hf_abs"] / f"{stem}.png", np.clip(hf_abs / max(float(args.vis_clip), 1e-8), 0.0, 1.0))
         _save_gray(dirs["coherence"] / f"{stem}.png", coherence)
@@ -540,6 +592,7 @@ def main() -> None:
                 sr,
                 lr,
                 evidence_type,
+                effective_weight,
                 hf_abs,
                 geometry_score,
                 texture_score,
@@ -556,10 +609,13 @@ def main() -> None:
             "geometry_ratio": _weighted_mean((geometry_weight > 0).astype(np.float32), trust),
             "texture_ratio": _weighted_mean((texture_weight > 0).astype(np.float32), trust),
             "noise_ratio": _weighted_mean((noise_weight > 0).astype(np.float32), trust),
+            "effective_hf_ratio": _weighted_mean((effective_weight > 0).astype(np.float32), trust),
             "geometry_weight_mean": float(geometry_weight.mean()),
             "texture_weight_mean": float(texture_weight.mean()),
             "noise_weight_mean": float(noise_weight.mean()),
             "structure_weight_mean": float(structure_weight.mean()),
+            "effective_hf_score_mean": float(effective_score.mean()),
+            "effective_hf_weight_mean": float(effective_weight.mean()),
             "num_primitives": float(primitives["xy"].shape[0]),
             "num_geometry_primitives": float(np.sum(primitives["kind"] == 1)),
             "num_texture_primitives": float(np.sum(primitives["kind"] == 2)),
@@ -591,6 +647,11 @@ def main() -> None:
         "geometry_score_threshold": float(args.geometry_score_threshold),
         "texture_score_threshold": float(args.texture_score_threshold),
         "noise_score_threshold": float(args.noise_score_threshold),
+        "effective_score_threshold": float(args.effective_score_threshold),
+        "effective_texture_weight": float(args.effective_texture_weight),
+        "effective_min_coherence": float(args.effective_min_coherence),
+        "effective_noise_suppression": float(args.effective_noise_suppression),
+        "effective_context_floor": float(args.effective_context_floor),
         "means": {key: _mean(rows, key) for key in rows[0].keys()} if rows else {},
         "frames": frames,
         "outputs": {key: str(value) for key, value in dirs.items()},
