@@ -1047,6 +1047,7 @@ def main() -> None:
         "gs_delta_rgb_signed": output_dir / "gs_delta_rgb_signed",
         "gs_delta_rgb_pos": output_dir / "gs_delta_rgb_pos",
         "gs_delta_rgb_neg": output_dir / "gs_delta_rgb_neg",
+        "gs_delta_color_render": output_dir / "gs_delta_color_render",
         "gs_delta_abs": output_dir / "gs_delta_abs",
         "gs_delta_alpha": output_dir / "gs_delta_alpha",
         "gs_delta_primitives": output_dir / "gs_delta_primitives",
@@ -1072,6 +1073,7 @@ def main() -> None:
             "gs_delta_rgb_signed": dirs["gs_delta_rgb_signed"],
             "gs_delta_rgb_pos": dirs["gs_delta_rgb_pos"],
             "gs_delta_rgb_neg": dirs["gs_delta_rgb_neg"],
+            "gs_delta_color_render": dirs["gs_delta_color_render"],
             "gs_delta_abs": dirs["gs_delta_abs"],
             "gs_delta_alpha": dirs["gs_delta_alpha"],
             "gs_delta_primitives": dirs["gs_delta_primitives"],
@@ -1249,6 +1251,7 @@ def main() -> None:
             _save_rgb(dirs["gs_delta_rgb_signed"] / f"{stem}.png", gs_delta_rgb_signed)
             _save_rgb(dirs["gs_delta_rgb_pos"] / f"{stem}.png", gs_delta_rgb_pos)
             _save_rgb(dirs["gs_delta_rgb_neg"] / f"{stem}.png", gs_delta_rgb_neg)
+            _save_rgb(dirs["gs_delta_color_render"] / f"{stem}.png", rgb_render)
             _save_gray(dirs["gs_delta_abs"] / f"{stem}.png", recon_abs)
             _save_gray(dirs["gs_delta_alpha"] / f"{stem}.png", carrier_alpha)
             _save_rgb(dirs["gs_delta_primitives"] / f"{stem}.png", primitive_overlay)
