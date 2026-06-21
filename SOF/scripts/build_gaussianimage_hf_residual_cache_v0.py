@@ -41,7 +41,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--confidence_power", type=float, default=1.5)
     parser.add_argument("--mask_power", type=float, default=1.0)
     parser.add_argument("--background_weight", type=float, default=0.02)
-    parser.add_argument("--fit_target_mode", default="hf_residual", choices=["hf_residual", "rgb"])
+    parser.add_argument("--fit_target_mode", default="hf_residual", choices=["hf_residual", "rgb", "rgb_delta"])
     parser.add_argument("--rgb_loss_weight_mode", default="full", choices=["full", "trust", "trust_plus_background"])
     parser.add_argument("--num_gaussians", type=int, default=4096)
     parser.add_argument("--model", default="cholesky", choices=["cholesky", "rs"])
@@ -569,6 +569,26 @@ def _target_signed_hf(
     return signed, residual, trust.astype(np.float32)
 
 
+def _target_signed_rgb_delta(
+    target: np.ndarray,
+    anchor: np.ndarray,
+    mask: np.ndarray,
+    detail_alpha: float,
+    residual_clip: float,
+    confidence_power: float,
+    mask_power: float,
+    neutral_outside_mask: bool,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    residual = float(detail_alpha) * (target.astype(np.float32) - anchor.astype(np.float32))
+    residual = np.clip(residual, -float(residual_clip), float(residual_clip)).astype(np.float32)
+    trust = np.clip(mask, 0.0, 1.0) ** max(float(mask_power), 0.0)
+    trust = trust ** max(float(confidence_power), 0.0)
+    if neutral_outside_mask:
+        residual = residual * trust[..., None]
+    signed = np.clip(0.5 + residual / (2.0 * max(float(residual_clip), 1e-8)), 0.0, 1.0).astype(np.float32)
+    return signed, residual, trust.astype(np.float32)
+
+
 def _fit_gaussianimage(
     module,
     fit_target: np.ndarray,
@@ -1005,6 +1025,10 @@ def main() -> None:
         "rgb_target": output_dir / "rgb_target",
         "rgb_recon": output_dir / "rgb_recon",
         "rgb_recon_error": output_dir / "rgb_recon_error",
+        "rgb_delta_target": output_dir / "rgb_delta_target",
+        "rgb_delta_recon": output_dir / "rgb_delta_recon",
+        "rgb_delta_apply": output_dir / "rgb_delta_apply",
+        "rgb_delta_apply_error": output_dir / "rgb_delta_apply_error",
         "rgb_target_hf": output_dir / "rgb_target_hf",
         "rgb_recon_hf": output_dir / "rgb_recon_hf",
         "rgb_recon_hf_weighted": output_dir / "rgb_recon_hf_weighted",
@@ -1057,7 +1081,7 @@ def main() -> None:
         size = (target.shape[1], target.shape[0])
         anchor = _load_rgb(anchor_path, size=size)
         mask = _load_gray(mask_path, size=size)
-        signed_target, target_residual, weight = _target_signed_hf(
+        signed_hf_target, hf_target_residual, weight = _target_signed_hf(
             target,
             anchor,
             mask,
@@ -1068,7 +1092,28 @@ def main() -> None:
             float(args.mask_power),
             bool(args.neutral_outside_mask),
         )
-        if str(args.fit_target_mode) == "rgb":
+        if str(args.fit_target_mode) == "rgb_delta":
+            signed_target, target_residual, weight = _target_signed_rgb_delta(
+                target,
+                anchor,
+                mask,
+                float(args.detail_alpha),
+                float(args.residual_clip),
+                float(args.confidence_power),
+                float(args.mask_power),
+                bool(args.neutral_outside_mask),
+            )
+            fit_target = signed_target
+            if str(args.rgb_loss_weight_mode) == "full":
+                fit_weight = np.ones_like(weight, dtype=np.float32)
+            elif str(args.rgb_loss_weight_mode) == "trust_plus_background":
+                fit_weight = np.clip(weight + float(args.background_weight), 0.0, 1.0).astype(np.float32)
+            else:
+                fit_weight = weight
+            init_color_image = None
+        elif str(args.fit_target_mode) == "rgb":
+            signed_target = signed_hf_target
+            target_residual = hf_target_residual
             fit_target = target
             if str(args.rgb_loss_weight_mode) == "full":
                 fit_weight = np.ones_like(weight, dtype=np.float32)
@@ -1078,6 +1123,8 @@ def main() -> None:
                 fit_weight = weight
             init_color_image = target
         else:
+            signed_target = signed_hf_target
+            target_residual = hf_target_residual
             fit_target = signed_target
             fit_weight = weight
             init_color_image = None
@@ -1098,7 +1145,12 @@ def main() -> None:
             args,
             init_color_image=init_color_image,
         )
-        if str(args.fit_target_mode) == "rgb":
+        if str(args.fit_target_mode) == "rgb_delta":
+            signed_render = fit_render
+            recon_residual = _signed_to_residual(signed_render, float(args.residual_clip))
+            rgb_render = np.clip(anchor + recon_residual, 0.0, 1.0)
+            rgb_l1 = _weighted_l1(rgb_render, target, np.ones_like(weight, dtype=np.float32))
+        elif str(args.fit_target_mode) == "rgb":
             rgb_render = fit_render
             recon_residual = float(args.detail_alpha) * (
                 rgb_render - _box_blur_rgb(rgb_render, int(args.highpass_kernel)) - (anchor - _box_blur_rgb(anchor, int(args.highpass_kernel)))
@@ -1154,6 +1206,10 @@ def main() -> None:
         _save_rgb(dirs["rgb_target"] / f"{stem}.png", target)
         _save_rgb(dirs["rgb_recon"] / f"{stem}.png", rgb_render)
         _save_rgb(dirs["rgb_recon_error"] / f"{stem}.png", np.repeat(np.clip(np.abs(rgb_render - target).mean(axis=2, keepdims=True) * 4.0, 0.0, 1.0), 3, axis=2))
+        _save_rgb(dirs["rgb_delta_target"] / f"{stem}.png", signed_target)
+        _save_rgb(dirs["rgb_delta_recon"] / f"{stem}.png", signed_render)
+        _save_rgb(dirs["rgb_delta_apply"] / f"{stem}.png", rgb_render)
+        _save_rgb(dirs["rgb_delta_apply_error"] / f"{stem}.png", np.repeat(np.clip(np.abs(rgb_render - target).mean(axis=2, keepdims=True) * 4.0, 0.0, 1.0), 3, axis=2))
         _save_rgb(dirs["rgb_target_hf"] / f"{stem}.png", target_rgb_hf)
         _save_rgb(dirs["rgb_recon_hf"] / f"{stem}.png", recon_rgb_hf)
         _save_rgb(dirs["rgb_recon_hf_weighted"] / f"{stem}.png", recon_rgb_hf_weighted)
