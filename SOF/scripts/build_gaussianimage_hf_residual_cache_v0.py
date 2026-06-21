@@ -43,6 +43,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--background_weight", type=float, default=0.02)
     parser.add_argument("--fit_target_mode", default="hf_residual", choices=["hf_residual", "rgb", "rgb_delta"])
     parser.add_argument("--rgb_loss_weight_mode", default="full", choices=["full", "trust", "trust_plus_background"])
+    parser.add_argument("--output_profile", default="full", choices=["full", "carrier_only"])
     parser.add_argument("--num_gaussians", type=int, default=4096)
     parser.add_argument("--model", default="cholesky", choices=["cholesky", "rs"])
     parser.add_argument("--optimizer", default="adam", choices=["adam", "adan"])
@@ -1042,6 +1043,10 @@ def main() -> None:
         "carrier_rgb_target": output_dir / "carrier_rgb_target",
         "carrier_rgb_anchor": output_dir / "carrier_rgb_anchor",
         "carrier_rgb_target_over_anchor": output_dir / "carrier_rgb_target_over_anchor",
+        "gs_delta_signed": output_dir / "gs_delta_signed",
+        "gs_delta_abs": output_dir / "gs_delta_abs",
+        "gs_delta_alpha": output_dir / "gs_delta_alpha",
+        "gs_delta_primitives": output_dir / "gs_delta_primitives",
         "sheet": output_dir / "sheet",
         "primitives": output_dir / "primitives",
     }
@@ -1058,7 +1063,19 @@ def main() -> None:
         )
     if bool(args.save_pt):
         dirs["pt"] = output_dir / "pt"
-    for directory in dirs.values():
+    if str(args.output_profile) == "carrier_only":
+        active_dirs = {
+            "gs_delta_signed": dirs["gs_delta_signed"],
+            "gs_delta_abs": dirs["gs_delta_abs"],
+            "gs_delta_alpha": dirs["gs_delta_alpha"],
+            "gs_delta_primitives": dirs["gs_delta_primitives"],
+            "primitives": dirs["primitives"],
+        }
+        if bool(args.save_pt):
+            active_dirs["pt"] = dirs["pt"]
+    else:
+        active_dirs = dirs
+    for directory in active_dirs.values():
         directory.mkdir(parents=True, exist_ok=True)
 
     anchor_lookup = _lookup(anchor_paths)
@@ -1073,7 +1090,8 @@ def main() -> None:
     print(f"[gaussianimage-hf-v0] output : {output_dir}")
     print(
         f"[gaussianimage-hf-v0] fit    : model={args.model} n={args.num_gaussians} "
-        f"iters={args.iterations} lr={args.lr} loss={args.loss} mode={args.fit_target_mode}"
+        f"iters={args.iterations} lr={args.lr} loss={args.loss} mode={args.fit_target_mode} "
+        f"output={args.output_profile}"
     )
 
     for index, target_path in enumerate(tqdm(target_paths, desc="GaussianImage HF")):
@@ -1197,79 +1215,90 @@ def main() -> None:
             primitives["pair_edges"] = init_meta["pair_edges"]
             primitives["init_mu_norm"] = init_meta["means_norm"]
             primitives["init_cholesky"] = init_meta["cholesky"]
-        carrier_target_colors = _sample_rgb_bilinear(target, primitives["mu_xy"])
-        carrier_anchor_colors = _sample_rgb_bilinear(anchor, primitives["mu_xy"])
-        carrier_rgb_target = _render_model_with_colors(model, carrier_target_colors, background=0.0)
-        carrier_rgb_anchor = _render_model_with_colors(model, carrier_anchor_colors, background=0.0)
+        carrier_target_colors = None
+        carrier_rgb_target = None
+        carrier_rgb_anchor = None
         carrier_alpha_rgb = _render_model_with_colors(
             model,
-            np.ones_like(carrier_target_colors, dtype=np.float32),
+            np.ones_like(primitives["color"], dtype=np.float32),
             background=0.0,
         )
         carrier_alpha = np.clip(carrier_alpha_rgb.mean(axis=2), 0.0, 1.0)
-        carrier_rgb_target_over_anchor = _composite_over(anchor, carrier_rgb_target, carrier_alpha)
+        carrier_rgb_target_over_anchor = None
+        if str(args.output_profile) != "carrier_only":
+            carrier_target_colors = _sample_rgb_bilinear(target, primitives["mu_xy"])
+            carrier_anchor_colors = _sample_rgb_bilinear(anchor, primitives["mu_xy"])
+            carrier_rgb_target = _render_model_with_colors(model, carrier_target_colors, background=0.0)
+            carrier_rgb_anchor = _render_model_with_colors(model, carrier_anchor_colors, background=0.0)
+            carrier_rgb_target_over_anchor = _composite_over(anchor, carrier_rgb_target, carrier_alpha)
         primitive_overlay = _primitive_overlay(primitives, target.shape[0], target.shape[1])
 
         stem = target_path.stem
-        _save_rgb(dirs["target_hf"] / f"{stem}.png", signed_target)
-        _save_rgb(dirs["recon_hf"] / f"{stem}.png", signed_render)
-        _save_gray(dirs["target_abs"] / f"{stem}.png", target_abs)
-        _save_gray(dirs["recon_abs"] / f"{stem}.png", recon_abs)
-        _save_rgb(dirs["edge_recon"] / f"{stem}.png", recon_rgb_hf)
-        _save_rgb(dirs["overlay"] / f"{stem}.png", overlay)
-        _save_rgb(dirs["primitive_overlay"] / f"{stem}.png", primitive_overlay)
-        _save_rgb(dirs["rgb_anchor"] / f"{stem}.png", anchor)
-        _save_rgb(dirs["rgb_target"] / f"{stem}.png", target)
-        _save_rgb(dirs["rgb_recon"] / f"{stem}.png", rgb_render)
-        _save_rgb(dirs["rgb_recon_error"] / f"{stem}.png", np.repeat(np.clip(np.abs(rgb_render - target).mean(axis=2, keepdims=True) * 4.0, 0.0, 1.0), 3, axis=2))
-        _save_rgb(dirs["rgb_delta_target"] / f"{stem}.png", signed_target)
-        _save_rgb(dirs["rgb_delta_recon"] / f"{stem}.png", signed_render)
-        _save_rgb(dirs["rgb_delta_apply"] / f"{stem}.png", rgb_render)
-        _save_rgb(dirs["rgb_delta_apply_error"] / f"{stem}.png", np.repeat(np.clip(np.abs(rgb_render - target).mean(axis=2, keepdims=True) * 4.0, 0.0, 1.0), 3, axis=2))
-        _save_rgb(dirs["rgb_delta_recon_trust"] / f"{stem}.png", signed_render_trust)
-        _save_rgb(dirs["rgb_delta_apply_trust"] / f"{stem}.png", rgb_render_trust)
-        _save_rgb(dirs["rgb_delta_apply_trust_error"] / f"{stem}.png", np.repeat(np.clip(np.abs(rgb_render_trust - target).mean(axis=2, keepdims=True) * 4.0, 0.0, 1.0), 3, axis=2))
-        _save_gray(dirs["rgb_delta_extra_outside"] / f"{stem}.png", extra_outside)
-        _save_rgb(dirs["rgb_target_hf"] / f"{stem}.png", target_rgb_hf)
-        _save_rgb(dirs["rgb_recon_hf"] / f"{stem}.png", recon_rgb_hf)
-        _save_rgb(dirs["rgb_recon_hf_weighted"] / f"{stem}.png", recon_rgb_hf_weighted)
-        _save_rgb(dirs["rgb_error_overlay"] / f"{stem}.png", rgb_error_overlay)
-        _save_gray(dirs["carrier_alpha"] / f"{stem}.png", carrier_alpha)
-        _save_rgb(dirs["carrier_rgb_target"] / f"{stem}.png", carrier_rgb_target)
-        _save_rgb(dirs["carrier_rgb_anchor"] / f"{stem}.png", carrier_rgb_anchor)
-        _save_rgb(dirs["carrier_rgb_target_over_anchor"] / f"{stem}.png", carrier_rgb_target_over_anchor)
-        if bool(args.light_visuals):
-            light_strength = float(args.light_visual_strength)
-            _save_rgb(dirs["target_abs_light"] / f"{stem}.png", _light_abs(target_abs, light_strength))
-            _save_rgb(dirs["recon_abs_light"] / f"{stem}.png", _light_abs(recon_abs, light_strength))
-            _save_rgb(dirs["target_hf_light"] / f"{stem}.png", _light_signed(signed_target, light_strength))
-            _save_rgb(dirs["recon_hf_light"] / f"{stem}.png", _light_signed(signed_render, light_strength))
-            _save_rgb(dirs["overlay_light"] / f"{stem}.png", _light_overlay(target_abs, recon_abs, weight, light_strength))
-            _save_rgb(
-                dirs["primitive_overlay_light"] / f"{stem}.png",
-                _light_primitive_overlay(primitive_overlay, light_strength),
-            )
-        if index < int(args.debug_limit):
-            _write_sheet(
-                dirs["sheet"] / f"{stem}.png",
-                signed_target,
-                signed_render,
-                target_residual,
-                recon_residual,
-                error,
-                weight,
-                primitive_overlay,
-                float(args.residual_clip),
-            )
-            _write_rgb_sheet(
-                dirs["rgb_sheet"] / f"{stem}.png",
-                anchor,
-                target,
-                target_rgb_hf,
-                recon_rgb_hf,
-                recon_rgb_hf_weighted,
-                rgb_error_overlay,
-            )
+        if str(args.fit_target_mode) == "rgb_delta":
+            _save_rgb(dirs["gs_delta_signed"] / f"{stem}.png", signed_render)
+            _save_gray(dirs["gs_delta_abs"] / f"{stem}.png", recon_abs)
+            _save_gray(dirs["gs_delta_alpha"] / f"{stem}.png", carrier_alpha)
+            _save_rgb(dirs["gs_delta_primitives"] / f"{stem}.png", primitive_overlay)
+        if str(args.output_profile) != "carrier_only":
+            _save_rgb(dirs["target_hf"] / f"{stem}.png", signed_target)
+            _save_rgb(dirs["recon_hf"] / f"{stem}.png", signed_render)
+            _save_gray(dirs["target_abs"] / f"{stem}.png", target_abs)
+            _save_gray(dirs["recon_abs"] / f"{stem}.png", recon_abs)
+            _save_rgb(dirs["edge_recon"] / f"{stem}.png", recon_rgb_hf)
+            _save_rgb(dirs["overlay"] / f"{stem}.png", overlay)
+            _save_rgb(dirs["primitive_overlay"] / f"{stem}.png", primitive_overlay)
+            _save_rgb(dirs["rgb_anchor"] / f"{stem}.png", anchor)
+            _save_rgb(dirs["rgb_target"] / f"{stem}.png", target)
+            _save_rgb(dirs["rgb_recon"] / f"{stem}.png", rgb_render)
+            _save_rgb(dirs["rgb_recon_error"] / f"{stem}.png", np.repeat(np.clip(np.abs(rgb_render - target).mean(axis=2, keepdims=True) * 4.0, 0.0, 1.0), 3, axis=2))
+            _save_rgb(dirs["rgb_delta_target"] / f"{stem}.png", signed_target)
+            _save_rgb(dirs["rgb_delta_recon"] / f"{stem}.png", signed_render)
+            _save_rgb(dirs["rgb_delta_apply"] / f"{stem}.png", rgb_render)
+            _save_rgb(dirs["rgb_delta_apply_error"] / f"{stem}.png", np.repeat(np.clip(np.abs(rgb_render - target).mean(axis=2, keepdims=True) * 4.0, 0.0, 1.0), 3, axis=2))
+            _save_rgb(dirs["rgb_delta_recon_trust"] / f"{stem}.png", signed_render_trust)
+            _save_rgb(dirs["rgb_delta_apply_trust"] / f"{stem}.png", rgb_render_trust)
+            _save_rgb(dirs["rgb_delta_apply_trust_error"] / f"{stem}.png", np.repeat(np.clip(np.abs(rgb_render_trust - target).mean(axis=2, keepdims=True) * 4.0, 0.0, 1.0), 3, axis=2))
+            _save_gray(dirs["rgb_delta_extra_outside"] / f"{stem}.png", extra_outside)
+            _save_rgb(dirs["rgb_target_hf"] / f"{stem}.png", target_rgb_hf)
+            _save_rgb(dirs["rgb_recon_hf"] / f"{stem}.png", recon_rgb_hf)
+            _save_rgb(dirs["rgb_recon_hf_weighted"] / f"{stem}.png", recon_rgb_hf_weighted)
+            _save_rgb(dirs["rgb_error_overlay"] / f"{stem}.png", rgb_error_overlay)
+            _save_gray(dirs["carrier_alpha"] / f"{stem}.png", carrier_alpha)
+            _save_rgb(dirs["carrier_rgb_target"] / f"{stem}.png", carrier_rgb_target)
+            _save_rgb(dirs["carrier_rgb_anchor"] / f"{stem}.png", carrier_rgb_anchor)
+            _save_rgb(dirs["carrier_rgb_target_over_anchor"] / f"{stem}.png", carrier_rgb_target_over_anchor)
+            if bool(args.light_visuals):
+                light_strength = float(args.light_visual_strength)
+                _save_rgb(dirs["target_abs_light"] / f"{stem}.png", _light_abs(target_abs, light_strength))
+                _save_rgb(dirs["recon_abs_light"] / f"{stem}.png", _light_abs(recon_abs, light_strength))
+                _save_rgb(dirs["target_hf_light"] / f"{stem}.png", _light_signed(signed_target, light_strength))
+                _save_rgb(dirs["recon_hf_light"] / f"{stem}.png", _light_signed(signed_render, light_strength))
+                _save_rgb(dirs["overlay_light"] / f"{stem}.png", _light_overlay(target_abs, recon_abs, weight, light_strength))
+                _save_rgb(
+                    dirs["primitive_overlay_light"] / f"{stem}.png",
+                    _light_primitive_overlay(primitive_overlay, light_strength),
+                )
+            if index < int(args.debug_limit):
+                _write_sheet(
+                    dirs["sheet"] / f"{stem}.png",
+                    signed_target,
+                    signed_render,
+                    target_residual,
+                    recon_residual,
+                    error,
+                    weight,
+                    primitive_overlay,
+                    float(args.residual_clip),
+                )
+                _write_rgb_sheet(
+                    dirs["rgb_sheet"] / f"{stem}.png",
+                    anchor,
+                    target,
+                    target_rgb_hf,
+                    recon_rgb_hf,
+                    recon_rgb_hf_weighted,
+                    rgb_error_overlay,
+                )
         np.savez_compressed(dirs["primitives"] / f"{stem}.npz", **primitives, losses=np.asarray(losses, dtype=np.float32))
         if bool(args.save_pt):
             torch.save(model.state_dict(), dirs["pt"] / f"{stem}.pt")
@@ -1313,6 +1342,7 @@ def main() -> None:
         "model": args.model,
         "fit_target_mode": args.fit_target_mode,
         "rgb_loss_weight_mode": args.rgb_loss_weight_mode,
+        "output_profile": args.output_profile,
         "num_frames": len(rows),
         "num_gaussians": int(args.num_gaussians),
         "iterations": int(args.iterations),
