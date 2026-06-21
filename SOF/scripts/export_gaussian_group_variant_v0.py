@@ -20,7 +20,32 @@ for candidate in reversed((REPO_ROOT, PROJECT_ROOT / "mip-splatting")):
         if candidate_str not in sys.path:
             sys.path.insert(0, candidate_str)
 
-from gaussian_renderer import render_simple
+try:
+    from gaussian_renderer import render_simple
+except ImportError:
+    from gaussian_renderer import render as _render
+
+    class _PreviewPipeline:
+        convert_SHs_python = False
+        convert_SBs_python = False
+        compute_filter3D_python = False
+        debug = False
+        use_merged_sof_rasterizer = False
+        use_vanilla_sof_rasterizer = False
+
+    def render_simple(viewpoint_camera, pc, bg_color):
+        render_pkg = _render(
+            viewpoint_camera,
+            pc,
+            _PreviewPipeline(),
+            bg_color,
+            kernel_size=0.0,
+        )
+        if "alpha" not in render_pkg:
+            rgb = render_pkg["render"][:3]
+            alpha = torch.linalg.vector_norm(rgb - bg_color.reshape(3, 1, 1), dim=0, keepdim=True)
+            render_pkg["alpha"] = (alpha > 1e-4).to(dtype=rgb.dtype)
+        return render_pkg
 from scene import Scene
 from scene.gaussian_model import GaussianModel, GaussianSourceTag
 from export_gaussian_mask_subset_v0 import (

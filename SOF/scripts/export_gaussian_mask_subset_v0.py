@@ -15,10 +15,39 @@ from torch import nn
 from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+PROJECT_ROOT = REPO_ROOT.parent
+for candidate in reversed((REPO_ROOT, PROJECT_ROOT / "mip-splatting")):
+    if candidate.is_dir():
+        candidate_str = str(candidate)
+        if candidate_str not in sys.path:
+            sys.path.insert(0, candidate_str)
 
-from gaussian_renderer import render_simple
+try:
+    from gaussian_renderer import render_simple
+except ImportError:
+    from gaussian_renderer import render as _render
+
+    class _PreviewPipeline:
+        convert_SHs_python = False
+        convert_SBs_python = False
+        compute_filter3D_python = False
+        debug = False
+        use_merged_sof_rasterizer = False
+        use_vanilla_sof_rasterizer = False
+
+    def render_simple(viewpoint_camera, pc, bg_color):
+        render_pkg = _render(
+            viewpoint_camera,
+            pc,
+            _PreviewPipeline(),
+            bg_color,
+            kernel_size=0.0,
+        )
+        if "alpha" not in render_pkg:
+            rgb = render_pkg["render"][:3]
+            alpha = torch.linalg.vector_norm(rgb - bg_color.reshape(3, 1, 1), dim=0, keepdim=True)
+            render_pkg["alpha"] = (alpha > 1e-4).to(dtype=rgb.dtype)
+        return render_pkg
 from scene import Scene
 from scene.gaussian_model import GaussianModel
 
@@ -106,7 +135,10 @@ def _copy_render_config(src_model_path: Path, dst_model_path: Path) -> None:
 def _clone_subset_gaussians(base: GaussianModel, mask: torch.Tensor) -> GaussianModel:
     mask = mask.to(device=base.get_xyz.device, dtype=torch.bool).reshape(-1)
     count = int(mask.sum().item())
-    subset = GaussianModel(base.max_sh_degree, use_SBs=base.use_SBs)
+    if hasattr(base, "use_SBs"):
+        subset = GaussianModel(base.max_sh_degree, use_SBs=base.use_SBs)
+    else:
+        subset = GaussianModel(base.max_sh_degree)
     subset.active_sh_degree = int(base.active_sh_degree)
     subset.spatial_lr_scale = float(base.spatial_lr_scale)
     subset._xyz = nn.Parameter(base._xyz.detach()[mask].clone().requires_grad_(False))
