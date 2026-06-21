@@ -41,6 +41,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--confidence_power", type=float, default=1.5)
     parser.add_argument("--mask_power", type=float, default=1.0)
     parser.add_argument("--background_weight", type=float, default=0.02)
+    parser.add_argument("--fit_target_mode", default="hf_residual", choices=["hf_residual", "rgb"])
+    parser.add_argument("--rgb_loss_weight_mode", default="full", choices=["full", "trust", "trust_plus_background"])
     parser.add_argument("--num_gaussians", type=int, default=4096)
     parser.add_argument("--model", default="cholesky", choices=["cholesky", "rs"])
     parser.add_argument("--optimizer", default="adam", choices=["adam", "adan"])
@@ -278,7 +280,7 @@ def _trace_segment_one_side(
 def _build_segment_init_points(
     energy: np.ndarray,
     residual: np.ndarray,
-    signed_target: np.ndarray,
+    color_image: np.ndarray,
     count: int,
     args: argparse.Namespace,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -381,7 +383,7 @@ def _build_segment_init_points(
     coh = coherence[ys, xs]
     sigma_long = float(args.init_sigma_long_px) * (1.0 + float(args.init_coherence_long_boost) * coh)
     sigma_short = np.full_like(sigma_long, float(args.init_sigma_short_px), dtype=np.float32)
-    colors = signed_target[ys, xs, :].astype(np.float32)
+    colors = color_image[ys, xs, :].astype(np.float32)
     segment_ids_arr = np.asarray(segment_ids[: int(count)], dtype=np.int32)
     pair_arr = np.asarray(
         [(a, b) for a, b in pair_edges if a < int(count) and b < int(count)],
@@ -415,16 +417,18 @@ def _target_init_gaussianimage(
     weight: np.ndarray,
     residual_clip: float,
     args: argparse.Namespace,
+    init_color_image: Optional[np.ndarray] = None,
 ) -> Dict[str, np.ndarray]:
     h, w = signed_target.shape[:2]
     n = int(model._xyz.shape[0])
+    color_image = signed_target if init_color_image is None else init_color_image
     energy = np.clip(np.abs(residual).mean(axis=2) / max(float(residual_clip), 1e-8), 0.0, 1.0)
     energy = (energy * (np.clip(weight, 0.0, 1.0) ** max(float(args.init_weight_power), 0.0))).astype(np.float32)
     if bool(args.segment_init):
         coords, theta, sigma_long, sigma_short, colors, segment_ids, pair_edges = _build_segment_init_points(
             energy,
             residual,
-            signed_target,
+            color_image,
             n,
             args,
         )
@@ -455,7 +459,7 @@ def _target_init_gaussianimage(
         coh = coherence[ys, xs]
         sigma_long = float(args.init_sigma_long_px) * (1.0 + float(args.init_coherence_long_boost) * coh)
         sigma_short = np.full_like(sigma_long, float(args.init_sigma_short_px), dtype=np.float32)
-        colors = signed_target[ys, xs, :].astype(np.float32)
+        colors = color_image[ys, xs, :].astype(np.float32)
         segment_ids = np.full((n,), -1, dtype=np.int32)
         pair_edges = np.zeros((0, 2), dtype=np.int64)
     cholesky = _cholesky_from_orientation(theta.astype(np.float32), sigma_long.astype(np.float32), sigma_short)
@@ -567,7 +571,7 @@ def _target_signed_hf(
 
 def _fit_gaussianimage(
     module,
-    signed_target: np.ndarray,
+    fit_target: np.ndarray,
     target_residual: np.ndarray,
     weight: np.ndarray,
     num_gaussians: int,
@@ -580,12 +584,13 @@ def _fit_gaussianimage(
     lambda_l2: float,
     background_weight: float,
     args: argparse.Namespace,
+    init_color_image: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, object, List[float], Dict[str, np.ndarray]]:
     if not torch.cuda.is_available():
         raise RuntimeError("GaussianImage fitting requires CUDA for diff_gaussian_rasterization.")
-    h, w = signed_target.shape[:2]
+    h, w = fit_target.shape[:2]
     device = torch.device("cuda")
-    image_t = torch.from_numpy(signed_target).to(device=device, dtype=torch.float32).permute(2, 0, 1).contiguous()
+    image_t = torch.from_numpy(fit_target).to(device=device, dtype=torch.float32).permute(2, 0, 1).contiguous()
     weight_t = torch.from_numpy(np.clip(weight, 0.0, 1.0)).to(device=device, dtype=torch.float32)[None, :, :]
     weight_t = torch.clamp(weight_t + float(background_weight), 0.0, 1.0)
     model_cls = module["GaussianImage_Cholesky"] if model_name == "cholesky" else module["GaussianImage_RS"]
@@ -608,11 +613,12 @@ def _fit_gaussianimage(
     if not bool(args.init_random):
         init_meta = _target_init_gaussianimage(
             model,
-            signed_target,
+            fit_target,
             target_residual,
             weight,
             float(args.residual_clip),
             args,
+            init_color_image=init_color_image,
         )
     init_means_t: Optional[torch.Tensor] = None
     init_cholesky_t: Optional[torch.Tensor] = None
@@ -997,6 +1003,8 @@ def main() -> None:
         "primitive_overlay": output_dir / "primitive_overlay",
         "rgb_anchor": output_dir / "rgb_anchor",
         "rgb_target": output_dir / "rgb_target",
+        "rgb_recon": output_dir / "rgb_recon",
+        "rgb_recon_error": output_dir / "rgb_recon_error",
         "rgb_target_hf": output_dir / "rgb_target_hf",
         "rgb_recon_hf": output_dir / "rgb_recon_hf",
         "rgb_recon_hf_weighted": output_dir / "rgb_recon_hf_weighted",
@@ -1037,7 +1045,7 @@ def main() -> None:
     print(f"[gaussianimage-hf-v0] output : {output_dir}")
     print(
         f"[gaussianimage-hf-v0] fit    : model={args.model} n={args.num_gaussians} "
-        f"iters={args.iterations} lr={args.lr} loss={args.loss}"
+        f"iters={args.iterations} lr={args.lr} loss={args.loss} mode={args.fit_target_mode}"
     )
 
     for index, target_path in enumerate(tqdm(target_paths, desc="GaussianImage HF")):
@@ -1060,11 +1068,24 @@ def main() -> None:
             float(args.mask_power),
             bool(args.neutral_outside_mask),
         )
-        signed_render, model, losses, init_meta = _fit_gaussianimage(
+        if str(args.fit_target_mode) == "rgb":
+            fit_target = target
+            if str(args.rgb_loss_weight_mode) == "full":
+                fit_weight = np.ones_like(weight, dtype=np.float32)
+            elif str(args.rgb_loss_weight_mode) == "trust_plus_background":
+                fit_weight = np.clip(weight + float(args.background_weight), 0.0, 1.0).astype(np.float32)
+            else:
+                fit_weight = weight
+            init_color_image = target
+        else:
+            fit_target = signed_target
+            fit_weight = weight
+            init_color_image = None
+        fit_render, model, losses, init_meta = _fit_gaussianimage(
             module,
-            signed_target,
+            fit_target,
             target_residual,
-            weight,
+            fit_weight,
             int(args.num_gaussians),
             str(args.model),
             int(args.iterations),
@@ -1075,8 +1096,25 @@ def main() -> None:
             float(args.lambda_l2),
             float(args.background_weight),
             args,
+            init_color_image=init_color_image,
         )
-        recon_residual = _signed_to_residual(signed_render, float(args.residual_clip))
+        if str(args.fit_target_mode) == "rgb":
+            rgb_render = fit_render
+            recon_residual = float(args.detail_alpha) * (
+                rgb_render - _box_blur_rgb(rgb_render, int(args.highpass_kernel)) - (anchor - _box_blur_rgb(anchor, int(args.highpass_kernel)))
+            )
+            recon_residual = np.clip(recon_residual, -float(args.residual_clip), float(args.residual_clip)).astype(np.float32)
+            signed_render = np.clip(
+                0.5 + recon_residual / (2.0 * max(float(args.residual_clip), 1e-8)),
+                0.0,
+                1.0,
+            ).astype(np.float32)
+            rgb_l1 = _weighted_l1(rgb_render, target, np.ones_like(weight, dtype=np.float32))
+        else:
+            signed_render = fit_render
+            rgb_render = np.clip(anchor + _signed_to_residual(signed_render, float(args.residual_clip)), 0.0, 1.0)
+            recon_residual = _signed_to_residual(signed_render, float(args.residual_clip))
+            rgb_l1 = float("nan")
         error = recon_residual - target_residual
         target_abs = np.clip(np.abs(target_residual).mean(axis=2) / max(float(args.residual_clip), 1e-8), 0.0, 1.0)
         recon_abs = np.clip(np.abs(recon_residual).mean(axis=2) / max(float(args.residual_clip), 1e-8), 0.0, 1.0)
@@ -1114,6 +1152,8 @@ def main() -> None:
         _save_rgb(dirs["primitive_overlay"] / f"{stem}.png", primitive_overlay)
         _save_rgb(dirs["rgb_anchor"] / f"{stem}.png", anchor)
         _save_rgb(dirs["rgb_target"] / f"{stem}.png", target)
+        _save_rgb(dirs["rgb_recon"] / f"{stem}.png", rgb_render)
+        _save_rgb(dirs["rgb_recon_error"] / f"{stem}.png", np.repeat(np.clip(np.abs(rgb_render - target).mean(axis=2, keepdims=True) * 4.0, 0.0, 1.0), 3, axis=2))
         _save_rgb(dirs["rgb_target_hf"] / f"{stem}.png", target_rgb_hf)
         _save_rgb(dirs["rgb_recon_hf"] / f"{stem}.png", recon_rgb_hf)
         _save_rgb(dirs["rgb_recon_hf_weighted"] / f"{stem}.png", recon_rgb_hf_weighted)
@@ -1167,6 +1207,7 @@ def main() -> None:
             "recon_energy": _weighted_energy(recon_residual, weight),
             "l1": _weighted_l1(recon_residual, target_residual, weight),
             "corr_abs": _pearson_abs(recon_residual, target_residual, weight),
+            "rgb_l1": rgb_l1,
             "weight_mean": float(weight.mean()),
         }
         rows.append(row)
@@ -1194,10 +1235,13 @@ def main() -> None:
         "output_dir": str(output_dir),
         "match_policy": args.match_policy,
         "model": args.model,
+        "fit_target_mode": args.fit_target_mode,
+        "rgb_loss_weight_mode": args.rgb_loss_weight_mode,
         "num_frames": len(rows),
         "num_gaussians": int(args.num_gaussians),
         "iterations": int(args.iterations),
         "loss_final_mean": _mean(rows, "loss_final"),
+        "rgb_l1_mean": _mean(rows, "rgb_l1"),
         "l1_mean": _mean(rows, "l1"),
         "corr_abs_mean": _mean(rows, "corr_abs"),
         "target_energy_mean": _mean(rows, "target_energy"),
@@ -1219,6 +1263,7 @@ def main() -> None:
                 "recon_energy",
                 "l1",
                 "corr_abs",
+                "rgb_l1",
                 "weight_mean",
             ],
         )
