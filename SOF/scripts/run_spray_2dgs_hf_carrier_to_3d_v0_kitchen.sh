@@ -30,6 +30,7 @@ OUTPUT_NAME="${OUTPUT_NAME:-${BASE_EXPERIMENT_NAME}_spray_2dgs_effective_hf_v0}"
 OUTPUT_MODEL_DIR="${OUTPUT_MODEL_DIR:-${SOF_ROOT}/output/mipsplatting_2dgs_hf_spray_v0/${SCENE_NAME}/${OUTPUT_NAME}}"
 NEWBORN_MODEL_DIR="${NEWBORN_MODEL_DIR:-${OUTPUT_MODEL_DIR}_newborn_only}"
 OUTPUT_ITERATION="${OUTPUT_ITERATION:-${BASE_ITERATION}}"
+MERGE_SCRIPT="${MERGE_SCRIPT:-}"
 
 MATCH_POLICY="${MATCH_POLICY:-order_if_needed}"
 LIMIT="${LIMIT:-0}"
@@ -117,7 +118,19 @@ fi
 
 cd "${SOF_ROOT}"
 export PYTHONPATH="${SOF_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
-"${PYTHON_BIN}" "${SOF_ROOT}/merge_gaussian_plys_v0.py" \
+if [[ -z "${MERGE_SCRIPT}" ]]; then
+  if [[ -f "${SOF_ROOT}/merge_gaussian_plys_v0.py" ]]; then
+    MERGE_SCRIPT="${SOF_ROOT}/merge_gaussian_plys_v0.py"
+  else
+    MERGE_SCRIPT="${SOF_ROOT}/scripts/merge_gaussian_plys_v0.py"
+  fi
+fi
+if [[ ! -f "${MERGE_SCRIPT}" ]]; then
+  echo "[spray-2dgs-to-3d-v0] merge script not found: ${MERGE_SCRIPT}" >&2
+  exit 1
+fi
+echo "[spray-2dgs-to-3d-v0] merge     : ${MERGE_SCRIPT}"
+"${PYTHON_BIN}" "${MERGE_SCRIPT}" \
   --source_path "${SCENE_ROOT}" \
   --model_path "${OUTPUT_MODEL_DIR}" \
   --images images_2 \
