@@ -237,10 +237,15 @@ def _mean_dict(rows: Sequence[Dict[str, float]]) -> Dict[str, float]:
 
 
 def _classify(summary: Dict[str, float]) -> Dict[str, str]:
-    chroma_fraction = float(summary.get("delta_chroma_fraction_mean", float("nan")))
-    hf_ratio = float(summary.get("delta_hf_band_fraction_mean", float("nan")))
-    flat_ratio = float(summary.get("hf_flat_over_edge_ratio_mean", float("nan")))
-    low_ratio = float(summary.get("delta_lf_band_fraction_mean", float("nan")))
+    def _metric(name: str) -> float:
+        if name in summary:
+            return float(summary.get(name, float("nan")))
+        return float(summary.get(f"{name}_mean", float("nan")))
+
+    chroma_fraction = _metric("delta_chroma_fraction")
+    hf_ratio = _metric("delta_hf_band_fraction")
+    flat_ratio = _metric("hf_flat_over_edge_ratio")
+    low_ratio = _metric("delta_lf_band_fraction")
     labels: List[str] = []
     if math.isfinite(chroma_fraction) and chroma_fraction < 0.20:
         labels.append("mostly_luma_not_color")
