@@ -31,18 +31,24 @@ except ImportError:
     class _PreviewPipeline:
         convert_SHs_python = False
         convert_SBs_python = False
+        compute_cov3D_python = False
         compute_filter3D_python = False
+        compute_view2gaussian_python = False
         debug = False
         use_merged_sof_rasterizer = False
         use_vanilla_sof_rasterizer = False
 
     def render_simple(viewpoint_camera, pc, bg_color):
+        render_kwargs = {}
+        render_params = inspect.signature(_render).parameters
+        if "kernel_size" in render_params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in render_params.values()):
+            render_kwargs["kernel_size"] = 0.0
         render_pkg = _render(
             viewpoint_camera,
             pc,
             _PreviewPipeline(),
             bg_color,
-            kernel_size=0.0,
+            **render_kwargs,
         )
         if "alpha" not in render_pkg:
             rgb = render_pkg["render"][:3]
