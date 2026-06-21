@@ -71,6 +71,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--segment_pair_weight", type=float, default=0.030)
     parser.add_argument("--segment_shape_weight", type=float, default=0.001)
     parser.add_argument("--segment_color_smooth_weight", type=float, default=0.002)
+    parser.add_argument("--light_visuals", action="store_true", help="Also write white-background diagnostic images.")
+    parser.add_argument("--light_visual_strength", type=float, default=0.75)
     parser.add_argument("--neutral_outside_mask", action="store_true")
     parser.add_argument("--no_neutral_outside_mask", dest="neutral_outside_mask", action="store_false")
     parser.set_defaults(neutral_outside_mask=False)
@@ -752,6 +754,33 @@ def _overlay(target_abs: np.ndarray, recon_abs: np.ndarray, weight: np.ndarray) 
     return np.clip(rgb * (0.12 + 0.88 * np.clip(weight[..., None], 0.0, 1.0)), 0.0, 1.0)
 
 
+def _light_abs(gray: np.ndarray, strength: float) -> np.ndarray:
+    value = 1.0 - float(strength) * np.clip(gray, 0.0, 1.0)
+    return np.repeat(np.clip(value[..., None], 0.0, 1.0), 3, axis=2)
+
+
+def _light_signed(value: np.ndarray, strength: float) -> np.ndarray:
+    # Signed HF uses 0.5 as neutral. Show residual magnitude on a white canvas
+    # so sparse line structure is easier to inspect than on a black canvas.
+    residual = np.abs(np.clip(value, 0.0, 1.0) - 0.5) * 2.0
+    return 1.0 - float(strength) * residual
+
+
+def _light_overlay(target_abs: np.ndarray, recon_abs: np.ndarray, weight: np.ndarray, strength: float) -> np.ndarray:
+    target = np.clip(target_abs, 0.0, 1.0) * np.clip(weight, 0.0, 1.0)
+    recon = np.clip(recon_abs, 0.0, 1.0) * np.clip(weight, 0.0, 1.0)
+    rgb = np.ones((*target.shape, 3), dtype=np.float32)
+    rgb[..., 1] -= float(strength) * target
+    rgb[..., 2] -= float(strength) * target
+    rgb[..., 0] -= float(strength) * recon
+    return np.clip(rgb, 0.0, 1.0)
+
+
+def _light_primitive_overlay(primitive_overlay: np.ndarray, strength: float) -> np.ndarray:
+    gray = np.clip(primitive_overlay.mean(axis=2), 0.0, 1.0)
+    return _light_abs(gray, strength)
+
+
 def _primitive_overlay(primitives: Dict[str, np.ndarray], h: int, w: int, max_draw: int = 4096) -> np.ndarray:
     image = Image.new("RGB", (w, h), (0, 0, 0))
     draw = ImageDraw.Draw(image)
@@ -860,6 +889,17 @@ def main() -> None:
         "sheet": output_dir / "sheet",
         "primitives": output_dir / "primitives",
     }
+    if bool(args.light_visuals):
+        dirs.update(
+            {
+                "target_abs_light": output_dir / "target_abs_light",
+                "recon_abs_light": output_dir / "recon_abs_light",
+                "target_hf_light": output_dir / "target_hf_light",
+                "recon_hf_light": output_dir / "recon_hf_light",
+                "overlay_light": output_dir / "overlay_light",
+                "primitive_overlay_light": output_dir / "primitive_overlay_light",
+            }
+        )
     if bool(args.save_pt):
         dirs["pt"] = output_dir / "pt"
     for directory in dirs.values():
@@ -937,6 +977,17 @@ def main() -> None:
         _save_rgb(dirs["edge_recon"] / f"{stem}.png", np.clip(anchor + recon_residual, 0.0, 1.0))
         _save_rgb(dirs["overlay"] / f"{stem}.png", overlay)
         _save_rgb(dirs["primitive_overlay"] / f"{stem}.png", primitive_overlay)
+        if bool(args.light_visuals):
+            light_strength = float(args.light_visual_strength)
+            _save_rgb(dirs["target_abs_light"] / f"{stem}.png", _light_abs(target_abs, light_strength))
+            _save_rgb(dirs["recon_abs_light"] / f"{stem}.png", _light_abs(recon_abs, light_strength))
+            _save_rgb(dirs["target_hf_light"] / f"{stem}.png", _light_signed(signed_target, light_strength))
+            _save_rgb(dirs["recon_hf_light"] / f"{stem}.png", _light_signed(signed_render, light_strength))
+            _save_rgb(dirs["overlay_light"] / f"{stem}.png", _light_overlay(target_abs, recon_abs, weight, light_strength))
+            _save_rgb(
+                dirs["primitive_overlay_light"] / f"{stem}.png",
+                _light_primitive_overlay(primitive_overlay, light_strength),
+            )
         if index < int(args.debug_limit):
             _write_sheet(
                 dirs["sheet"] / f"{stem}.png",

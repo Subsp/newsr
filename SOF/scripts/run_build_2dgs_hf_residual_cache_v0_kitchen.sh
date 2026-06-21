@@ -60,6 +60,8 @@ SEGMENT_ANCHOR_WEIGHT="${SEGMENT_ANCHOR_WEIGHT:-0.015}"
 SEGMENT_PAIR_WEIGHT="${SEGMENT_PAIR_WEIGHT:-0.030}"
 SEGMENT_SHAPE_WEIGHT="${SEGMENT_SHAPE_WEIGHT:-0.001}"
 SEGMENT_COLOR_SMOOTH_WEIGHT="${SEGMENT_COLOR_SMOOTH_WEIGHT:-0.002}"
+LIGHT_VIS="${LIGHT_VIS:-0}"
+LIGHT_VIS_STRENGTH="${LIGHT_VIS_STRENGTH:-0.75}"
 SAVE_PT="${SAVE_PT:-0}"
 
 for required in "${EXTERNAL_REPO_ROOT}" "${TARGET_DIR}" "${MASK_DIR}" "${ANCHOR_DIR}"; do
@@ -112,6 +114,7 @@ ARGS=(
   --segment_pair_weight "${SEGMENT_PAIR_WEIGHT}"
   --segment_shape_weight "${SEGMENT_SHAPE_WEIGHT}"
   --segment_color_smooth_weight "${SEGMENT_COLOR_SMOOTH_WEIGHT}"
+  --light_visual_strength "${LIGHT_VIS_STRENGTH}"
   --limit "${LIMIT}"
   --debug_limit "${DEBUG_LIMIT}"
 )
@@ -130,6 +133,10 @@ if [[ "${NEUTRAL_OUTSIDE_MASK}" == "1" ]]; then
   ARGS+=(--neutral_outside_mask)
 else
   ARGS+=(--no_neutral_outside_mask)
+fi
+
+if [[ "${LIGHT_VIS}" == "1" ]]; then
+  ARGS+=(--light_visuals)
 fi
 
 if [[ "${SAVE_PT}" == "1" ]]; then
@@ -154,3 +161,9 @@ echo "  ${OUTPUT_ROOT}/overlay"
 echo "  ${OUTPUT_ROOT}/primitive_overlay"
 echo "  ${OUTPUT_ROOT}/recon_hf"
 echo "  ${OUTPUT_ROOT}/target_hf"
+if [[ "${LIGHT_VIS}" == "1" ]]; then
+  echo "  ${OUTPUT_ROOT}/recon_abs_light"
+  echo "  ${OUTPUT_ROOT}/target_abs_light"
+  echo "  ${OUTPUT_ROOT}/primitive_overlay_light"
+  echo "  ${OUTPUT_ROOT}/overlay_light"
+fi
