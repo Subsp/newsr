@@ -806,6 +806,62 @@ def _rgb_hf_error_overlay(
     return np.clip(rgb, 0.0, 1.0)
 
 
+def _sample_rgb_bilinear(image: np.ndarray, xy: np.ndarray) -> np.ndarray:
+    h, w = image.shape[:2]
+    x = np.clip(xy[:, 0].astype(np.float32), 0.0, max(float(w - 1), 0.0))
+    y = np.clip(xy[:, 1].astype(np.float32), 0.0, max(float(h - 1), 0.0))
+    x0 = np.floor(x).astype(np.int64)
+    y0 = np.floor(y).astype(np.int64)
+    x1 = np.clip(x0 + 1, 0, w - 1)
+    y1 = np.clip(y0 + 1, 0, h - 1)
+    wx = (x - x0.astype(np.float32))[:, None]
+    wy = (y - y0.astype(np.float32))[:, None]
+    c00 = image[y0, x0, :]
+    c10 = image[y0, x1, :]
+    c01 = image[y1, x0, :]
+    c11 = image[y1, x1, :]
+    return (
+        c00 * (1.0 - wx) * (1.0 - wy)
+        + c10 * wx * (1.0 - wy)
+        + c01 * (1.0 - wx) * wy
+        + c11 * wx * wy
+    ).astype(np.float32)
+
+
+def _render_model_with_colors(model, colors: np.ndarray, background: float = 0.0) -> np.ndarray:
+    device = model._features_dc.device
+    old_features = model._features_dc.detach().clone()
+    old_background = model.background.detach().clone() if hasattr(model, "background") else None
+    try:
+        with torch.no_grad():
+            model._features_dc.copy_(torch.from_numpy(colors).to(device=device, dtype=model._features_dc.dtype))
+            if hasattr(model, "background"):
+                model.background.fill_(float(background))
+            render = (
+                model.forward()["render"]
+                .squeeze(0)
+                .detach()
+                .clamp(0.0, 1.0)
+                .permute(1, 2, 0)
+                .cpu()
+                .numpy()
+                .astype(np.float32)
+            )
+    finally:
+        with torch.no_grad():
+            model._features_dc.copy_(old_features)
+            if old_background is not None:
+                model.background.copy_(old_background)
+    return render
+
+
+def _composite_over(base: np.ndarray, foreground: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    a = np.clip(alpha, 0.0, 1.0)
+    if a.ndim == 2:
+        a = a[..., None]
+    return np.clip(foreground * a + base * (1.0 - a), 0.0, 1.0)
+
+
 def _primitive_overlay(primitives: Dict[str, np.ndarray], h: int, w: int, max_draw: int = 4096) -> np.ndarray:
     image = Image.new("RGB", (w, h), (0, 0, 0))
     draw = ImageDraw.Draw(image)
@@ -946,6 +1002,10 @@ def main() -> None:
         "rgb_recon_hf_weighted": output_dir / "rgb_recon_hf_weighted",
         "rgb_error_overlay": output_dir / "rgb_error_overlay",
         "rgb_sheet": output_dir / "rgb_sheet",
+        "carrier_alpha": output_dir / "carrier_alpha",
+        "carrier_rgb_target": output_dir / "carrier_rgb_target",
+        "carrier_rgb_anchor": output_dir / "carrier_rgb_anchor",
+        "carrier_rgb_target_over_anchor": output_dir / "carrier_rgb_target_over_anchor",
         "sheet": output_dir / "sheet",
         "primitives": output_dir / "primitives",
     }
@@ -1031,6 +1091,17 @@ def main() -> None:
             primitives["pair_edges"] = init_meta["pair_edges"]
             primitives["init_mu_norm"] = init_meta["means_norm"]
             primitives["init_cholesky"] = init_meta["cholesky"]
+        carrier_target_colors = _sample_rgb_bilinear(target, primitives["mu_xy"])
+        carrier_anchor_colors = _sample_rgb_bilinear(anchor, primitives["mu_xy"])
+        carrier_rgb_target = _render_model_with_colors(model, carrier_target_colors, background=0.0)
+        carrier_rgb_anchor = _render_model_with_colors(model, carrier_anchor_colors, background=0.0)
+        carrier_alpha_rgb = _render_model_with_colors(
+            model,
+            np.ones_like(carrier_target_colors, dtype=np.float32),
+            background=0.0,
+        )
+        carrier_alpha = np.clip(carrier_alpha_rgb.mean(axis=2), 0.0, 1.0)
+        carrier_rgb_target_over_anchor = _composite_over(anchor, carrier_rgb_target, carrier_alpha)
         primitive_overlay = _primitive_overlay(primitives, target.shape[0], target.shape[1])
 
         stem = target_path.stem
@@ -1047,6 +1118,10 @@ def main() -> None:
         _save_rgb(dirs["rgb_recon_hf"] / f"{stem}.png", recon_rgb_hf)
         _save_rgb(dirs["rgb_recon_hf_weighted"] / f"{stem}.png", recon_rgb_hf_weighted)
         _save_rgb(dirs["rgb_error_overlay"] / f"{stem}.png", rgb_error_overlay)
+        _save_gray(dirs["carrier_alpha"] / f"{stem}.png", carrier_alpha)
+        _save_rgb(dirs["carrier_rgb_target"] / f"{stem}.png", carrier_rgb_target)
+        _save_rgb(dirs["carrier_rgb_anchor"] / f"{stem}.png", carrier_rgb_anchor)
+        _save_rgb(dirs["carrier_rgb_target_over_anchor"] / f"{stem}.png", carrier_rgb_target_over_anchor)
         if bool(args.light_visuals):
             light_strength = float(args.light_visual_strength)
             _save_rgb(dirs["target_abs_light"] / f"{stem}.png", _light_abs(target_abs, light_strength))
