@@ -49,6 +49,17 @@ INIT_ORIENTATION_RADIUS_PX="${INIT_ORIENTATION_RADIUS_PX:-5}"
 INIT_SIGMA_LONG_PX="${INIT_SIGMA_LONG_PX:-5.0}"
 INIT_SIGMA_SHORT_PX="${INIT_SIGMA_SHORT_PX:-0.8}"
 INIT_COHERENCE_LONG_BOOST="${INIT_COHERENCE_LONG_BOOST:-0.75}"
+SEGMENT_INIT="${SEGMENT_INIT:-1}"
+SEGMENT_SAMPLES_PER_SEED="${SEGMENT_SAMPLES_PER_SEED:-7}"
+SEGMENT_STEP_PX="${SEGMENT_STEP_PX:-2.0}"
+SEGMENT_SEED_NMS_RADIUS_PX="${SEGMENT_SEED_NMS_RADIUS_PX:-8}"
+SEGMENT_TRACE_SEARCH_RADIUS_PX="${SEGMENT_TRACE_SEARCH_RADIUS_PX:-2}"
+SEGMENT_TURN_MIN_COS="${SEGMENT_TURN_MIN_COS:-0.45}"
+SEGMENT_MIN_SCORE="${SEGMENT_MIN_SCORE:--1.0}"
+SEGMENT_ANCHOR_WEIGHT="${SEGMENT_ANCHOR_WEIGHT:-0.015}"
+SEGMENT_PAIR_WEIGHT="${SEGMENT_PAIR_WEIGHT:-0.030}"
+SEGMENT_SHAPE_WEIGHT="${SEGMENT_SHAPE_WEIGHT:-0.001}"
+SEGMENT_COLOR_SMOOTH_WEIGHT="${SEGMENT_COLOR_SMOOTH_WEIGHT:-0.002}"
 SAVE_PT="${SAVE_PT:-0}"
 
 for required in "${EXTERNAL_REPO_ROOT}" "${TARGET_DIR}" "${MASK_DIR}" "${ANCHOR_DIR}"; do
@@ -91,12 +102,28 @@ ARGS=(
   --init_sigma_long_px "${INIT_SIGMA_LONG_PX}"
   --init_sigma_short_px "${INIT_SIGMA_SHORT_PX}"
   --init_coherence_long_boost "${INIT_COHERENCE_LONG_BOOST}"
+  --segment_samples_per_seed "${SEGMENT_SAMPLES_PER_SEED}"
+  --segment_step_px "${SEGMENT_STEP_PX}"
+  --segment_seed_nms_radius_px "${SEGMENT_SEED_NMS_RADIUS_PX}"
+  --segment_trace_search_radius_px "${SEGMENT_TRACE_SEARCH_RADIUS_PX}"
+  --segment_turn_min_cos "${SEGMENT_TURN_MIN_COS}"
+  --segment_min_score "${SEGMENT_MIN_SCORE}"
+  --segment_anchor_weight "${SEGMENT_ANCHOR_WEIGHT}"
+  --segment_pair_weight "${SEGMENT_PAIR_WEIGHT}"
+  --segment_shape_weight "${SEGMENT_SHAPE_WEIGHT}"
+  --segment_color_smooth_weight "${SEGMENT_COLOR_SMOOTH_WEIGHT}"
   --limit "${LIMIT}"
   --debug_limit "${DEBUG_LIMIT}"
 )
 
 if [[ "${INIT_RANDOM}" == "1" ]]; then
   ARGS+=(--init_random)
+fi
+
+if [[ "${SEGMENT_INIT}" == "1" ]]; then
+  ARGS+=(--segment_init)
+else
+  ARGS+=(--no_segment_init)
 fi
 
 if [[ "${NEUTRAL_OUTSIDE_MASK}" == "1" ]]; then

@@ -58,6 +58,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--init_sigma_long_px", type=float, default=5.0)
     parser.add_argument("--init_sigma_short_px", type=float, default=0.8)
     parser.add_argument("--init_coherence_long_boost", type=float, default=0.75)
+    parser.add_argument("--segment_init", action="store_true")
+    parser.add_argument("--no_segment_init", dest="segment_init", action="store_false")
+    parser.set_defaults(segment_init=True)
+    parser.add_argument("--segment_samples_per_seed", type=int, default=7)
+    parser.add_argument("--segment_step_px", type=float, default=2.0)
+    parser.add_argument("--segment_seed_nms_radius_px", type=int, default=8)
+    parser.add_argument("--segment_trace_search_radius_px", type=int, default=2)
+    parser.add_argument("--segment_turn_min_cos", type=float, default=0.45)
+    parser.add_argument("--segment_min_score", type=float, default=-1.0)
+    parser.add_argument("--segment_anchor_weight", type=float, default=0.015)
+    parser.add_argument("--segment_pair_weight", type=float, default=0.030)
+    parser.add_argument("--segment_shape_weight", type=float, default=0.001)
+    parser.add_argument("--segment_color_smooth_weight", type=float, default=0.002)
     parser.add_argument("--neutral_outside_mask", action="store_true")
     parser.add_argument("--no_neutral_outside_mask", dest="neutral_outside_mask", action="store_false")
     parser.set_defaults(neutral_outside_mask=False)
@@ -207,6 +220,176 @@ def _select_energy_pixels(
     return np.asarray(coords, dtype=np.float32), np.asarray(scores, dtype=np.float32)
 
 
+def _angle_abs_cos(theta_a: float, theta_b: float) -> float:
+    return float(abs(math.cos(float(theta_a) - float(theta_b))))
+
+
+def _trace_segment_one_side(
+    seed_xy: np.ndarray,
+    seed_theta: float,
+    sign: float,
+    energy: np.ndarray,
+    tangent: np.ndarray,
+    min_score: float,
+    step_px: float,
+    half_samples: int,
+    search_radius_px: int,
+    turn_min_cos: float,
+) -> List[Tuple[float, float]]:
+    h, w = energy.shape
+    pos = np.asarray(seed_xy, dtype=np.float32).copy()
+    theta = float(seed_theta)
+    out: List[Tuple[float, float]] = []
+    r = max(0, int(search_radius_px))
+    for _ in range(max(0, int(half_samples))):
+        direction = np.asarray([math.cos(theta), math.sin(theta)], dtype=np.float32) * float(sign)
+        pred = pos + float(step_px) * direction
+        px = int(round(float(pred[0])))
+        py = int(round(float(pred[1])))
+        best_score = -1.0
+        best_xy: Optional[Tuple[int, int]] = None
+        best_theta = theta
+        for yy in range(max(0, py - r), min(h, py + r + 1)):
+            for xx in range(max(0, px - r), min(w, px + r + 1)):
+                score = float(energy[yy, xx])
+                if score < float(min_score):
+                    continue
+                cand_theta = float(tangent[yy, xx])
+                continuity = _angle_abs_cos(theta, cand_theta)
+                if continuity < float(turn_min_cos):
+                    continue
+                # Prefer high-energy ridge pixels, but keep tangent continuity as
+                # a real part of the score so we do not jump across nearby edges.
+                combined = score * (0.35 + 0.65 * continuity)
+                if combined > best_score:
+                    best_score = combined
+                    best_xy = (xx, yy)
+                    best_theta = cand_theta
+        if best_xy is None:
+            break
+        pos = np.asarray(best_xy, dtype=np.float32)
+        theta = best_theta
+        out.append((float(pos[0]), float(pos[1])))
+    return out
+
+
+def _build_segment_init_points(
+    energy: np.ndarray,
+    residual: np.ndarray,
+    signed_target: np.ndarray,
+    count: int,
+    args: argparse.Namespace,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    h, w = energy.shape
+    tangent, coherence = _structure_tensor_tangent(energy, int(args.init_orientation_radius_px))
+    samples_per_seed = max(1, int(args.segment_samples_per_seed))
+    half_samples = max(0, (samples_per_seed - 1) // 2)
+    seed_count = int(math.ceil(max(int(count), 1) / float(samples_per_seed)) * 1.35)
+    min_score = float(args.init_min_score if float(args.segment_min_score) < 0.0 else args.segment_min_score)
+    seed_xy, _ = _select_energy_pixels(
+        energy,
+        seed_count,
+        min_score,
+        int(args.segment_seed_nms_radius_px),
+        int(args.init_max_candidates),
+    )
+    coords: List[Tuple[float, float]] = []
+    thetas: List[float] = []
+    segment_ids: List[int] = []
+    segment_orders: List[int] = []
+    pair_edges: List[Tuple[int, int]] = []
+    segment_id = 0
+    for seed in seed_xy:
+        sx = int(np.clip(round(float(seed[0])), 0, w - 1))
+        sy = int(np.clip(round(float(seed[1])), 0, h - 1))
+        seed_theta = float(tangent[sy, sx])
+        back = _trace_segment_one_side(
+            seed,
+            seed_theta,
+            -1.0,
+            energy,
+            tangent,
+            min_score,
+            float(args.segment_step_px),
+            half_samples,
+            int(args.segment_trace_search_radius_px),
+            float(args.segment_turn_min_cos),
+        )
+        fwd = _trace_segment_one_side(
+            seed,
+            seed_theta,
+            1.0,
+            energy,
+            tangent,
+            min_score,
+            float(args.segment_step_px),
+            half_samples,
+            int(args.segment_trace_search_radius_px),
+            float(args.segment_turn_min_cos),
+        )
+        chain = list(reversed(back)) + [(float(seed[0]), float(seed[1]))] + fwd
+        if len(chain) < 2:
+            continue
+        start_index = len(coords)
+        for order, (x, y) in enumerate(chain):
+            if len(coords) >= int(count):
+                break
+            xi = int(np.clip(round(x), 0, w - 1))
+            yi = int(np.clip(round(y), 0, h - 1))
+            coords.append((float(xi), float(yi)))
+            thetas.append(float(tangent[yi, xi]))
+            segment_ids.append(segment_id)
+            segment_orders.append(order)
+            if order > 0:
+                pair_edges.append((len(coords) - 2, len(coords) - 1))
+        segment_id += 1
+        if len(coords) >= int(count):
+            break
+    if len(coords) < int(count):
+        missing = int(count) - len(coords)
+        extra_xy, _ = _select_energy_pixels(
+            energy,
+            missing,
+            min_score,
+            int(args.init_nms_radius_px),
+            int(args.init_max_candidates),
+        )
+        if extra_xy.shape[0] < missing:
+            rng = np.random.default_rng(12345)
+            extra_random = np.stack(
+                [
+                    rng.uniform(0.0, max(float(w - 1), 1.0), size=missing - extra_xy.shape[0]),
+                    rng.uniform(0.0, max(float(h - 1), 1.0), size=missing - extra_xy.shape[0]),
+                ],
+                axis=1,
+            ).astype(np.float32)
+            extra_xy = np.concatenate([extra_xy, extra_random], axis=0)
+        for x, y in extra_xy[:missing]:
+            xi = int(np.clip(round(float(x)), 0, w - 1))
+            yi = int(np.clip(round(float(y)), 0, h - 1))
+            coords.append((float(xi), float(yi)))
+            thetas.append(float(tangent[yi, xi]))
+            segment_ids.append(-1)
+            segment_orders.append(-1)
+    coords_arr = np.asarray(coords[: int(count)], dtype=np.float32)
+    theta_arr = np.asarray(thetas[: int(count)], dtype=np.float32)
+    xy_int = np.rint(coords_arr).astype(np.int64)
+    xs = np.clip(xy_int[:, 0], 0, w - 1)
+    ys = np.clip(xy_int[:, 1], 0, h - 1)
+    coh = coherence[ys, xs]
+    sigma_long = float(args.init_sigma_long_px) * (1.0 + float(args.init_coherence_long_boost) * coh)
+    sigma_short = np.full_like(sigma_long, float(args.init_sigma_short_px), dtype=np.float32)
+    colors = signed_target[ys, xs, :].astype(np.float32)
+    segment_ids_arr = np.asarray(segment_ids[: int(count)], dtype=np.int32)
+    pair_arr = np.asarray(
+        [(a, b) for a, b in pair_edges if a < int(count) and b < int(count)],
+        dtype=np.int64,
+    )
+    if pair_arr.size == 0:
+        pair_arr = np.zeros((0, 2), dtype=np.int64)
+    return coords_arr, theta_arr, sigma_long.astype(np.float32), sigma_short, colors, segment_ids_arr, pair_arr
+
+
 def _cholesky_from_orientation(theta: np.ndarray, sigma_long: np.ndarray, sigma_short: np.ndarray) -> np.ndarray:
     out = np.zeros((theta.shape[0], 3), dtype=np.float32)
     for i in range(theta.shape[0]):
@@ -230,44 +413,54 @@ def _target_init_gaussianimage(
     weight: np.ndarray,
     residual_clip: float,
     args: argparse.Namespace,
-) -> None:
+) -> Dict[str, np.ndarray]:
     h, w = signed_target.shape[:2]
     n = int(model._xyz.shape[0])
     energy = np.clip(np.abs(residual).mean(axis=2) / max(float(residual_clip), 1e-8), 0.0, 1.0)
     energy = (energy * (np.clip(weight, 0.0, 1.0) ** max(float(args.init_weight_power), 0.0))).astype(np.float32)
-    coords, scores = _select_energy_pixels(
-        energy,
-        n,
-        float(args.init_min_score),
-        int(args.init_nms_radius_px),
-        int(args.init_max_candidates),
-    )
-    if coords.shape[0] < n:
-        missing = n - int(coords.shape[0])
-        rng = np.random.default_rng(12345)
-        extra_xy = np.stack(
-            [
-                rng.uniform(0.0, max(float(w - 1), 1.0), size=missing),
-                rng.uniform(0.0, max(float(h - 1), 1.0), size=missing),
-            ],
-            axis=1,
-        ).astype(np.float32)
-        coords = np.concatenate([coords, extra_xy], axis=0)
-        scores = np.concatenate([scores, np.zeros((missing,), dtype=np.float32)], axis=0)
-    xy_int = np.rint(coords).astype(np.int64)
-    xs = np.clip(xy_int[:, 0], 0, w - 1)
-    ys = np.clip(xy_int[:, 1], 0, h - 1)
-    tangent, coherence = _structure_tensor_tangent(energy, int(args.init_orientation_radius_px))
-    theta = tangent[ys, xs]
-    coh = coherence[ys, xs]
-    sigma_long = float(args.init_sigma_long_px) * (1.0 + float(args.init_coherence_long_boost) * coh)
-    sigma_short = np.full_like(sigma_long, float(args.init_sigma_short_px), dtype=np.float32)
+    if bool(args.segment_init):
+        coords, theta, sigma_long, sigma_short, colors, segment_ids, pair_edges = _build_segment_init_points(
+            energy,
+            residual,
+            signed_target,
+            n,
+            args,
+        )
+    else:
+        coords, _ = _select_energy_pixels(
+            energy,
+            n,
+            float(args.init_min_score),
+            int(args.init_nms_radius_px),
+            int(args.init_max_candidates),
+        )
+        if coords.shape[0] < n:
+            missing = n - int(coords.shape[0])
+            rng = np.random.default_rng(12345)
+            extra_xy = np.stack(
+                [
+                    rng.uniform(0.0, max(float(w - 1), 1.0), size=missing),
+                    rng.uniform(0.0, max(float(h - 1), 1.0), size=missing),
+                ],
+                axis=1,
+            ).astype(np.float32)
+            coords = np.concatenate([coords, extra_xy], axis=0)
+        xy_int = np.rint(coords).astype(np.int64)
+        xs = np.clip(xy_int[:, 0], 0, w - 1)
+        ys = np.clip(xy_int[:, 1], 0, h - 1)
+        tangent, coherence = _structure_tensor_tangent(energy, int(args.init_orientation_radius_px))
+        theta = tangent[ys, xs]
+        coh = coherence[ys, xs]
+        sigma_long = float(args.init_sigma_long_px) * (1.0 + float(args.init_coherence_long_boost) * coh)
+        sigma_short = np.full_like(sigma_long, float(args.init_sigma_short_px), dtype=np.float32)
+        colors = signed_target[ys, xs, :].astype(np.float32)
+        segment_ids = np.full((n,), -1, dtype=np.int32)
+        pair_edges = np.zeros((0, 2), dtype=np.int64)
     cholesky = _cholesky_from_orientation(theta.astype(np.float32), sigma_long.astype(np.float32), sigma_short)
     means = np.empty((n, 2), dtype=np.float32)
     means[:, 0] = np.clip(coords[:, 0] / max(float(w - 1), 1.0) * 2.0 - 1.0, -0.999, 0.999)
     means[:, 1] = np.clip(coords[:, 1] / max(float(h - 1), 1.0) * 2.0 - 1.0, -0.999, 0.999)
     xyz = np.arctanh(means).astype(np.float32)
-    colors = signed_target[ys, xs, :].astype(np.float32)
     bound = np.asarray([0.5, 0.0, 0.5], dtype=np.float32)[None, :]
     cholesky_param = cholesky - bound
     device = model._xyz.device
@@ -280,6 +473,13 @@ def _target_init_gaussianimage(
             model._opacity.fill_(1.0)
         if hasattr(model, "background"):
             model.background.fill_(0.5)
+    return {
+        "means_norm": means.astype(np.float32),
+        "cholesky": cholesky.astype(np.float32),
+        "colors": colors.astype(np.float32),
+        "segment_id": segment_ids.astype(np.int32),
+        "pair_edges": pair_edges.astype(np.int64),
+    }
 
 
 def _import_gaussianimage(repo_root: Path, model_name: str):
@@ -378,7 +578,7 @@ def _fit_gaussianimage(
     lambda_l2: float,
     background_weight: float,
     args: argparse.Namespace,
-) -> Tuple[np.ndarray, object, List[float]]:
+) -> Tuple[np.ndarray, object, List[float], Dict[str, np.ndarray]]:
     if not torch.cuda.is_available():
         raise RuntimeError("GaussianImage fitting requires CUDA for diff_gaussian_rasterization.")
     h, w = signed_target.shape[:2]
@@ -400,9 +600,11 @@ def _fit_gaussianimage(
         quantize=False,
     ).to(device)
     if hasattr(model, "background"):
-        model.background.fill_(0.5)
+        with torch.no_grad():
+            model.background.fill_(0.5)
+    init_meta: Dict[str, np.ndarray] = {}
     if not bool(args.init_random):
-        _target_init_gaussianimage(
+        init_meta = _target_init_gaussianimage(
             model,
             signed_target,
             target_residual,
@@ -410,6 +612,17 @@ def _fit_gaussianimage(
             float(args.residual_clip),
             args,
         )
+    init_means_t: Optional[torch.Tensor] = None
+    init_cholesky_t: Optional[torch.Tensor] = None
+    pair_edges_t: Optional[torch.Tensor] = None
+    segment_valid_t: Optional[torch.Tensor] = None
+    if init_meta:
+        init_means_t = torch.from_numpy(init_meta["means_norm"]).to(device=device, dtype=torch.float32)
+        init_cholesky_t = torch.from_numpy(init_meta["cholesky"]).to(device=device, dtype=torch.float32)
+        segment_ids_np = init_meta["segment_id"].reshape(-1)
+        segment_valid_t = torch.from_numpy(segment_ids_np >= 0).to(device=device)
+        if init_meta["pair_edges"].shape[0] > 0:
+            pair_edges_t = torch.from_numpy(init_meta["pair_edges"]).to(device=device, dtype=torch.long)
     losses: List[float] = []
     for _ in range(int(iterations)):
         model.optimizer.zero_grad(set_to_none=True)
@@ -423,12 +636,33 @@ def _fit_gaussianimage(
             l1 = (diff.abs() * weight_t).sum() / (weight_t.sum() * 3.0 + 1e-8)
             l2 = ((diff * diff) * weight_t).sum() / (weight_t.sum() * 3.0 + 1e-8)
             loss = float(lambda_l1) * l1 + float(lambda_l2) * l2
+        if init_means_t is not None and segment_valid_t is not None and bool(torch.any(segment_valid_t)):
+            current_means = torch.tanh(model._xyz)
+            valid_means = segment_valid_t.to(device=current_means.device)
+            anchor_weight = float(args.segment_anchor_weight)
+            if anchor_weight > 0.0:
+                loss = loss + anchor_weight * F.smooth_l1_loss(current_means[valid_means], init_means_t[valid_means])
+            if pair_edges_t is not None and int(pair_edges_t.shape[0]) > 0:
+                p0 = pair_edges_t[:, 0]
+                p1 = pair_edges_t[:, 1]
+                pair_weight = float(args.segment_pair_weight)
+                if pair_weight > 0.0:
+                    curr_delta = current_means[p1] - current_means[p0]
+                    init_delta = init_means_t[p1] - init_means_t[p0]
+                    loss = loss + pair_weight * F.smooth_l1_loss(curr_delta, init_delta)
+                color_weight = float(args.segment_color_smooth_weight)
+                if color_weight > 0.0:
+                    colors = torch.clamp(model.get_features, 0.0, 1.0)
+                    loss = loss + color_weight * F.smooth_l1_loss(colors[p1], colors[p0])
+            shape_weight = float(args.segment_shape_weight)
+            if shape_weight > 0.0 and init_cholesky_t is not None and hasattr(model, "get_cholesky_elements"):
+                loss = loss + shape_weight * F.smooth_l1_loss(model.get_cholesky_elements[valid_means], init_cholesky_t[valid_means])
         loss.backward()
         model.optimizer.step()
         losses.append(float(loss.detach().cpu().item()))
     with torch.no_grad():
         rendered = model.forward()["render"].squeeze(0).detach().clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy().astype(np.float32)
-    return rendered, model, losses
+    return rendered, model, losses, init_meta
 
 
 def _extract_primitives(model, model_name: str, h: int, w: int) -> Dict[str, np.ndarray]:
@@ -666,7 +900,7 @@ def main() -> None:
             float(args.mask_power),
             bool(args.neutral_outside_mask),
         )
-        signed_render, model, losses = _fit_gaussianimage(
+        signed_render, model, losses, init_meta = _fit_gaussianimage(
             module,
             signed_target,
             target_residual,
@@ -688,6 +922,11 @@ def main() -> None:
         recon_abs = np.clip(np.abs(recon_residual).mean(axis=2) / max(float(args.residual_clip), 1e-8), 0.0, 1.0)
         overlay = _overlay(target_abs, recon_abs, weight)
         primitives = _extract_primitives(model, str(args.model), target.shape[0], target.shape[1])
+        if init_meta:
+            primitives["segment_id"] = init_meta["segment_id"]
+            primitives["pair_edges"] = init_meta["pair_edges"]
+            primitives["init_mu_norm"] = init_meta["means_norm"]
+            primitives["init_cholesky"] = init_meta["cholesky"]
         primitive_overlay = _primitive_overlay(primitives, target.shape[0], target.shape[1])
 
         stem = target_path.stem
@@ -733,6 +972,9 @@ def main() -> None:
                 "anchor": str(anchor_path),
                 "mask": str(mask_path),
                 "num_primitives": int(args.num_gaussians),
+                "segment_init": bool(args.segment_init and not args.init_random),
+                "num_segments": int(len(set(int(x) for x in primitives.get("segment_id", np.asarray([], dtype=np.int32)).tolist() if int(x) >= 0))),
+                "num_segment_pairs": int(primitives.get("pair_edges", np.zeros((0, 2), dtype=np.int64)).shape[0]),
                 "loss_final": row["loss_final"],
             }
         )
