@@ -781,6 +781,31 @@ def _light_primitive_overlay(primitive_overlay: np.ndarray, strength: float) -> 
     return _light_abs(gray, strength)
 
 
+def _rgb_with_hf(base: np.ndarray, residual: np.ndarray, weight: Optional[np.ndarray] = None, strength: float = 1.0) -> np.ndarray:
+    if weight is not None:
+        residual = residual * np.clip(weight[..., None], 0.0, 1.0)
+    return np.clip(base + float(strength) * residual, 0.0, 1.0)
+
+
+def _rgb_hf_error_overlay(
+    base: np.ndarray,
+    target_abs: np.ndarray,
+    recon_abs: np.ndarray,
+    weight: np.ndarray,
+    strength: float,
+) -> np.ndarray:
+    # Red marks target HF not explained by 2DGS, cyan marks extra 2DGS HF.
+    target = np.clip(target_abs, 0.0, 1.0) * np.clip(weight, 0.0, 1.0)
+    recon = np.clip(recon_abs, 0.0, 1.0) * np.clip(weight, 0.0, 1.0)
+    missing = np.clip(target - recon, 0.0, 1.0)
+    extra = np.clip(recon - target, 0.0, 1.0)
+    rgb = 0.72 * np.clip(base, 0.0, 1.0) + 0.18
+    rgb[..., 0] += float(strength) * missing
+    rgb[..., 1] += float(strength) * extra
+    rgb[..., 2] += float(strength) * extra
+    return np.clip(rgb, 0.0, 1.0)
+
+
 def _primitive_overlay(primitives: Dict[str, np.ndarray], h: int, w: int, max_draw: int = 4096) -> np.ndarray:
     image = Image.new("RGB", (w, h), (0, 0, 0))
     draw = ImageDraw.Draw(image)
@@ -856,6 +881,34 @@ def _write_sheet(
     sheet.save(path)
 
 
+def _write_rgb_sheet(
+    path: Path,
+    anchor: np.ndarray,
+    target: np.ndarray,
+    target_rgb_hf: np.ndarray,
+    recon_rgb_hf: np.ndarray,
+    recon_rgb_hf_weighted: np.ndarray,
+    rgb_error_overlay: np.ndarray,
+) -> None:
+    panels = [
+        _panel(anchor, "anchor RGB"),
+        _panel(target, "edge target RGB"),
+        _panel(target_rgb_hf, "anchor + target HF"),
+        _panel(recon_rgb_hf, "anchor + 2DGS HF"),
+        _panel(recon_rgb_hf_weighted, "anchor + trusted 2DGS HF"),
+        _panel(rgb_error_overlay, "RGB error: red missing, cyan extra"),
+    ]
+    width = max(p.width for p in panels)
+    height = max(p.height for p in panels)
+    cols = 2
+    rows = (len(panels) + cols - 1) // cols
+    sheet = Image.new("RGB", (cols * width, rows * height), (0, 0, 0))
+    for i, panel in enumerate(panels):
+        sheet.paste(panel, ((i % cols) * width, (i // cols) * height))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(path)
+
+
 def _mean(rows: Sequence[Dict[str, float]], key: str) -> float:
     vals = [float(row[key]) for row in rows if key in row and np.isfinite(float(row[key]))]
     return float(np.mean(vals)) if vals else float("nan")
@@ -886,6 +939,13 @@ def main() -> None:
         "edge_recon": output_dir / "edge_recon",
         "overlay": output_dir / "overlay",
         "primitive_overlay": output_dir / "primitive_overlay",
+        "rgb_anchor": output_dir / "rgb_anchor",
+        "rgb_target": output_dir / "rgb_target",
+        "rgb_target_hf": output_dir / "rgb_target_hf",
+        "rgb_recon_hf": output_dir / "rgb_recon_hf",
+        "rgb_recon_hf_weighted": output_dir / "rgb_recon_hf_weighted",
+        "rgb_error_overlay": output_dir / "rgb_error_overlay",
+        "rgb_sheet": output_dir / "rgb_sheet",
         "sheet": output_dir / "sheet",
         "primitives": output_dir / "primitives",
     }
@@ -961,6 +1021,10 @@ def main() -> None:
         target_abs = np.clip(np.abs(target_residual).mean(axis=2) / max(float(args.residual_clip), 1e-8), 0.0, 1.0)
         recon_abs = np.clip(np.abs(recon_residual).mean(axis=2) / max(float(args.residual_clip), 1e-8), 0.0, 1.0)
         overlay = _overlay(target_abs, recon_abs, weight)
+        target_rgb_hf = _rgb_with_hf(anchor, target_residual)
+        recon_rgb_hf = _rgb_with_hf(anchor, recon_residual)
+        recon_rgb_hf_weighted = _rgb_with_hf(anchor, recon_residual, weight=weight)
+        rgb_error_overlay = _rgb_hf_error_overlay(anchor, target_abs, recon_abs, weight, 0.65)
         primitives = _extract_primitives(model, str(args.model), target.shape[0], target.shape[1])
         if init_meta:
             primitives["segment_id"] = init_meta["segment_id"]
@@ -974,9 +1038,15 @@ def main() -> None:
         _save_rgb(dirs["recon_hf"] / f"{stem}.png", signed_render)
         _save_gray(dirs["target_abs"] / f"{stem}.png", target_abs)
         _save_gray(dirs["recon_abs"] / f"{stem}.png", recon_abs)
-        _save_rgb(dirs["edge_recon"] / f"{stem}.png", np.clip(anchor + recon_residual, 0.0, 1.0))
+        _save_rgb(dirs["edge_recon"] / f"{stem}.png", recon_rgb_hf)
         _save_rgb(dirs["overlay"] / f"{stem}.png", overlay)
         _save_rgb(dirs["primitive_overlay"] / f"{stem}.png", primitive_overlay)
+        _save_rgb(dirs["rgb_anchor"] / f"{stem}.png", anchor)
+        _save_rgb(dirs["rgb_target"] / f"{stem}.png", target)
+        _save_rgb(dirs["rgb_target_hf"] / f"{stem}.png", target_rgb_hf)
+        _save_rgb(dirs["rgb_recon_hf"] / f"{stem}.png", recon_rgb_hf)
+        _save_rgb(dirs["rgb_recon_hf_weighted"] / f"{stem}.png", recon_rgb_hf_weighted)
+        _save_rgb(dirs["rgb_error_overlay"] / f"{stem}.png", rgb_error_overlay)
         if bool(args.light_visuals):
             light_strength = float(args.light_visual_strength)
             _save_rgb(dirs["target_abs_light"] / f"{stem}.png", _light_abs(target_abs, light_strength))
@@ -999,6 +1069,15 @@ def main() -> None:
                 weight,
                 primitive_overlay,
                 float(args.residual_clip),
+            )
+            _write_rgb_sheet(
+                dirs["rgb_sheet"] / f"{stem}.png",
+                anchor,
+                target,
+                target_rgb_hf,
+                recon_rgb_hf,
+                recon_rgb_hf_weighted,
+                rgb_error_overlay,
             )
         np.savez_compressed(dirs["primitives"] / f"{stem}.npz", **primitives, losses=np.asarray(losses, dtype=np.float32))
         if bool(args.save_pt):
