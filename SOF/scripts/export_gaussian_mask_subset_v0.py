@@ -123,6 +123,14 @@ def _make_scene(dataset, gaussians, *, load_iteration: int):
     return Scene(dataset, gaussians, **kwargs)
 
 
+def _compute_3d_filter_compat(gaussians, cameras) -> None:
+    params = inspect.signature(gaussians.compute_3D_filter).parameters
+    if "CUDA" in params:
+        gaussians.compute_3D_filter(cameras, CUDA=False)
+    else:
+        gaussians.compute_3D_filter(cameras)
+
+
 def _select_uniform(items: Sequence[object], max_items: int):
     if int(max_items) <= 0 or len(items) <= int(max_items):
         return list(items), list(range(len(items)))
@@ -259,7 +267,7 @@ def export_subset_model(
     render_gaussians = GaussianModel(render_dataset.sh_degree)
     render_scene = _make_scene(render_dataset, render_gaussians, load_iteration=loaded_iter)
     if not _has_loaded_filter_3d(render_gaussians):
-        render_gaussians.compute_3D_filter(render_scene.getTrainCameras().copy(), CUDA=False)
+        _compute_3d_filter_compat(render_gaussians, render_scene.getTrainCameras().copy())
     background = torch.tensor(
         [1, 1, 1] if white_background else [0, 0, 0],
         dtype=torch.float32,

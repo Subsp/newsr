@@ -52,6 +52,7 @@ from scene.gaussian_model import GaussianModel, GaussianSourceTag
 from export_gaussian_mask_subset_v0 import (
     _build_dataset_args,
     _clone_subset_gaussians,
+    _compute_3d_filter_compat,
     _copy_render_config,
     _iter_views,
     _resolve_iteration,
@@ -370,7 +371,7 @@ def export_variant(
     render_dataset = _build_dataset_args(str(scene_root), str(variant_root), images_subdir, white_background)
     render_gaussians = GaussianModel(render_dataset.sh_degree)
     render_scene = _make_scene(render_dataset, render_gaussians, load_iteration=loaded_iter)
-    render_gaussians.compute_3D_filter(render_scene.getTrainCameras().copy(), CUDA=False)
+    _compute_3d_filter_compat(render_gaussians, render_scene.getTrainCameras().copy())
     background = torch.tensor([1, 1, 1] if white_background else [0, 0, 0], dtype=torch.float32, device="cuda")
 
     render_summary: Dict[str, object] = {}
