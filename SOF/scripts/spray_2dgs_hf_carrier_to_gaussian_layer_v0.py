@@ -15,6 +15,7 @@ from plyfile import PlyData, PlyElement
 
 from spray_2dgs_hf_carrier_to_3d_v0 import (
     IMAGE_EXTS,
+    SH_C0,
     _bilinear_rgb,
     _bilinear_scalar,
     _camera_basis,
@@ -72,6 +73,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--opacity_power", type=float, default=0.75)
     parser.add_argument("--opacity_min", type=float, default=0.01)
     parser.add_argument("--opacity_max", type=float, default=0.16)
+    parser.add_argument(
+        "--color_mode",
+        default="primitive",
+        choices=["primitive", "base_anchor_additive"],
+        help=(
+            "primitive uses exported 2DGS primitive RGB as ordinary radiance. "
+            "base_anchor_additive anchors each newborn Gaussian to its matched base Gaussian DC color and "
+            "adds a bounded positive HF carrier term, avoiding black-background alpha-over darkening."
+        ),
+    )
+    parser.add_argument("--color_gain", type=float, default=0.35)
     parser.add_argument("--write_cpu_merged_preview", action="store_true")
     return parser.parse_args()
 
@@ -81,7 +93,7 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
     return (1.0 / (1.0 + np.exp(-x))).astype(np.float32)
 
 
-def _load_base_vertices(base_ply: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _load_base_vertices(base_ply: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     ply = PlyData.read(str(base_ply))
     vertices = ply["vertex"].data
     names = set(vertices.dtype.names or ())
@@ -92,7 +104,12 @@ def _load_base_vertices(base_ply: Path) -> Tuple[np.ndarray, np.ndarray, np.ndar
         opacity = _sigmoid(np.asarray(vertices["opacity"], dtype=np.float32).reshape(-1))
     else:
         opacity = np.ones((xyz.shape[0],), dtype=np.float32)
-    return vertices, xyz, opacity
+    if {"f_dc_0", "f_dc_1", "f_dc_2"}.issubset(names):
+        dc = np.stack([vertices["f_dc_0"], vertices["f_dc_1"], vertices["f_dc_2"]], axis=1).astype(np.float32)
+        rgb = np.clip(dc * float(SH_C0) + 0.5, 0.0, 1.0).astype(np.float32)
+    else:
+        rgb = np.full((xyz.shape[0], 3), 0.5, dtype=np.float32)
+    return vertices, xyz, opacity, rgb
 
 
 def _project_base_to_source(
@@ -234,6 +251,29 @@ def _load_primitive_colors(
     return np.clip(kept_color, 0.0, 1.0).astype(np.float32)
 
 
+def _resolve_newborn_colors(
+    primitive: Dict[str, np.ndarray],
+    mu: np.ndarray,
+    final_ids: np.ndarray,
+    matched_base_idx: np.ndarray,
+    base_rgb: np.ndarray,
+    rgb_path: Optional[Path],
+    source_size: Tuple[int, int],
+    args: argparse.Namespace,
+) -> np.ndarray:
+    primitive_color = _load_primitive_colors(primitive, mu, final_ids, rgb_path, source_size)
+    mode = str(args.color_mode).strip().lower()
+    if mode == "primitive":
+        return primitive_color
+    if mode == "base_anchor_additive":
+        anchor = np.clip(base_rgb[matched_base_idx], 0.0, 1.0)
+        # The 2DGS evidence image is a black-background carrier: black means no HF evidence,
+        # not black radiance. Anchor to the matched 3D Gaussian and add only the visible carrier energy.
+        carrier = np.clip(primitive_color, 0.0, 1.0)
+        return np.clip(anchor + float(args.color_gain) * carrier, 0.0, 1.0).astype(np.float32)
+    raise ValueError(f"Unsupported color_mode={args.color_mode!r}")
+
+
 def _spray_view(
     primitive_path: Path,
     view_index: int,
@@ -241,6 +281,7 @@ def _spray_view(
     cameras: Dict[str, Dict[str, object]],
     base_xyz: np.ndarray,
     base_opacity: np.ndarray,
+    base_rgb: np.ndarray,
     rgb_paths: Sequence[Path],
     rgb_lookup: Dict[str, Path],
     weight_paths: Sequence[Path],
@@ -305,7 +346,17 @@ def _spray_view(
     kept_depth = matched_depth[matched]
     kept_weight = weight[final_ids]
     kept_opacity_2d = np.clip(opacity_2d[final_ids], 0.0, 1.0)
-    kept_color = _load_primitive_colors(primitive, kept_mu, final_ids, rgb_path, source_size)
+    kept_matched_base_idx = matched_base_idx[matched]
+    kept_color = _resolve_newborn_colors(
+        primitive,
+        kept_mu,
+        final_ids,
+        kept_matched_base_idx,
+        base_rgb,
+        rgb_path,
+        source_size,
+        args,
+    )
     xyz, cam_x, cam_y, normal, _px, fx, fy = _unproject_points(cam, kept_mu, kept_depth, source_size)
     pix_world = kept_depth / max((float(fx) + float(fy)) * 0.5, 1e-8)
     front_offset = np.maximum(float(args.front_offset_px), 0.0) * pix_world
@@ -345,7 +396,7 @@ def _spray_view(
         "rotation": quats,
         "source_view": np.full((final_ids.size,), int(view_index), dtype=np.int32),
         "source_primitive": final_ids.astype(np.int64),
-        "matched_base_index": matched_base_idx[matched].astype(np.int64),
+        "matched_base_index": kept_matched_base_idx.astype(np.int64),
         "matched_depth": kept_depth.astype(np.float32),
         "matched_pixel_distance": matched_dist[matched].astype(np.float32),
         "weight": kept_weight.astype(np.float32),
@@ -368,6 +419,8 @@ def _spray_view(
         "matched_pixel_distance_mean": float(matched_dist[matched].mean()),
         "scale_long_mean": float(scale_long.mean()),
         "scale_short_mean": float(scale_short.mean()),
+        "color_mode": str(args.color_mode),
+        "color_gain": float(args.color_gain),
     }
     return newborn, info
 
@@ -411,7 +464,7 @@ def main() -> None:
     weight_paths = _list_files(Path(args.carrier_weight_dir), IMAGE_EXTS) if args.carrier_weight_dir else []
     weight_lookup = _lookup(weight_paths)
     cameras = _load_cameras(base_model_dir)
-    base_vertices, base_xyz, base_opacity = _load_base_vertices(base_ply)
+    base_vertices, base_xyz, base_opacity, base_rgb = _load_base_vertices(base_ply)
 
     per_view: List[Dict[str, object]] = []
     chunks: List[Dict[str, np.ndarray]] = []
@@ -424,6 +477,7 @@ def main() -> None:
             cameras,
             base_xyz,
             base_opacity,
+            base_rgb,
             rgb_paths,
             rgb_lookup,
             weight_paths,
@@ -530,6 +584,8 @@ def main() -> None:
             "opacity_floor": float(args.opacity_floor),
             "opacity_scale": float(args.opacity_scale),
             "opacity_max": float(args.opacity_max),
+            "color_mode": str(args.color_mode),
+            "color_gain": float(args.color_gain),
         },
         "newborn_stats": {
             "weight_mean": float(newborn_all["weight"].mean()),

@@ -53,6 +53,8 @@ OPACITY_SCALE="${OPACITY_SCALE:-0.12}"
 OPACITY_POWER="${OPACITY_POWER:-0.75}"
 OPACITY_MIN="${OPACITY_MIN:-0.01}"
 OPACITY_MAX="${OPACITY_MAX:-0.16}"
+COLOR_MODE="${COLOR_MODE:-primitive}"
+COLOR_GAIN="${COLOR_GAIN:-0.35}"
 WRITE_CPU_MERGED_PREVIEW="${WRITE_CPU_MERGED_PREVIEW:-0}"
 
 for required in "${BASE_MODEL_DIR}" "${BASE_PLY}" "${PRIMITIVE_DIR}" "${EVIDENCE_RGB_DIR}" "${EVIDENCE_WEIGHT_DIR}"; do
@@ -74,6 +76,7 @@ echo "[spray-2dgs-to-gaussian-layer-v0] weight     : ${EVIDENCE_WEIGHT_DIR}"
 echo "[spray-2dgs-to-gaussian-layer-v0] newborn   : ${NEWBORN_MODEL_DIR}"
 echo "[spray-2dgs-to-gaussian-layer-v0] output    : ${OUTPUT_MODEL_DIR}"
 echo "[spray-2dgs-to-gaussian-layer-v0] layer     : base opacity>=${BASE_OPACITY_MIN} search=${SEARCH_RADIUS_PX}px front=${FRONT_OFFSET_PX}px"
+echo "[spray-2dgs-to-gaussian-layer-v0] color     : mode=${COLOR_MODE} gain=${COLOR_GAIN}"
 
 SPRAY_ARGS=(
   --base_model_dir "${BASE_MODEL_DIR}"
@@ -104,6 +107,8 @@ SPRAY_ARGS=(
   --opacity_power "${OPACITY_POWER}"
   --opacity_min "${OPACITY_MIN}"
   --opacity_max "${OPACITY_MAX}"
+  --color_mode "${COLOR_MODE}"
+  --color_gain "${COLOR_GAIN}"
 )
 if [[ "${OVERWRITE}" == "1" ]]; then
   SPRAY_ARGS+=(--overwrite)
