@@ -326,6 +326,31 @@ def _apply_group_variant(
     return variant
 
 
+def _scale_masked_opacity(variant: GaussianModel, mask: torch.Tensor, tau_scale: float) -> None:
+    if float(tau_scale) == 1.0:
+        return
+    selected = mask.to(device=variant.get_xyz.device, dtype=torch.bool).reshape(-1)
+    if int(selected.shape[0]) != int(variant.get_xyz.shape[0]):
+        raise ValueError("Opacity-scale mask length mismatch for variant export.")
+    if not torch.any(selected):
+        return
+    alpha = torch.sigmoid(variant._opacity.data[selected])
+    tau = -torch.log(torch.clamp(1.0 - alpha, min=1e-6))
+    alpha_scaled = 1.0 - torch.exp(-tau * float(tau_scale))
+    variant._opacity.data[selected] = _logit(alpha_scaled)
+
+
+def _scale_masked_dc(variant: GaussianModel, mask: torch.Tensor, dc_scale: float) -> None:
+    if float(dc_scale) == 1.0:
+        return
+    selected = mask.to(device=variant.get_xyz.device, dtype=torch.bool).reshape(-1)
+    if int(selected.shape[0]) != int(variant.get_xyz.shape[0]):
+        raise ValueError("DC-scale mask length mismatch for variant export.")
+    if not torch.any(selected):
+        return
+    variant._features_dc.data[selected] *= float(dc_scale)
+
+
 def export_variant(
     *,
     scene_root: Path,
@@ -351,6 +376,11 @@ def export_variant(
     post_mute_selection_source: str,
     post_mute_selection_key: str,
     post_mute_mask_payload_path: Path | None,
+    weak_selection_source: str,
+    weak_selection_key: str,
+    weak_mask_payload_path: Path | None,
+    weak_tau_scale: float,
+    weak_dc_scale: float,
     save_alpha: bool,
     save_depth: bool,
     save_premul: bool,
@@ -400,6 +430,20 @@ def export_variant(
         if int(post_mute_mask.shape[0]) != int(variant.get_xyz.shape[0]):
             raise ValueError("Post-mute mask length mismatch for variant export.")
         variant._opacity.data[post_mute_mask] = float(mute_opacity_logit)
+    weak_mask = None
+    if str(weak_selection_key).strip():
+        weak_mask = _load_selection_mask(
+            model_path=model_path,
+            iteration=loaded_iter,
+            selection_key=weak_selection_key,
+            selection_source=weak_selection_source,
+            payload_path=weak_mask_payload_path,
+            total_gaussians=int(gaussians.get_xyz.shape[0]),
+        ).to(device=variant.get_xyz.device, dtype=torch.bool)
+        if int(weak_mask.shape[0]) != int(variant.get_xyz.shape[0]):
+            raise ValueError("Weak mask length mismatch for variant export.")
+        _scale_masked_opacity(variant, weak_mask, weak_tau_scale)
+        _scale_masked_dc(variant, weak_mask, weak_dc_scale)
     variant.save_ply(str(point_dir / "point_cloud.ply"))
     variant.save_tracking_metadata(str(point_dir / "gaussian_tags.pt"))
 
@@ -485,6 +529,12 @@ def export_variant(
             "post_mute_selection_key": str(post_mute_selection_key),
             "post_mute_mask_payload_path": str(post_mute_mask_payload_path) if post_mute_mask_payload_path else None,
             "post_mute_gaussians": None if post_mute_mask is None else int(post_mute_mask.sum().item()),
+            "weak_selection_source": str(weak_selection_source),
+            "weak_selection_key": str(weak_selection_key),
+            "weak_mask_payload_path": str(weak_mask_payload_path) if weak_mask_payload_path else None,
+            "weak_gaussians": None if weak_mask is None else int(weak_mask.sum().item()),
+            "weak_tau_scale": float(weak_tau_scale),
+            "weak_dc_scale": float(weak_dc_scale),
         },
         "paths": {
             "variant_model_root": str(variant_root),
@@ -523,6 +573,11 @@ def main() -> None:
     parser.add_argument("--post_mute_selection_source", default="payload")
     parser.add_argument("--post_mute_selection_key", default="")
     parser.add_argument("--post_mute_mask_payload_path", default=None)
+    parser.add_argument("--weak_selection_source", default="payload")
+    parser.add_argument("--weak_selection_key", default="")
+    parser.add_argument("--weak_mask_payload_path", default=None)
+    parser.add_argument("--weak_tau_scale", type=float, default=1.0)
+    parser.add_argument("--weak_dc_scale", type=float, default=1.0)
     parser.add_argument("--save_alpha", action="store_true")
     parser.add_argument("--save_depth", action="store_true")
     parser.add_argument("--save_premul", action="store_true")
@@ -536,6 +591,11 @@ def main() -> None:
     post_mute_mask_payload_path = (
         Path(args.post_mute_mask_payload_path).expanduser().resolve()
         if args.post_mute_mask_payload_path
+        else None
+    )
+    weak_mask_payload_path = (
+        Path(args.weak_mask_payload_path).expanduser().resolve()
+        if args.weak_mask_payload_path
         else None
     )
 
@@ -563,6 +623,11 @@ def main() -> None:
         post_mute_selection_source=str(args.post_mute_selection_source),
         post_mute_selection_key=str(args.post_mute_selection_key),
         post_mute_mask_payload_path=post_mute_mask_payload_path,
+        weak_selection_source=str(args.weak_selection_source),
+        weak_selection_key=str(args.weak_selection_key),
+        weak_mask_payload_path=weak_mask_payload_path,
+        weak_tau_scale=float(args.weak_tau_scale),
+        weak_dc_scale=float(args.weak_dc_scale),
         save_alpha=bool(args.save_alpha),
         save_depth=bool(args.save_depth),
         save_premul=bool(args.save_premul),
