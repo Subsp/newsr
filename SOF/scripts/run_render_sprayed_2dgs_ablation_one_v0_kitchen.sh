@@ -17,7 +17,8 @@ ITERATION="${ITERATION:-30000}"
 SPLIT="${SPLIT:-train}"
 MAX_VIEWS="${MAX_VIEWS:-1}"
 MODE="${MODE:-alpha}"
-ALPHA_TAU_SCALE="${ALPHA_TAU_SCALE:-0.5}"
+BOOST_TAU_SCALE="${BOOST_TAU_SCALE:-${ALPHA_TAU_SCALE:-10.0}}"
+BOOST_SCALE_MULTIPLIER="${BOOST_SCALE_MULTIPLIER:-2.0}"
 KEEP_RATIO="${KEEP_RATIO:-0.5}"
 SEED="${SEED:-12345}"
 VARIANT_NAME="${VARIANT_NAME:-}"
@@ -26,18 +27,27 @@ OVERWRITE="${OVERWRITE:-1}"
 KEEP_EXPORT_ROOT="${KEEP_EXPORT_ROOT:-0}"
 
 if [[ -z "${VARIANT_NAME}" ]]; then
-  if [[ "${MODE}" == "alpha" ]]; then
-    VARIANT_NAME="alpha$(printf '%03d' "$(python - <<PY
-print(round(float("${ALPHA_TAU_SCALE}") * 100))
+  if [[ "${MODE}" == "alpha" || "${MODE}" == "boost_alpha" ]]; then
+    VARIANT_NAME="tau$(printf '%04d' "$(python - <<PY
+print(round(float("${BOOST_TAU_SCALE}") * 100))
+PY
+)")_scale$(printf '%03d' "$(python - <<PY
+print(round(float("${BOOST_SCALE_MULTIPLIER}") * 100))
 PY
 )")"
-  elif [[ "${MODE}" == "random" ]]; then
+  elif [[ "${MODE}" == "random" || "${MODE}" == "boost_random" ]]; then
     VARIANT_NAME="keep$(printf '%03d' "$(python - <<PY
 print(round(float("${KEEP_RATIO}") * 100))
 PY
+)")_tau$(printf '%04d' "$(python - <<PY
+print(round(float("${BOOST_TAU_SCALE}") * 100))
+PY
+)")_scale$(printf '%03d' "$(python - <<PY
+print(round(float("${BOOST_SCALE_MULTIPLIER}") * 100))
+PY
 )")"
   else
-    echo "[spray-ablation-one-v0] invalid MODE=${MODE}; use alpha or random" >&2
+    echo "[spray-ablation-one-v0] invalid MODE=${MODE}; use alpha/boost_alpha or random/boost_random" >&2
     exit 1
   fi
 fi
@@ -48,7 +58,7 @@ if [[ ! -f "${POINT_DIR}/point_cloud.ply" ]]; then
   echo "[spray-ablation-one-v0] point cloud not found: ${POINT_DIR}/point_cloud.ply" >&2
   exit 1
 fi
-if [[ "${MODE}" == "random" && ! -f "${TAGS_PATH}" ]]; then
+if [[ ( "${MODE}" == "random" || "${MODE}" == "boost_random" ) && ! -f "${TAGS_PATH}" ]]; then
   echo "[spray-ablation-one-v0] tags not found for random mode: ${TAGS_PATH}" >&2
   exit 1
 fi
@@ -68,6 +78,7 @@ echo "[spray-ablation-one-v0] model   : ${MODEL_DIR}"
 echo "[spray-ablation-one-v0] mode    : ${MODE}"
 echo "[spray-ablation-one-v0] variant : ${VARIANT_NAME}"
 echo "[spray-ablation-one-v0] output  : ${FINAL_DIR}"
+echo "[spray-ablation-one-v0] boost   : tau=${BOOST_TAU_SCALE} scale=${BOOST_SCALE_MULTIPLIER}"
 
 EXPORT_ARGS=(
   --scene_root "${SCENE_ROOT}"
@@ -79,14 +90,15 @@ EXPORT_ARGS=(
   --max_views "${MAX_VIEWS}"
 )
 
-if [[ "${MODE}" == "alpha" ]]; then
+if [[ "${MODE}" == "alpha" || "${MODE}" == "boost_alpha" ]]; then
   EXPORT_ARGS+=(
     --selection_source tracking
     --selection_key prior_injected
     --selection_mode full
-    --tau_scale "${ALPHA_TAU_SCALE}"
+    --tau_scale "${BOOST_TAU_SCALE}"
+    --scale_multiplier "${BOOST_SCALE_MULTIPLIER}"
   )
-elif [[ "${MODE}" == "random" ]]; then
+elif [[ "${MODE}" == "random" || "${MODE}" == "boost_random" ]]; then
   TAGS_PATH="${TAGS_PATH}" PAYLOAD_PATH="${PAYLOAD_PATH}" KEEP_RATIO="${KEEP_RATIO}" SEED="${SEED}" "${PYTHON_BIN}" - <<'PY'
 import os
 import torch
@@ -120,11 +132,16 @@ PY
   EXPORT_ARGS+=(
     --selection_source payload
     --mask_payload_path "${PAYLOAD_PATH}"
-    --selection_key drop_prior
-    --selection_mode selected_removed
+    --selection_key keep_prior
+    --selection_mode full
+    --tau_scale "${BOOST_TAU_SCALE}"
+    --scale_multiplier "${BOOST_SCALE_MULTIPLIER}"
+    --post_mute_selection_source payload
+    --post_mute_mask_payload_path "${PAYLOAD_PATH}"
+    --post_mute_selection_key drop_prior
   )
 else
-  echo "[spray-ablation-one-v0] invalid MODE=${MODE}; use alpha or random" >&2
+  echo "[spray-ablation-one-v0] invalid MODE=${MODE}; use alpha/boost_alpha or random/boost_random" >&2
   exit 1
 fi
 
@@ -145,7 +162,8 @@ model: ${MODEL_DIR}
 iteration: ${ITERATION}
 split: ${SPLIT}
 mode: ${MODE}
-alpha_tau_scale: ${ALPHA_TAU_SCALE}
+boost_tau_scale: ${BOOST_TAU_SCALE}
+boost_scale_multiplier: ${BOOST_SCALE_MULTIPLIER}
 keep_ratio: ${KEEP_RATIO}
 seed: ${SEED}
 

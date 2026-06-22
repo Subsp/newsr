@@ -335,6 +335,9 @@ def export_variant(
     scale_multiplier: float,
     scale_axis_mode: str,
     filter_multiplier: float,
+    post_mute_selection_source: str,
+    post_mute_selection_key: str,
+    post_mute_mask_payload_path: Path | None,
     save_alpha: bool,
     save_depth: bool,
     save_premul: bool,
@@ -371,6 +374,19 @@ def export_variant(
         scale_axis_mode=scale_axis_mode,
         filter_multiplier=filter_multiplier,
     )
+    post_mute_mask = None
+    if str(post_mute_selection_key).strip():
+        post_mute_mask = _load_selection_mask(
+            model_path=model_path,
+            iteration=loaded_iter,
+            selection_key=post_mute_selection_key,
+            selection_source=post_mute_selection_source,
+            payload_path=post_mute_mask_payload_path,
+            total_gaussians=int(gaussians.get_xyz.shape[0]),
+        ).to(device=variant.get_xyz.device, dtype=torch.bool)
+        if int(post_mute_mask.shape[0]) != int(variant.get_xyz.shape[0]):
+            raise ValueError("Post-mute mask length mismatch for variant export.")
+        variant._opacity.data[post_mute_mask] = float(mute_opacity_logit)
     variant.save_ply(str(point_dir / "point_cloud.ply"))
     variant.save_tracking_metadata(str(point_dir / "gaussian_tags.pt"))
 
@@ -450,6 +466,10 @@ def export_variant(
             "scale_multiplier": float(scale_multiplier),
             "scale_axis_mode": str(scale_axis_mode),
             "filter_multiplier": float(filter_multiplier),
+            "post_mute_selection_source": str(post_mute_selection_source),
+            "post_mute_selection_key": str(post_mute_selection_key),
+            "post_mute_mask_payload_path": str(post_mute_mask_payload_path) if post_mute_mask_payload_path else None,
+            "post_mute_gaussians": None if post_mute_mask is None else int(post_mute_mask.sum().item()),
         },
         "paths": {
             "variant_model_root": str(variant_root),
@@ -484,6 +504,9 @@ def main() -> None:
     parser.add_argument("--scale_multiplier", type=float, default=1.0)
     parser.add_argument("--scale_axis_mode", choices=["all", "major_only"], default="all")
     parser.add_argument("--filter_multiplier", type=float, default=1.0)
+    parser.add_argument("--post_mute_selection_source", default="payload")
+    parser.add_argument("--post_mute_selection_key", default="")
+    parser.add_argument("--post_mute_mask_payload_path", default=None)
     parser.add_argument("--save_alpha", action="store_true")
     parser.add_argument("--save_depth", action="store_true")
     parser.add_argument("--save_premul", action="store_true")
@@ -494,6 +517,11 @@ def main() -> None:
     output_root = Path(args.output_root).expanduser().resolve()
     iteration = _resolve_iteration(model_path, int(args.iteration))
     mask_payload_path = Path(args.mask_payload_path).expanduser().resolve() if args.mask_payload_path else None
+    post_mute_mask_payload_path = (
+        Path(args.post_mute_mask_payload_path).expanduser().resolve()
+        if args.post_mute_mask_payload_path
+        else None
+    )
 
     summary = export_variant(
         scene_root=scene_root,
@@ -515,6 +543,9 @@ def main() -> None:
         scale_multiplier=float(args.scale_multiplier),
         scale_axis_mode=str(args.scale_axis_mode),
         filter_multiplier=float(args.filter_multiplier),
+        post_mute_selection_source=str(args.post_mute_selection_source),
+        post_mute_selection_key=str(args.post_mute_selection_key),
+        post_mute_mask_payload_path=post_mute_mask_payload_path,
         save_alpha=bool(args.save_alpha),
         save_depth=bool(args.save_depth),
         save_premul=bool(args.save_premul),
