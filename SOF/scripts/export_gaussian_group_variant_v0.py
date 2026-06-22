@@ -263,6 +263,18 @@ def _logit(prob: torch.Tensor) -> torch.Tensor:
     return torch.log(prob / torch.clamp(1.0 - prob, min=1e-6))
 
 
+def _select_views(items, max_items: int, mode: str):
+    mode = str(mode).strip().lower()
+    if mode == "first":
+        if int(max_items) <= 0 or len(items) <= int(max_items):
+            return list(items), list(range(len(items)))
+        ids = list(range(int(max_items)))
+        return [items[idx] for idx in ids], ids
+    if mode == "uniform":
+        return _select_uniform(items, max_items)
+    raise ValueError(f"Unsupported view_select_mode={mode!r}; use first/uniform.")
+
+
 def _apply_group_variant(
     gaussians: GaussianModel,
     *,
@@ -323,6 +335,7 @@ def export_variant(
     images_subdir: str,
     split: str,
     max_views: int,
+    view_select_mode: str,
     white_background: bool,
     selection_source: str,
     selection_key: str,
@@ -398,7 +411,7 @@ def export_variant(
 
     render_summary: Dict[str, object] = {}
     for split_name, views in _iter_views(render_scene, split):
-        selected_views, selected_indices = _select_uniform(list(views), max_views)
+        selected_views, selected_indices = _select_views(list(views), max_views, view_select_mode)
         render_root = output_root / split_name / f"ours_{loaded_iter}" / "renders"
         render_root.mkdir(parents=True, exist_ok=True)
         alpha_root = output_root / split_name / f"ours_{loaded_iter}" / "alpha"
@@ -433,6 +446,7 @@ def export_variant(
         render_summary[split_name] = {
             "num_views": int(len(selected_views)),
             "source_num_views": int(len(views)),
+            "view_select_mode": str(view_select_mode),
             "selected_indices": selected_indices,
             "render_root": str(render_root),
             "alpha_root": str(alpha_root) if save_alpha else None,
@@ -448,6 +462,7 @@ def export_variant(
         "images_subdir": str(images_subdir),
         "split": str(split),
         "max_views": int(max_views),
+        "view_select_mode": str(view_select_mode),
         "white_background": bool(white_background),
         "selection": {
             "source": str(selection_source),
@@ -492,6 +507,7 @@ def main() -> None:
     parser.add_argument("--iteration", type=int, default=-1)
     parser.add_argument("--split", choices=["train", "test", "both"], default="test")
     parser.add_argument("--max_views", type=int, default=8)
+    parser.add_argument("--view_select_mode", choices=["uniform", "first"], default="uniform")
     parser.add_argument("--white_background", action="store_true")
     parser.add_argument("--selection_source", choices=["lineage", "payload", "tracking"], default="lineage")
     parser.add_argument("--selection_key", default="children")
@@ -531,6 +547,7 @@ def main() -> None:
         images_subdir=str(args.images_subdir),
         split=str(args.split),
         max_views=int(args.max_views),
+        view_select_mode=str(args.view_select_mode),
         white_background=bool(args.white_background),
         selection_source=str(args.selection_source),
         selection_key=str(args.selection_key),

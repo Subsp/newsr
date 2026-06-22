@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SOF_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+
+WORK_ROOT="${WORK_ROOT:-/root/autodl-tmp}"
+SCENE_NAME="${SCENE_NAME:-kitchen}"
+SCENE_ROOT="${SCENE_ROOT:-${WORK_ROOT}/${SCENE_NAME}}"
+SCENE_ASSET_ROOT="${SCENE_ASSET_ROOT:-${SCENE_ROOT}/_hrgsrefiner_assets}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+MIPSPLATTING_ROOT="${MIPSPLATTING_ROOT:-$(cd -- "${SOF_ROOT}/.." && pwd)/mip-splatting}"
+
+RUN_TAG="${RUN_TAG:-mip30k_rerun_check_directsrc_r1_v0_spray_2dgs_effective_hf_gaulayer_anchoradd_8view_v0}"
+MODEL_DIR="${MODEL_DIR:-${SOF_ROOT}/output/mipsplatting_2dgs_hf_spray_v0/${SCENE_NAME}/${RUN_TAG}}"
+BASE_EXPERIMENT_NAME="${BASE_EXPERIMENT_NAME:-mip30k_rerun_check_directsrc_r1_v0}"
+BASE_MODEL_DIR="${BASE_MODEL_DIR:-${SCENE_ASSET_ROOT}/kitchen_mip_vanilla_images8_v1/${BASE_EXPERIMENT_NAME}}"
+GT_DIR="${GT_DIR:-${SCENE_ROOT}/images_2}"
+ITERATION="${ITERATION:-30000}"
+SPLIT="${SPLIT:-train}"
+MAX_VIEWS="${MAX_VIEWS:-8}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${SOF_ROOT}/output/spray_survival_preview/${RUN_TAG}_render_validated_v1}"
+OVERWRITE="${OVERWRITE:-1}"
+
+PRIOR_TAU_SCALE="${PRIOR_TAU_SCALE:-20.0}"
+PRIOR_SCALE_MULTIPLIER="${PRIOR_SCALE_MULTIPLIER:-2.0}"
+BOOST_TAU_SCALE="${BOOST_TAU_SCALE:-20.0}"
+BOOST_SCALE_MULTIPLIER="${BOOST_SCALE_MULTIPLIER:-2.0}"
+
+TARGET_COVERAGE_MULTIPLIER="${TARGET_COVERAGE_MULTIPLIER:-1.0}"
+PROBATION_COVERAGE_MULTIPLIER="${PROBATION_COVERAGE_MULTIPLIER:-1.8}"
+MIN_KEEP_FRACTION="${MIN_KEEP_FRACTION:-0.01}"
+MAX_KEEP_FRACTION="${MAX_KEEP_FRACTION:-0.45}"
+MIN_SCORE_FLOOR="${MIN_SCORE_FLOOR:-0.05}"
+HIGHPASS_KERNEL="${HIGHPASS_KERNEL:-9}"
+LOWPASS_KERNEL="${LOWPASS_KERNEL:-21}"
+
+POINT_DIR="${MODEL_DIR}/point_cloud/iteration_${ITERATION}"
+if [[ ! -f "${POINT_DIR}/point_cloud.ply" ]]; then
+  echo "[render-validated-survival-v1] point cloud not found: ${POINT_DIR}/point_cloud.ply" >&2
+  exit 1
+fi
+for required in "${BASE_MODEL_DIR}" "${GT_DIR}"; do
+  if [[ ! -d "${required}" ]]; then
+    echo "[render-validated-survival-v1] required path not found: ${required}" >&2
+    exit 1
+  fi
+done
+if [[ "${OVERWRITE}" == "1" ]]; then
+  rm -rf "${OUTPUT_ROOT}"
+fi
+mkdir -p "${OUTPUT_ROOT}"
+
+cd "${SOF_ROOT}"
+export PYTHONPATH="${SOF_ROOT}:${MIPSPLATTING_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+
+echo "[render-validated-survival-v1] model  : ${MODEL_DIR}"
+echo "[render-validated-survival-v1] base   : ${BASE_MODEL_DIR}"
+echo "[render-validated-survival-v1] gt     : ${GT_DIR}"
+echo "[render-validated-survival-v1] output : ${OUTPUT_ROOT}"
+echo "[render-validated-survival-v1] source views: first ${MAX_VIEWS} ${SPLIT} views"
+
+export_variant() {
+  local model_path="$1"
+  local export_root="$2"
+  shift 2
+  "${PYTHON_BIN}" "${SOF_ROOT}/scripts/export_gaussian_group_variant_v0.py" \
+    --scene_root "${SCENE_ROOT}" \
+    --model_path "${model_path}" \
+    --output_root "${export_root}" \
+    --images_subdir images_2 \
+    --iteration "${ITERATION}" \
+    --split "${SPLIT}" \
+    --max_views "${MAX_VIEWS}" \
+    --view_select_mode first \
+    "$@"
+}
+
+BASE_EXPORT="${OUTPUT_ROOT}/_base_source_variant"
+MERGED_EXPORT="${OUTPUT_ROOT}/_merged_source_variant"
+export_variant "${BASE_MODEL_DIR}" "${BASE_EXPORT}" \
+  --selection_source lineage \
+  --selection_key full \
+  --selection_mode full
+export_variant "${MODEL_DIR}" "${MERGED_EXPORT}" \
+  --selection_source lineage \
+  --selection_key full \
+  --selection_mode full
+
+BASE_RENDER_DIR="${BASE_EXPORT}/${SPLIT}/ours_${ITERATION}/renders"
+MERGED_RENDER_DIR="${MERGED_EXPORT}/${SPLIT}/ours_${ITERATION}/renders"
+PAYLOAD_DIR="${OUTPUT_ROOT}/survival_payload_v1"
+PAYLOAD_PATH="${PAYLOAD_DIR}/sprayed_2dgs_render_validated_survival_payload_v1.pt"
+
+"${PYTHON_BIN}" "${SOF_ROOT}/scripts/build_sprayed_2dgs_render_validated_survival_payload_v1.py" \
+  --model_dir "${MODEL_DIR}" \
+  --iteration "${ITERATION}" \
+  --base_render_dir "${BASE_RENDER_DIR}" \
+  --merged_render_dir "${MERGED_RENDER_DIR}" \
+  --gt_dir "${GT_DIR}" \
+  --output_dir "${PAYLOAD_DIR}" \
+  --limit_views "${MAX_VIEWS}" \
+  --highpass_kernel "${HIGHPASS_KERNEL}" \
+  --lowpass_kernel "${LOWPASS_KERNEL}" \
+  --target_coverage_multiplier "${TARGET_COVERAGE_MULTIPLIER}" \
+  --probation_coverage_multiplier "${PROBATION_COVERAGE_MULTIPLIER}" \
+  --min_keep_fraction "${MIN_KEEP_FRACTION}" \
+  --max_keep_fraction "${MAX_KEEP_FRACTION}" \
+  --min_score_floor "${MIN_SCORE_FLOOR}"
+
+render_payload_variant() {
+  local key="$1"
+  local mode="$2"
+  local out_name="$3"
+  local tau="$4"
+  local scale="$5"
+  local post_mute_key="${6:-}"
+  local export_root="${OUTPUT_ROOT}/_${out_name}_variant"
+  local selected_count
+  selected_count="$("${PYTHON_BIN}" -c 'import sys, torch; p=torch.load(sys.argv[1], map_location="cpu"); print(int(p[sys.argv[2]].reshape(-1).sum().item()))' "${PAYLOAD_PATH}" "${key}")"
+  if [[ "${mode}" == "selected_only" && "${selected_count}" == "0" ]]; then
+    mkdir -p "${OUTPUT_ROOT}/${out_name}_${SPLIT}"
+    echo "[render-validated-survival-v1] skip ${out_name}: ${key} selected zero gaussians"
+    return
+  fi
+  local args=(
+    --selection_source payload
+    --mask_payload_path "${PAYLOAD_PATH}"
+    --selection_key "${key}"
+    --selection_mode "${mode}"
+    --tau_scale "${tau}"
+    --scale_multiplier "${scale}"
+  )
+  if [[ -n "${post_mute_key}" ]]; then
+    args+=(
+      --post_mute_selection_source payload
+      --post_mute_mask_payload_path "${PAYLOAD_PATH}"
+      --post_mute_selection_key "${post_mute_key}"
+    )
+  fi
+  export_variant "${MODEL_DIR}" "${export_root}" "${args[@]}"
+}
+
+copy_renders() {
+  local export_name="$1"
+  local flat_name="$2"
+  local render_dir="${OUTPUT_ROOT}/_${export_name}_variant/${SPLIT}/ours_${ITERATION}/renders"
+  local flat_dir="${OUTPUT_ROOT}/${flat_name}"
+  mkdir -p "${flat_dir}"
+  shopt -s nullglob
+  for image_path in "${render_dir}"/*.png; do
+    cp "${image_path}" "${flat_dir}/"
+  done
+  shopt -u nullglob
+}
+
+mkdir -p "${OUTPUT_ROOT}/base_source_${SPLIT}" "${OUTPUT_ROOT}/merged_source_${SPLIT}"
+cp "${BASE_RENDER_DIR}"/*.png "${OUTPUT_ROOT}/base_source_${SPLIT}/"
+cp "${MERGED_RENDER_DIR}"/*.png "${OUTPUT_ROOT}/merged_source_${SPLIT}/"
+
+render_payload_variant "survive_prior" "selected_only" "survive_prior" "${PRIOR_TAU_SCALE}" "${PRIOR_SCALE_MULTIPLIER}"
+render_payload_variant "probation_prior" "selected_only" "probation_prior" "${PRIOR_TAU_SCALE}" "${PRIOR_SCALE_MULTIPLIER}"
+render_payload_variant "suppress_prior" "selected_only" "suppress_prior" "${PRIOR_TAU_SCALE}" "${PRIOR_SCALE_MULTIPLIER}"
+render_payload_variant "keep_prior" "full" "merged_survive" "1.0" "1.0" "drop_prior"
+render_payload_variant "keep_prior" "full" "merged_survive_boost" "${BOOST_TAU_SCALE}" "${BOOST_SCALE_MULTIPLIER}" "drop_prior"
+render_payload_variant "candidate_prior" "full" "merged_candidate_boost" "${BOOST_TAU_SCALE}" "${BOOST_SCALE_MULTIPLIER}" "drop_candidate_prior"
+
+copy_renders "survive_prior" "survive_prior_${SPLIT}"
+copy_renders "probation_prior" "probation_prior_${SPLIT}"
+copy_renders "suppress_prior" "suppress_prior_${SPLIT}"
+copy_renders "merged_survive" "merged_survive_${SPLIT}"
+copy_renders "merged_survive_boost" "merged_survive_boost_${SPLIT}"
+copy_renders "merged_candidate_boost" "merged_candidate_boost_${SPLIT}"
+
+cat > "${OUTPUT_ROOT}/README.txt" <<EOF
+Render-validated sprayed 2DGS HF survival preview v1.
+
+model: ${MODEL_DIR}
+base: ${BASE_MODEL_DIR}
+gt: ${GT_DIR}
+iteration: ${ITERATION}
+split: ${SPLIT}
+source views: first ${MAX_VIEWS}
+payload: ${PAYLOAD_PATH}
+
+Inspect:
+  ${OUTPUT_ROOT}/survival_payload_v1/summary.json
+  ${OUTPUT_ROOT}/base_source_${SPLIT}
+  ${OUTPUT_ROOT}/merged_source_${SPLIT}
+  ${OUTPUT_ROOT}/survive_prior_${SPLIT}
+  ${OUTPUT_ROOT}/probation_prior_${SPLIT}
+  ${OUTPUT_ROOT}/suppress_prior_${SPLIT}
+  ${OUTPUT_ROOT}/merged_survive_${SPLIT}
+  ${OUTPUT_ROOT}/merged_survive_boost_${SPLIT}
+  ${OUTPUT_ROOT}/merged_candidate_boost_${SPLIT}
+EOF
+
+echo "[render-validated-survival-v1] shallow outputs:"
+echo "  ${OUTPUT_ROOT}/survival_payload_v1/summary.json"
+echo "  ${OUTPUT_ROOT}/base_source_${SPLIT}"
+echo "  ${OUTPUT_ROOT}/merged_source_${SPLIT}"
+echo "  ${OUTPUT_ROOT}/survive_prior_${SPLIT}"
+echo "  ${OUTPUT_ROOT}/probation_prior_${SPLIT}"
+echo "  ${OUTPUT_ROOT}/suppress_prior_${SPLIT}"
+echo "  ${OUTPUT_ROOT}/merged_survive_${SPLIT}"
+echo "  ${OUTPUT_ROOT}/merged_survive_boost_${SPLIT}"
+echo "  ${OUTPUT_ROOT}/merged_candidate_boost_${SPLIT}"
+echo "  ${OUTPUT_ROOT}/README.txt"
