@@ -146,11 +146,39 @@ def _resolve_paths(args: argparse.Namespace) -> Tuple[Path, Path, Path, Path, Pa
         else model_dir / "spray_2dgs_hf_carrier_to_gaussian_layer_v0_summary.json"
     )
     summary = _read_json(summary_path)
-    metadata_path = (
-        Path(args.metadata_path).expanduser().resolve()
-        if args.metadata_path
-        else Path(str(summary["newborn_metadata"])).expanduser().resolve()
-    )
+    if args.metadata_path:
+        metadata_path = Path(args.metadata_path).expanduser().resolve()
+    else:
+        metadata_name = "sprayed_2dgs_gaussian_layer_metadata_v0.npz"
+        metadata_candidates: List[Path] = []
+        for key in ("merged_metadata", "newborn_metadata"):
+            value = summary.get(key)
+            if value:
+                metadata_candidates.append(Path(str(value)).expanduser().resolve())
+        metadata_candidates.append(point_dir / metadata_name)
+        newborn_model_dir = summary.get("newborn_model_dir")
+        if newborn_model_dir:
+            metadata_candidates.append(
+                Path(str(newborn_model_dir)).expanduser().resolve()
+                / "point_cloud"
+                / f"iteration_{int(args.iteration)}"
+                / metadata_name
+            )
+        seen = set()
+        deduped_candidates: List[Path] = []
+        for candidate in metadata_candidates:
+            key = str(candidate)
+            if key not in seen:
+                seen.add(key)
+                deduped_candidates.append(candidate)
+        metadata_path = next((candidate for candidate in deduped_candidates if candidate.is_file()), deduped_candidates[0])
+        if not metadata_path.is_file():
+            candidates = "\n  ".join(str(candidate) for candidate in deduped_candidates)
+            raise FileNotFoundError(
+                "sprayed 2DGS metadata not found. Re-run the spray step with the current code, "
+                "or pass --metadata_path explicitly. Tried:\n  "
+                f"{candidates}"
+            )
     primitive_dir = (
         Path(args.primitive_dir).expanduser().resolve()
         if args.primitive_dir

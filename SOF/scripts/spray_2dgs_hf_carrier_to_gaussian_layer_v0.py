@@ -528,10 +528,16 @@ def main() -> None:
 
     newborn_tags = _make_tracking(0, int(new_vertices.shape[0]), Path("__missing__"), base_iter)
     torch.save(newborn_tags, newborn_point_dir / "gaussian_tags.pt")
-    np.savez_compressed(
-        newborn_point_dir / "sprayed_2dgs_gaussian_layer_metadata_v0.npz",
-        **newborn_all,
-    )
+    metadata_name = "sprayed_2dgs_gaussian_layer_metadata_v0.npz"
+    newborn_metadata_path = newborn_point_dir / metadata_name
+    np.savez_compressed(newborn_metadata_path, **newborn_all)
+
+    # Keep a copy next to the merged model as well, so cleanup of *_newborn_only
+    # does not break later survival/validation passes.
+    output_point_dir = output_model_dir / "point_cloud" / f"iteration_{base_iter}"
+    output_point_dir.mkdir(parents=True, exist_ok=True)
+    output_metadata_path = output_point_dir / metadata_name
+    shutil.copy2(newborn_metadata_path, output_metadata_path)
 
     cpu_preview_ply = None
     cpu_preview_tags = None
@@ -561,7 +567,8 @@ def main() -> None:
         "newborn_model_dir": str(newborn_model_dir),
         "newborn_ply": str(newborn_ply),
         "newborn_tags": str(newborn_point_dir / "gaussian_tags.pt"),
-        "newborn_metadata": str(newborn_point_dir / "sprayed_2dgs_gaussian_layer_metadata_v0.npz"),
+        "newborn_metadata": str(newborn_metadata_path),
+        "merged_metadata": str(output_metadata_path),
         "cpu_preview_ply": None if cpu_preview_ply is None else str(cpu_preview_ply),
         "cpu_preview_tags": None if cpu_preview_tags is None else str(cpu_preview_tags),
         "base_gaussians": base_count,

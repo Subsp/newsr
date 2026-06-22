@@ -151,6 +151,15 @@ echo "[spray-2dgs-to-gaussian-layer-v0] merge     : ${MERGE_SCRIPT}"
   --output_model_path "${OUTPUT_MODEL_DIR}" \
   --output_iteration "${OUTPUT_ITERATION}"
 
+NEWBORN_METADATA="${NEWBORN_MODEL_DIR}/point_cloud/iteration_${BASE_ITERATION}/sprayed_2dgs_gaussian_layer_metadata_v0.npz"
+MERGED_METADATA="${OUTPUT_MODEL_DIR}/point_cloud/iteration_${OUTPUT_ITERATION}/sprayed_2dgs_gaussian_layer_metadata_v0.npz"
+if [[ -f "${NEWBORN_METADATA}" ]]; then
+  mkdir -p "$(dirname -- "${MERGED_METADATA}")"
+  cp "${NEWBORN_METADATA}" "${MERGED_METADATA}"
+  echo "[spray-2dgs-to-gaussian-layer-v0] metadata:"
+  echo "  ${MERGED_METADATA}"
+fi
+
 echo "[spray-2dgs-to-gaussian-layer-v0] done model:"
 echo "  ${OUTPUT_MODEL_DIR}"
 echo "[spray-2dgs-to-gaussian-layer-v0] merged ply:"
