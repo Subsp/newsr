@@ -104,6 +104,10 @@ def _build_full_mask(prior_indices: torch.Tensor, newborn_mask: np.ndarray, tota
     return out
 
 
+def _torch_flatnonzero(mask: torch.Tensor) -> torch.Tensor:
+    return torch.nonzero(mask.reshape(-1), as_tuple=False).reshape(-1)
+
+
 def main() -> None:
     args = _parse_args()
     tags_path, summary_path, metadata_path, output_dir = _resolve_paths(args)
@@ -112,7 +116,7 @@ def main() -> None:
     source_tag = torch.as_tensor(tags["source_tag"]).reshape(-1).to(dtype=torch.int64)
     total = int(source_tag.shape[0])
     prior_mask_t = source_tag == 1
-    prior_indices = torch.flatnonzero(prior_mask_t)
+    prior_indices = _torch_flatnonzero(prior_mask_t)
     base_count = int(summary.get("base_gaussians", total - int(prior_indices.shape[0])))
 
     if not metadata_path.is_file():
