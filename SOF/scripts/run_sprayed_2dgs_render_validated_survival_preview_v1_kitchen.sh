@@ -19,7 +19,7 @@ GT_DIR="${GT_DIR:-${SCENE_ROOT}/images_2}"
 ITERATION="${ITERATION:-30000}"
 SPLIT="${SPLIT:-train}"
 MAX_VIEWS="${MAX_VIEWS:-8}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${SOF_ROOT}/output/spray_survival_preview/${RUN_TAG}_render_validated_v1}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${SOF_ROOT}/output/spray_survival_preview/${RUN_TAG}_render_validated_v2}"
 OVERWRITE="${OVERWRITE:-1}"
 
 PRIOR_TAU_SCALE="${PRIOR_TAU_SCALE:-20.0}"
@@ -34,6 +34,17 @@ MAX_KEEP_FRACTION="${MAX_KEEP_FRACTION:-0.45}"
 MIN_SCORE_FLOOR="${MIN_SCORE_FLOOR:-0.05}"
 HIGHPASS_KERNEL="${HIGHPASS_KERNEL:-9}"
 LOWPASS_KERNEL="${LOWPASS_KERNEL:-21}"
+ORIENTATION_KERNEL="${ORIENTATION_KERNEL:-9}"
+FOOTPRINT_LONG_SCALE="${FOOTPRINT_LONG_SCALE:-0.85}"
+FOOTPRINT_SHORT_SCALE="${FOOTPRINT_SHORT_SCALE:-0.85}"
+FOOTPRINT_MAX_RADIUS_PX="${FOOTPRINT_MAX_RADIUS_PX:-12.0}"
+MIN_DIRECTION_ALIGN="${MIN_DIRECTION_ALIGN:-0.52}"
+DIRECTION_PENALTY_WEIGHT="${DIRECTION_PENALTY_WEIGHT:-0.28}"
+FOOTPRINT_LEAK_PENALTY_WEIGHT="${FOOTPRINT_LEAK_PENALTY_WEIGHT:-0.34}"
+OWNER_DIRECTION_BINS="${OWNER_DIRECTION_BINS:-12}"
+OWNER_TOP_BINS="${OWNER_TOP_BINS:-2}"
+OWNER_MIN_GROUP_SIZE="${OWNER_MIN_GROUP_SIZE:-4}"
+OWNER_PENALTY_WEIGHT="${OWNER_PENALTY_WEIGHT:-0.18}"
 
 POINT_DIR="${MODEL_DIR}/point_cloud/iteration_${ITERATION}"
 if [[ ! -f "${POINT_DIR}/point_cloud.ply" ]]; then
@@ -102,6 +113,17 @@ PAYLOAD_PATH="${PAYLOAD_DIR}/sprayed_2dgs_render_validated_survival_payload_v1.p
   --limit_views "${MAX_VIEWS}" \
   --highpass_kernel "${HIGHPASS_KERNEL}" \
   --lowpass_kernel "${LOWPASS_KERNEL}" \
+  --orientation_kernel "${ORIENTATION_KERNEL}" \
+  --footprint_long_scale "${FOOTPRINT_LONG_SCALE}" \
+  --footprint_short_scale "${FOOTPRINT_SHORT_SCALE}" \
+  --footprint_max_radius_px "${FOOTPRINT_MAX_RADIUS_PX}" \
+  --min_direction_align "${MIN_DIRECTION_ALIGN}" \
+  --direction_penalty_weight "${DIRECTION_PENALTY_WEIGHT}" \
+  --footprint_leak_penalty_weight "${FOOTPRINT_LEAK_PENALTY_WEIGHT}" \
+  --owner_direction_bins "${OWNER_DIRECTION_BINS}" \
+  --owner_top_bins "${OWNER_TOP_BINS}" \
+  --owner_min_group_size "${OWNER_MIN_GROUP_SIZE}" \
+  --owner_penalty_weight "${OWNER_PENALTY_WEIGHT}" \
   --target_coverage_multiplier "${TARGET_COVERAGE_MULTIPLIER}" \
   --probation_coverage_multiplier "${PROBATION_COVERAGE_MULTIPLIER}" \
   --min_keep_fraction "${MIN_KEEP_FRACTION}" \
@@ -173,7 +195,10 @@ copy_renders "merged_survive_boost" "merged_survive_boost_${SPLIT}"
 copy_renders "merged_candidate_boost" "merged_candidate_boost_${SPLIT}"
 
 cat > "${OUTPUT_ROOT}/README.txt" <<EOF
-Render-validated sprayed 2DGS HF survival preview v1.
+Render-validated sprayed 2DGS HF survival preview v2.
+
+This variant adds footprint hit/leak, image tangent direction agreement, and
+per-owner direction-mode arbitration on top of the original render validation.
 
 model: ${MODEL_DIR}
 base: ${BASE_MODEL_DIR}
