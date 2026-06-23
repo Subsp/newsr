@@ -10,17 +10,32 @@ SCENE_ROOT="${SCENE_ROOT:-${WORK_ROOT}/${SCENE_NAME}}"
 SCENE_ASSET_ROOT="${SCENE_ASSET_ROOT:-${SCENE_ROOT}/_hrgsrefiner_assets}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
-BASE_RUN_TAG="${BASE_RUN_TAG:-mip30k_rerun_check_directsrc_r1_v0_cave_hf_transfer_v0}"
-BASE_MODEL_DIR="${BASE_MODEL_DIR:-${SOF_ROOT}/output/mipsplatting_nosr_layerfreq_cleanup_v0/${SCENE_NAME}/${BASE_RUN_TAG}}"
-BASE_ITERATION="${BASE_ITERATION:-32000}"
+BASE_RUN_TAG="${BASE_RUN_TAG:-}"
+if [[ -z "${BASE_MODEL_DIR:-}" ]]; then
+  if [[ -n "${BASE_RUN_TAG}" ]]; then
+    BASE_MODEL_DIR="${SOF_ROOT}/output/mipsplatting_nosr_layerfreq_cleanup_v0/${SCENE_NAME}/${BASE_RUN_TAG}"
+    BASE_ITERATION="${BASE_ITERATION:-32000}"
+  else
+    BASE_MODEL_DIR="${SCENE_ASSET_ROOT}/kitchen_mip_vanilla_images8_v1/mip30k_rerun_check_directsrc_r1_v0"
+    BASE_ITERATION="${BASE_ITERATION:-30000}"
+  fi
+else
+  BASE_ITERATION="${BASE_ITERATION:-30000}"
+fi
+BASE_LABEL="${BASE_RUN_TAG:-$(basename -- "${BASE_MODEL_DIR}")}"
 
 EVIDENCE_NAME="${EVIDENCE_NAME:-qwen_vosr_sr_hf_effective_verywide_8view_v0}"
 EVIDENCE_ROOT="${EVIDENCE_ROOT:-${SCENE_ASSET_ROOT}/sr_hf_evidence/${EVIDENCE_NAME}}"
 PRIMITIVE_DIR="${PRIMITIVE_DIR:-${EVIDENCE_ROOT}/primitives}"
 WEIGHT_DIR="${WEIGHT_DIR:-${EVIDENCE_ROOT}/effective_hf_weight}"
 RGB_DIR="${RGB_DIR:-${EVIDENCE_ROOT}/effective_hf_carrier_rgb}"
+SR_PRIOR_NAME="${SR_PRIOR_NAME:-qwen_steps1_seed42_rcgm_aligned_images2_train244_v0}"
+CURVE_IMAGE_DIR="${CURVE_IMAGE_DIR:-${SCENE_ASSET_ROOT}/prepared_sr_priors/${SR_PRIOR_NAME}/fused_priors}"
+CURVE_IMAGE_MODE="${CURVE_IMAGE_MODE:-sr_hf_luma}"
+CURVE_HIGHPASS_BLUR_RADIUS="${CURVE_HIGHPASS_BLUR_RADIUS:-4.0}"
+CURVE_WEIGHT_POWER="${CURVE_WEIGHT_POWER:-1.0}"
 
-OUTPUT_NAME="${OUTPUT_NAME:-${BASE_RUN_TAG}_${EVIDENCE_NAME}_curve_tracks_v1}"
+OUTPUT_NAME="${OUTPUT_NAME:-${BASE_LABEL}_${EVIDENCE_NAME}_curve_tracks_v1}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${SCENE_ASSET_ROOT}/sr_hf_curve_tracks/${OUTPUT_NAME}}"
 
 MATCH_POLICY="${MATCH_POLICY:-order_if_needed}"
@@ -61,7 +76,14 @@ STRONG_TRACK_MIN_VIEWS="${STRONG_TRACK_MIN_VIEWS:-2}"
 DEBUG_LIMIT="${DEBUG_LIMIT:-8}"
 MAX_DRAW_SEGMENTS="${MAX_DRAW_SEGMENTS:-8192}"
 
-for required in "${BASE_MODEL_DIR}" "${BASE_MODEL_DIR}/point_cloud/iteration_${BASE_ITERATION}/point_cloud.ply" "${PRIMITIVE_DIR}"; do
+REQUIRED_PATHS=("${BASE_MODEL_DIR}" "${BASE_MODEL_DIR}/point_cloud/iteration_${BASE_ITERATION}/point_cloud.ply" "${PRIMITIVE_DIR}")
+if [[ "${CURVE_SOURCE}" == "skeleton" ]]; then
+  REQUIRED_PATHS+=("${WEIGHT_DIR}")
+  if [[ "${CURVE_IMAGE_MODE}" != "weight" ]]; then
+    REQUIRED_PATHS+=("${CURVE_IMAGE_DIR}")
+  fi
+fi
+for required in "${REQUIRED_PATHS[@]}"; do
   if [[ ! -e "${required}" ]]; then
     echo "[sr-hf-curve-tracks-v0] required path not found: ${required}" >&2
     exit 1
@@ -73,6 +95,10 @@ ARGS=(
   --base_iteration "${BASE_ITERATION}"
   --primitive_dir "${PRIMITIVE_DIR}"
   --output_root "${OUTPUT_ROOT}"
+  --curve_image_dir "${CURVE_IMAGE_DIR}"
+  --curve_image_mode "${CURVE_IMAGE_MODE}"
+  --curve_highpass_blur_radius "${CURVE_HIGHPASS_BLUR_RADIUS}"
+  --curve_weight_power "${CURVE_WEIGHT_POWER}"
   --match_policy "${MATCH_POLICY}"
   --limit "${LIMIT}"
   --curve_source "${CURVE_SOURCE}"
@@ -128,6 +154,7 @@ echo "[sr-hf-curve-tracks-v0] base      : ${BASE_MODEL_DIR}"
 echo "[sr-hf-curve-tracks-v0] primitives: ${PRIMITIVE_DIR}"
 echo "[sr-hf-curve-tracks-v0] weight    : ${WEIGHT_DIR}"
 echo "[sr-hf-curve-tracks-v0] rgb       : ${RGB_DIR}"
+echo "[sr-hf-curve-tracks-v0] curve img : ${CURVE_IMAGE_DIR} mode=${CURVE_IMAGE_MODE}"
 echo "[sr-hf-curve-tracks-v0] output    : ${OUTPUT_ROOT}"
 echo "[sr-hf-curve-tracks-v0] limit     : ${LIMIT}"
 echo "[sr-hf-curve-tracks-v0] source    : ${CURVE_SOURCE} track_mode=${TRACK_BUILD_MODE}"

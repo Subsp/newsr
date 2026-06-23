@@ -11,17 +11,27 @@ SCENE_ASSET_ROOT="${SCENE_ASSET_ROOT:-${SCENE_ROOT}/_hrgsrefiner_assets}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 MIPSPLATTING_ROOT="${MIPSPLATTING_ROOT:-$(cd -- "${SOF_ROOT}/.." && pwd)/mip-splatting}"
 
-BASE_RUN_TAG="${BASE_RUN_TAG:-mip30k_rerun_check_directsrc_r1_v0_cave_hf_transfer_v0}"
-BASE_MODEL_DIR="${BASE_MODEL_DIR:-${SOF_ROOT}/output/mipsplatting_nosr_layerfreq_cleanup_v0/${SCENE_NAME}/${BASE_RUN_TAG}}"
-BASE_ITERATION="${BASE_ITERATION:-32000}"
+BASE_RUN_TAG="${BASE_RUN_TAG:-}"
+if [[ -z "${BASE_MODEL_DIR:-}" ]]; then
+  if [[ -n "${BASE_RUN_TAG}" ]]; then
+    BASE_MODEL_DIR="${SOF_ROOT}/output/mipsplatting_nosr_layerfreq_cleanup_v0/${SCENE_NAME}/${BASE_RUN_TAG}"
+    BASE_ITERATION="${BASE_ITERATION:-32000}"
+  else
+    BASE_MODEL_DIR="${SCENE_ASSET_ROOT}/kitchen_mip_vanilla_images8_v1/mip30k_rerun_check_directsrc_r1_v0"
+    BASE_ITERATION="${BASE_ITERATION:-30000}"
+  fi
+else
+  BASE_ITERATION="${BASE_ITERATION:-30000}"
+fi
+BASE_LABEL="${BASE_RUN_TAG:-$(basename -- "${BASE_MODEL_DIR}")}"
 BASE_PLY="${BASE_MODEL_DIR}/point_cloud/iteration_${BASE_ITERATION}/point_cloud.ply"
 
 EVIDENCE_NAME="${EVIDENCE_NAME:-qwen_vosr_sr_hf_effective_verywide_8view_v0}"
-TRACK_NAME="${TRACK_NAME:-${BASE_RUN_TAG}_${EVIDENCE_NAME}_curve_tracks_v1}"
+TRACK_NAME="${TRACK_NAME:-${BASE_LABEL}_${EVIDENCE_NAME}_curve_tracks_v1}"
 TRACK_ROOT="${TRACK_ROOT:-${SCENE_ASSET_ROOT}/sr_hf_curve_tracks/${TRACK_NAME}}"
 TRACK_PAYLOAD="${TRACK_PAYLOAD:-${TRACK_ROOT}/sr_hf_curve_tracks_v0.npz}"
 
-OUTPUT_NAME="${OUTPUT_NAME:-${BASE_RUN_TAG}_spray_sr_hf_curve_tracks_v1}"
+OUTPUT_NAME="${OUTPUT_NAME:-${BASE_LABEL}_spray_sr_hf_curve_tracks_v1}"
 OUTPUT_MODEL_DIR="${OUTPUT_MODEL_DIR:-${SOF_ROOT}/output/mipsplatting_sr_hf_curve_spray_v0/${SCENE_NAME}/${OUTPUT_NAME}}"
 NEWBORN_MODEL_DIR="${NEWBORN_MODEL_DIR:-${OUTPUT_MODEL_DIR}_newborn_only}"
 OUTPUT_ITERATION="${OUTPUT_ITERATION:-${BASE_ITERATION}}"

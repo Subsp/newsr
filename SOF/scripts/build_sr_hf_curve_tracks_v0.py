@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 
 try:
     from tqdm import tqdm
@@ -62,6 +62,50 @@ def _load_gray(path: Path, size: Optional[Tuple[int, int]] = None) -> np.ndarray
     if size is not None and image.size != size:
         image = image.resize(size, Image.BICUBIC)
     return np.asarray(image, dtype=np.float32) / 255.0
+
+
+def _rgb_luma(rgb: np.ndarray) -> np.ndarray:
+    return (
+        0.299 * rgb[..., 0].astype(np.float32)
+        + 0.587 * rgb[..., 1].astype(np.float32)
+        + 0.114 * rgb[..., 2].astype(np.float32)
+    ).astype(np.float32)
+
+
+def _blur_gray(image: np.ndarray, radius: float) -> np.ndarray:
+    radius = max(float(radius), 0.0)
+    if radius <= 1e-6:
+        return image.astype(np.float32)
+    pil = Image.fromarray((np.clip(image, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8), mode="L")
+    pil = pil.filter(ImageFilter.GaussianBlur(radius=radius))
+    return (np.asarray(pil, dtype=np.float32) / 255.0).astype(np.float32)
+
+
+def _curve_strength_from_image(curve_rgb: Optional[np.ndarray], gate_weight: np.ndarray, args: argparse.Namespace) -> np.ndarray:
+    mode = str(args.curve_image_mode)
+    if mode == "weight":
+        strength = gate_weight.astype(np.float32)
+    else:
+        if curve_rgb is None:
+            raise ValueError(f"curve_image_mode={mode} requires --curve_image_dir")
+        luma = _rgb_luma(curve_rgb)
+        if mode == "sr_hf_luma":
+            low = _blur_gray(luma, float(args.curve_highpass_blur_radius))
+            strength = np.abs(luma - low).astype(np.float32)
+            positive = strength[np.isfinite(strength) & (strength > 0)]
+            if positive.size:
+                scale = max(float(np.percentile(positive, 99.0)), 1e-6)
+                strength = strength / scale
+            strength = np.clip(strength, 0.0, 1.0).astype(np.float32)
+        elif mode == "luma":
+            strength = np.clip(luma, 0.0, 1.0).astype(np.float32)
+        else:  # argparse choices should prevent this.
+            raise ValueError(f"Unsupported curve_image_mode: {mode}")
+    gate = np.clip(gate_weight.astype(np.float32), 0.0, 1.0)
+    power = float(args.curve_weight_power)
+    if abs(power - 1.0) > 1e-8:
+        gate = np.power(gate, power).astype(np.float32)
+    return np.clip(strength * gate, 0.0, 1.0).astype(np.float32)
 
 
 def _load_cameras(base_model_dir: Path) -> Dict[str, Dict[str, object]]:
@@ -259,6 +303,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output_root", required=True)
     parser.add_argument("--weight_dir", default="")
     parser.add_argument("--rgb_dir", default="")
+    parser.add_argument("--curve_image_dir", default="")
+    parser.add_argument("--curve_image_mode", default="sr_hf_luma", choices=["sr_hf_luma", "luma", "weight"])
+    parser.add_argument("--curve_highpass_blur_radius", type=float, default=4.0)
+    parser.add_argument("--curve_weight_power", type=float, default=1.0)
     parser.add_argument("--match_policy", default="order_if_needed", choices=["stem", "order", "order_if_needed"])
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
@@ -518,11 +566,11 @@ def _resample_path(path: np.ndarray, step_px: float) -> np.ndarray:
 
 
 def _primitive_from_skeleton(
-    weight_img: np.ndarray,
+    strength_img: np.ndarray,
     rgb_img: Optional[np.ndarray],
     args: argparse.Namespace,
 ) -> Dict[str, np.ndarray]:
-    positive = weight_img[np.isfinite(weight_img) & (weight_img > 0)]
+    positive = strength_img[np.isfinite(strength_img) & (strength_img > 0)]
     if positive.size == 0:
         return {
             "xy": np.zeros((0, 2), dtype=np.float32),
@@ -537,7 +585,7 @@ def _primitive_from_skeleton(
         float(args.skeleton_min_weight),
         float(np.percentile(positive, float(args.skeleton_threshold_percentile))),
     )
-    mask = weight_img >= threshold
+    mask = strength_img >= threshold
     skel = _thin_binary_mask(mask, int(args.skeleton_max_thinning_iters))
     paths = _trace_skeleton_paths(skel, int(args.skeleton_min_path_pixels))
     xy_items: List[np.ndarray] = []
@@ -546,7 +594,7 @@ def _primitive_from_skeleton(
     sigma_short_items: List[np.ndarray] = []
     score_items: List[np.ndarray] = []
     color_items: List[np.ndarray] = []
-    h, w = weight_img.shape
+    h, w = strength_img.shape
     size = (int(w), int(h))
     for path in paths:
         path = _smooth_path(path, int(args.skeleton_smooth_window))
@@ -566,7 +614,7 @@ def _primitive_from_skeleton(
         length = length[ok]
         center = (p0 + p1) * 0.5
         theta = np.arctan2(vec[:, 1], vec[:, 0]).astype(np.float32)
-        score = _bilinear_scalar(weight_img, center, size)
+        score = _bilinear_scalar(strength_img, center, size)
         xy_items.append(center.astype(np.float32))
         theta_items.append(theta)
         sigma_long_items.append((length / max(2.0 * float(args.segment_length_scale), 1e-6)).astype(np.float32))
@@ -728,6 +776,8 @@ def _lift_view_segments(
     rgb_lookup: Dict[str, Path],
     weight_paths: Sequence[Path],
     weight_lookup: Dict[str, Path],
+    curve_paths: Sequence[Path],
+    curve_lookup: Dict[str, Path],
 ) -> Tuple[Optional[Dict[str, np.ndarray]], Dict[str, object]]:
     stem = primitive_path.stem
     cam, cam_match = _camera_for_view(cameras, stem, view_index, str(args.match_policy))
@@ -735,19 +785,26 @@ def _lift_view_segments(
         return None, {"stem": stem, "status": "missing_camera"}
     rgb_path = _resolve(rgb_paths, rgb_lookup, stem, view_index, str(args.match_policy)) if rgb_paths else None
     weight_path = _resolve(weight_paths, weight_lookup, stem, view_index, str(args.match_policy)) if weight_paths else None
+    curve_path = _resolve(curve_paths, curve_lookup, stem, view_index, str(args.match_policy)) if curve_paths else None
     if str(args.curve_source) == "skeleton":
         if weight_path is None or not weight_path.is_file():
             return None, {"stem": stem, "status": "missing_weight_for_skeleton"}
-        with Image.open(weight_path) as image:
+        if str(args.curve_image_mode) != "weight" and (curve_path is None or not curve_path.is_file()):
+            return None, {"stem": stem, "status": "missing_curve_image_for_skeleton"}
+        source_for_size = curve_path if curve_path is not None and curve_path.is_file() else weight_path
+        with Image.open(source_for_size) as image:
             source_size = image.size
-        weight_img_for_curve = _load_gray(weight_path, size=source_size)
-        rgb_img_for_curve = _load_rgb(rgb_path, size=source_size) if rgb_path is not None and rgb_path.is_file() else None
-        primitive = _primitive_from_skeleton(weight_img_for_curve, rgb_img_for_curve, args)
-        primitive_source = "skeleton"
+        weight_img_for_gate = _load_gray(weight_path, size=source_size)
+        curve_rgb = _load_rgb(curve_path, size=source_size) if curve_path is not None and curve_path.is_file() else None
+        curve_strength = _curve_strength_from_image(curve_rgb, weight_img_for_gate, args)
+        primitive = _primitive_from_skeleton(curve_strength, curve_rgb, args)
+        primitive_source = f"skeleton_{args.curve_image_mode}"
+        color_rgb_path = curve_path if curve_path is not None and curve_path.is_file() else rgb_path
     else:
         primitive = _load_primitive(primitive_path)
         source_size = _infer_source_size(primitive, rgb_path, weight_path)
         primitive_source = "primitive"
+        color_rgb_path = rgb_path
     ids, weight = _filter_primitive_ids(primitive, weight_path, source_size, args)
     if ids.size == 0:
         return None, {"stem": stem, "status": "empty_after_filter", "available": int(primitive["xy"].shape[0])}
@@ -847,8 +904,8 @@ def _lift_view_segments(
 
     final_ids = kept_ids[valid_len]
     rgb_color = np.clip(primitive["color"][final_ids], 0.0, 1.0).astype(np.float32)
-    if rgb_path is not None and rgb_path.is_file():
-        rgb_img = _load_rgb(rgb_path, size=source_size)
+    if color_rgb_path is not None and color_rgb_path.is_file():
+        rgb_img = _load_rgb(color_rgb_path, size=source_size)
         sampled = _bilinear_rgb(rgb_img, primitive["xy"][final_ids], source_size)
         low = np.mean(np.abs(rgb_color), axis=1, keepdims=True) < 1e-5
         rgb_color = np.where(low, sampled, rgb_color).astype(np.float32)
@@ -880,6 +937,7 @@ def _lift_view_segments(
         "status": "ok",
         "primitive_source": primitive_source,
         "camera_match": cam_match,
+        "curve_image": "" if curve_path is None else str(curve_path),
         "available": int(primitive["xy"].shape[0]),
         "candidate": int(ids.size),
         "lifted": int(lifted["p0"].shape[0]),
@@ -1222,6 +1280,7 @@ def main() -> None:
     output_root = Path(args.output_root).expanduser().resolve()
     weight_dir = Path(args.weight_dir).expanduser().resolve() if str(args.weight_dir) else None
     rgb_dir = Path(args.rgb_dir).expanduser().resolve() if str(args.rgb_dir) else None
+    curve_image_dir = Path(args.curve_image_dir).expanduser().resolve() if str(args.curve_image_dir) else None
 
     if output_root.exists() and any(output_root.iterdir()) and not bool(args.overwrite):
         raise FileExistsError(f"Output root is not empty; use --overwrite: {output_root}")
@@ -1241,6 +1300,10 @@ def main() -> None:
     rgb_lookup = _lookup(rgb_paths)
     weight_paths = _list_files(weight_dir, IMAGE_EXTS) if weight_dir is not None and weight_dir.is_dir() else []
     weight_lookup = _lookup(weight_paths)
+    curve_paths = _list_files(curve_image_dir, IMAGE_EXTS) if curve_image_dir is not None and curve_image_dir.is_dir() else []
+    curve_lookup = _lookup(curve_paths)
+    if str(args.curve_source) == "skeleton" and str(args.curve_image_mode) != "weight" and not curve_paths:
+        raise FileNotFoundError(f"curve_image_dir is required for SR-driven skeleton curves: {curve_image_dir}")
     cameras = _load_cameras(base_model_dir)
     _base_vertices, base_xyz, base_opacity, _base_rgb = _load_base_vertices(base_ply)
 
@@ -1260,6 +1323,8 @@ def main() -> None:
             rgb_lookup,
             weight_paths,
             weight_lookup,
+            curve_paths,
+            curve_lookup,
         )
         per_view.append(info)
         stems.append(primitive_path.stem)
@@ -1328,6 +1393,7 @@ def main() -> None:
         "primitive_dir": str(primitive_dir),
         "weight_dir": "" if weight_dir is None else str(weight_dir),
         "rgb_dir": "" if rgb_dir is None else str(rgb_dir),
+        "curve_image_dir": "" if curve_image_dir is None else str(curve_image_dir),
         "output_root": str(output_root),
         "num_views": len(primitive_paths),
         "stems": stems,
@@ -1348,6 +1414,9 @@ def main() -> None:
             "merge_min_overlap": float(args.merge_min_overlap),
             "merge_same_view": bool(args.merge_same_view),
             "curve_source": str(args.curve_source),
+            "curve_image_mode": str(args.curve_image_mode),
+            "curve_highpass_blur_radius": float(args.curve_highpass_blur_radius),
+            "curve_weight_power": float(args.curve_weight_power),
             "skeleton_threshold_percentile": float(args.skeleton_threshold_percentile),
             "skeleton_min_weight": float(args.skeleton_min_weight),
             "skeleton_min_path_pixels": int(args.skeleton_min_path_pixels),
