@@ -11,6 +11,21 @@ SCENE_ASSET_ROOT="${SCENE_ASSET_ROOT:-${SCENE_ROOT}/_hrgsrefiner_assets}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 MIPSPLATTING_ROOT="${MIPSPLATTING_ROOT:-$(cd -- "${SOF_ROOT}/.." && pwd)/mip-splatting}"
 
+resolve_latest_iteration() {
+  local model_dir="$1"
+  local latest=""
+  local d name
+  for d in "${model_dir}"/point_cloud/iteration_*; do
+    [[ -d "${d}" ]] || continue
+    name="${d##*/iteration_}"
+    [[ "${name}" =~ ^[0-9]+$ ]] || continue
+    if [[ -z "${latest}" || "${name}" -gt "${latest}" ]]; then
+      latest="${name}"
+    fi
+  done
+  [[ -n "${latest}" ]] && printf '%s\n' "${latest}"
+}
+
 BASE_RUN_TAG="${BASE_RUN_TAG:-}"
 if [[ -z "${BASE_MODEL_DIR:-}" ]]; then
   if [[ -n "${BASE_RUN_TAG}" ]]; then
@@ -21,7 +36,7 @@ if [[ -z "${BASE_MODEL_DIR:-}" ]]; then
     BASE_ITERATION="${BASE_ITERATION:-30000}"
   fi
 else
-  BASE_ITERATION="${BASE_ITERATION:-30000}"
+  BASE_ITERATION="${BASE_ITERATION:-$(resolve_latest_iteration "${BASE_MODEL_DIR}")}"
 fi
 BASE_LABEL="${BASE_RUN_TAG:-$(basename -- "${BASE_MODEL_DIR}")}"
 BASE_PLY="${BASE_MODEL_DIR}/point_cloud/iteration_${BASE_ITERATION}/point_cloud.ply"
