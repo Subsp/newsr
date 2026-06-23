@@ -318,8 +318,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--skeleton_sample_step_px", type=float, default=3.0)
     parser.add_argument("--skeleton_smooth_window", type=int, default=3)
     parser.add_argument("--skeleton_max_thinning_iters", type=int, default=80)
+    parser.add_argument("--dense_stroke_enable", action="store_true")
+    parser.add_argument("--dense_stroke_threshold_percentile", type=float, default=78.0)
+    parser.add_argument("--dense_stroke_min_strength", type=float, default=0.012)
+    parser.add_argument("--dense_stroke_grid_px", type=int, default=2)
+    parser.add_argument("--dense_stroke_max_per_view", type=int, default=32768)
+    parser.add_argument("--dense_stroke_length_px", type=float, default=4.0)
+    parser.add_argument("--dense_stroke_short_px", type=float, default=0.55)
     parser.add_argument("--keep_kinds", default="1,2", help="Comma-separated primitive kind ids. Defaults to geometry+texture.")
-    parser.add_argument("--max_primitives_per_view", type=int, default=8192)
+    parser.add_argument("--max_primitives_per_view", type=int, default=32768)
     parser.add_argument("--min_score", type=float, default=0.05)
     parser.add_argument("--min_weight", type=float, default=0.01)
     parser.add_argument("--base_opacity_min", type=float, default=0.02)
@@ -344,7 +351,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--min_track_views", type=int, default=1)
     parser.add_argument("--strong_track_min_views", type=int, default=2)
     parser.add_argument("--debug_limit", type=int, default=8)
-    parser.add_argument("--max_draw_segments", type=int, default=8192)
+    parser.add_argument("--max_draw_segments", type=int, default=32768)
     return parser.parse_args()
 
 
@@ -646,6 +653,90 @@ def _primitive_from_skeleton(
     }
 
 
+def _empty_primitive() -> Dict[str, np.ndarray]:
+    return {
+        "xy": np.zeros((0, 2), dtype=np.float32),
+        "theta": np.zeros((0,), dtype=np.float32),
+        "sigma_long": np.zeros((0,), dtype=np.float32),
+        "sigma_short": np.zeros((0,), dtype=np.float32),
+        "color": np.zeros((0, 3), dtype=np.float32),
+        "score": np.zeros((0,), dtype=np.float32),
+        "kind": np.zeros((0,), dtype=np.int32),
+    }
+
+
+def _concat_primitives(primitives: Sequence[Dict[str, np.ndarray]]) -> Dict[str, np.ndarray]:
+    non_empty = [item for item in primitives if int(item["xy"].shape[0]) > 0]
+    if not non_empty:
+        return _empty_primitive()
+    keys = ["xy", "theta", "sigma_long", "sigma_short", "color", "score", "kind"]
+    return {key: np.concatenate([item[key] for item in non_empty], axis=0) for key in keys}
+
+
+def _primitive_from_dense_strokes(
+    strength_img: np.ndarray,
+    rgb_img: Optional[np.ndarray],
+    args: argparse.Namespace,
+) -> Dict[str, np.ndarray]:
+    positive = strength_img[np.isfinite(strength_img) & (strength_img > 0)]
+    if positive.size == 0:
+        return _empty_primitive()
+    threshold = max(
+        float(args.dense_stroke_min_strength),
+        float(np.percentile(positive, float(args.dense_stroke_threshold_percentile))),
+    )
+    valid = np.isfinite(strength_img) & (strength_img >= threshold)
+    ys, xs = np.nonzero(valid)
+    if xs.size == 0:
+        return _empty_primitive()
+
+    scores = strength_img[ys, xs].astype(np.float32)
+    h, w = strength_img.shape
+    grid = max(int(args.dense_stroke_grid_px), 1)
+    cell_w = int(math.ceil(float(w) / float(grid)))
+    cells = (ys // grid).astype(np.int64) * int(cell_w) + (xs // grid).astype(np.int64)
+    order = np.lexsort((-scores, cells))
+    sorted_cells = cells[order]
+    first = np.concatenate(([True], sorted_cells[1:] != sorted_cells[:-1]))
+    keep = order[first]
+    keep = keep[np.argsort(scores[keep])[::-1]]
+    if int(args.dense_stroke_max_per_view) > 0:
+        keep = keep[: int(args.dense_stroke_max_per_view)]
+    xs_keep = xs[keep].astype(np.float32)
+    ys_keep = ys[keep].astype(np.float32)
+    score_keep = scores[keep].astype(np.float32)
+
+    gy, gx = np.gradient(strength_img.astype(np.float32))
+    grad_x = gx[ys[keep], xs[keep]].astype(np.float32)
+    grad_y = gy[ys[keep], xs[keep]].astype(np.float32)
+    theta = (np.arctan2(grad_y, grad_x) + math.pi * 0.5).astype(np.float32)
+    weak = (grad_x * grad_x + grad_y * grad_y) < 1e-12
+    theta[weak] = 0.0
+
+    xy = np.stack([xs_keep, ys_keep], axis=1).astype(np.float32)
+    size = (int(w), int(h))
+    if rgb_img is not None:
+        color = _bilinear_rgb(rgb_img, xy, size)
+    else:
+        color = np.repeat(score_keep[:, None], 3, axis=1).astype(np.float32)
+    dense_len = max(float(args.dense_stroke_length_px), 1e-6)
+    sigma_long = np.full(
+        (xy.shape[0],),
+        dense_len / max(2.0 * float(args.segment_length_scale), 1e-6),
+        dtype=np.float32,
+    )
+    sigma_short = np.full((xy.shape[0],), max(float(args.dense_stroke_short_px), 1e-6), dtype=np.float32)
+    return {
+        "xy": xy,
+        "theta": theta,
+        "sigma_long": sigma_long,
+        "sigma_short": sigma_short,
+        "color": np.clip(color, 0.0, 1.0).astype(np.float32),
+        "score": score_keep,
+        "kind": np.full((xy.shape[0],), KIND_TEXTURE, dtype=np.int32),
+    }
+
+
 def _load_primitive(path: Path) -> Dict[str, np.ndarray]:
     data = dict(np.load(path))
     if "xy" in data:
@@ -797,8 +888,14 @@ def _lift_view_segments(
         weight_img_for_gate = _load_gray(weight_path, size=source_size)
         curve_rgb = _load_rgb(curve_path, size=source_size) if curve_path is not None and curve_path.is_file() else None
         curve_strength = _curve_strength_from_image(curve_rgb, weight_img_for_gate, args)
-        primitive = _primitive_from_skeleton(curve_strength, curve_rgb, args)
-        primitive_source = f"skeleton_{args.curve_image_mode}"
+        skeleton_primitive = _primitive_from_skeleton(curve_strength, curve_rgb, args)
+        if bool(args.dense_stroke_enable):
+            dense_primitive = _primitive_from_dense_strokes(curve_strength, curve_rgb, args)
+            primitive = _concat_primitives([skeleton_primitive, dense_primitive])
+            primitive_source = f"skeleton_dense_{args.curve_image_mode}"
+        else:
+            primitive = skeleton_primitive
+            primitive_source = f"skeleton_{args.curve_image_mode}"
         color_rgb_path = curve_path if curve_path is not None and curve_path.is_file() else rgb_path
     else:
         primitive = _load_primitive(primitive_path)
@@ -1421,6 +1518,13 @@ def main() -> None:
             "skeleton_min_weight": float(args.skeleton_min_weight),
             "skeleton_min_path_pixels": int(args.skeleton_min_path_pixels),
             "skeleton_sample_step_px": float(args.skeleton_sample_step_px),
+            "dense_stroke_enable": bool(args.dense_stroke_enable),
+            "dense_stroke_threshold_percentile": float(args.dense_stroke_threshold_percentile),
+            "dense_stroke_min_strength": float(args.dense_stroke_min_strength),
+            "dense_stroke_grid_px": int(args.dense_stroke_grid_px),
+            "dense_stroke_max_per_view": int(args.dense_stroke_max_per_view),
+            "dense_stroke_length_px": float(args.dense_stroke_length_px),
+            "dense_stroke_short_px": float(args.dense_stroke_short_px),
             "track_build_mode": str(args.track_build_mode),
             "min_track_segments": int(args.min_track_segments),
             "min_track_views": int(args.min_track_views),

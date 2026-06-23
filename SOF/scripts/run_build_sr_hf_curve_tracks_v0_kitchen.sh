@@ -49,7 +49,14 @@ SKELETON_MIN_PATH_PIXELS="${SKELETON_MIN_PATH_PIXELS:-8}"
 SKELETON_SAMPLE_STEP_PX="${SKELETON_SAMPLE_STEP_PX:-3.0}"
 SKELETON_SMOOTH_WINDOW="${SKELETON_SMOOTH_WINDOW:-3}"
 SKELETON_MAX_THINNING_ITERS="${SKELETON_MAX_THINNING_ITERS:-80}"
-MAX_PRIMITIVES_PER_VIEW="${MAX_PRIMITIVES_PER_VIEW:-8192}"
+DENSE_STROKE_ENABLE="${DENSE_STROKE_ENABLE:-1}"
+DENSE_STROKE_THRESHOLD_PERCENTILE="${DENSE_STROKE_THRESHOLD_PERCENTILE:-78.0}"
+DENSE_STROKE_MIN_STRENGTH="${DENSE_STROKE_MIN_STRENGTH:-0.012}"
+DENSE_STROKE_GRID_PX="${DENSE_STROKE_GRID_PX:-2}"
+DENSE_STROKE_MAX_PER_VIEW="${DENSE_STROKE_MAX_PER_VIEW:-32768}"
+DENSE_STROKE_LENGTH_PX="${DENSE_STROKE_LENGTH_PX:-4.0}"
+DENSE_STROKE_SHORT_PX="${DENSE_STROKE_SHORT_PX:-0.55}"
+MAX_PRIMITIVES_PER_VIEW="${MAX_PRIMITIVES_PER_VIEW:-32768}"
 MIN_SCORE="${MIN_SCORE:-0.05}"
 MIN_WEIGHT="${MIN_WEIGHT:-0.01}"
 BASE_OPACITY_MIN="${BASE_OPACITY_MIN:-0.02}"
@@ -74,7 +81,7 @@ MIN_TRACK_SEGMENTS="${MIN_TRACK_SEGMENTS:-2}"
 MIN_TRACK_VIEWS="${MIN_TRACK_VIEWS:-1}"
 STRONG_TRACK_MIN_VIEWS="${STRONG_TRACK_MIN_VIEWS:-2}"
 DEBUG_LIMIT="${DEBUG_LIMIT:-8}"
-MAX_DRAW_SEGMENTS="${MAX_DRAW_SEGMENTS:-8192}"
+MAX_DRAW_SEGMENTS="${MAX_DRAW_SEGMENTS:-32768}"
 
 REQUIRED_PATHS=("${BASE_MODEL_DIR}" "${BASE_MODEL_DIR}/point_cloud/iteration_${BASE_ITERATION}/point_cloud.ply" "${PRIMITIVE_DIR}")
 if [[ "${CURVE_SOURCE}" == "skeleton" ]]; then
@@ -108,6 +115,12 @@ ARGS=(
   --skeleton_sample_step_px "${SKELETON_SAMPLE_STEP_PX}"
   --skeleton_smooth_window "${SKELETON_SMOOTH_WINDOW}"
   --skeleton_max_thinning_iters "${SKELETON_MAX_THINNING_ITERS}"
+  --dense_stroke_threshold_percentile "${DENSE_STROKE_THRESHOLD_PERCENTILE}"
+  --dense_stroke_min_strength "${DENSE_STROKE_MIN_STRENGTH}"
+  --dense_stroke_grid_px "${DENSE_STROKE_GRID_PX}"
+  --dense_stroke_max_per_view "${DENSE_STROKE_MAX_PER_VIEW}"
+  --dense_stroke_length_px "${DENSE_STROKE_LENGTH_PX}"
+  --dense_stroke_short_px "${DENSE_STROKE_SHORT_PX}"
   --keep_kinds "${KEEP_KINDS}"
   --max_primitives_per_view "${MAX_PRIMITIVES_PER_VIEW}"
   --min_score "${MIN_SCORE}"
@@ -146,6 +159,9 @@ fi
 if [[ "${REQUIRE_ENDPOINT_MATCH}" == "1" ]]; then
   ARGS+=(--require_endpoint_match)
 fi
+if [[ "${DENSE_STROKE_ENABLE}" == "1" ]]; then
+  ARGS+=(--dense_stroke_enable)
+fi
 if [[ "${MERGE_SAME_VIEW}" == "1" ]]; then
   ARGS+=(--merge_same_view)
 fi
@@ -158,6 +174,7 @@ echo "[sr-hf-curve-tracks-v0] curve img : ${CURVE_IMAGE_DIR} mode=${CURVE_IMAGE_
 echo "[sr-hf-curve-tracks-v0] output    : ${OUTPUT_ROOT}"
 echo "[sr-hf-curve-tracks-v0] limit     : ${LIMIT}"
 echo "[sr-hf-curve-tracks-v0] source    : ${CURVE_SOURCE} track_mode=${TRACK_BUILD_MODE}"
+echo "[sr-hf-curve-tracks-v0] dense     : enable=${DENSE_STROKE_ENABLE} grid=${DENSE_STROKE_GRID_PX}px max=${DENSE_STROKE_MAX_PER_VIEW}"
 echo "[sr-hf-curve-tracks-v0] merge     : radius=${MERGE_RADIUS_PX}px/${MERGE_RADIUS_ABS} angle=${MERGE_ANGLE_DEG} same_view=${MERGE_SAME_VIEW}"
 
 "${PYTHON_BIN}" "${SOF_ROOT}/scripts/build_sr_hf_curve_tracks_v0.py" "${ARGS[@]}"
