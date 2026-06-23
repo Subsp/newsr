@@ -110,6 +110,7 @@ CANDIDATE_MIN_SURVIVE_VIEWS="${CANDIDATE_MIN_SURVIVE_VIEWS:-2}"
 CANDIDATE_PROBATION_MIN_SOURCE_STRENGTH="${CANDIDATE_PROBATION_MIN_SOURCE_STRENGTH:-0.04}"
 CANDIDATE_PROBATION_MAX_LINE_RESIDUAL_PX="${CANDIDATE_PROBATION_MAX_LINE_RESIDUAL_PX:-8.0}"
 CANDIDATE_KEEP_PROBATION="${CANDIDATE_KEEP_PROBATION:-1}"
+CANDIDATE_POSTERIOR_FUSE="${CANDIDATE_POSTERIOR_FUSE:-0}"
 TRACK_BUILD_MODE="${TRACK_BUILD_MODE:-candidate_graph}"
 MIN_TRACK_SEGMENTS="${MIN_TRACK_SEGMENTS:-1}"
 MIN_TRACK_VIEWS="${MIN_TRACK_VIEWS:-1}"
@@ -228,6 +229,9 @@ fi
 if [[ "${CANDIDATE_KEEP_PROBATION}" == "1" ]]; then
   ARGS+=(--candidate_keep_probation)
 fi
+if [[ "${CANDIDATE_POSTERIOR_FUSE}" == "1" ]]; then
+  ARGS+=(--candidate_posterior_fuse)
+fi
 
 echo "[sr-hf-curve-tracks-v0] base      : ${BASE_MODEL_DIR}"
 echo "[sr-hf-curve-tracks-v0] primitives: ${PRIMITIVE_DIR}"
@@ -241,7 +245,7 @@ echo "[sr-hf-curve-tracks-v0] dense     : enable=${DENSE_STROKE_ENABLE} grid=${D
 echo "[sr-hf-curve-tracks-v0] width     : enable=${PROFILE_WIDTH_ENABLE} radius=${PROFILE_WIDTH_RADIUS_PX}px falloff=${PROFILE_WIDTH_FALLOFF}"
 echo "[sr-hf-curve-tracks-v0] merge     : radius=${MERGE_RADIUS_PX}px/${MERGE_RADIUS_ABS} angle=${MERGE_ANGLE_DEG} same_view=${MERGE_SAME_VIEW}"
 echo "[sr-hf-curve-tracks-v0] layer     : radius=${LAYER_BIN_RADIUS_PX}px/${LAYER_BIN_RADIUS_ABS} dir_bins=${LAYER_DIR_BINS} include_kind=${LAYER_INCLUDE_KIND}"
-echo "[sr-hf-curve-tracks-v0] candidate : radius=${CANDIDATE_RADIUS_PX}px/${CANDIDATE_RADIUS_ABS} reproj=${CANDIDATE_REPROJ_RADIUS_PX}px survive_views=${CANDIDATE_MIN_SURVIVE_VIEWS} keep_probation=${CANDIDATE_KEEP_PROBATION}"
+echo "[sr-hf-curve-tracks-v0] candidate : radius=${CANDIDATE_RADIUS_PX}px/${CANDIDATE_RADIUS_ABS} reproj=${CANDIDATE_REPROJ_RADIUS_PX}px survive_views=${CANDIDATE_MIN_SURVIVE_VIEWS} keep_probation=${CANDIDATE_KEEP_PROBATION} posterior_fuse=${CANDIDATE_POSTERIOR_FUSE}"
 
 "${PYTHON_BIN}" "${SOF_ROOT}/scripts/build_sr_hf_curve_tracks_v0.py" "${ARGS[@]}"
 

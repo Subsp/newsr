@@ -365,6 +365,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate_probation_min_source_strength", type=float, default=0.04)
     parser.add_argument("--candidate_probation_max_line_residual_px", type=float, default=8.0)
     parser.add_argument("--candidate_keep_probation", action="store_true")
+    parser.add_argument(
+        "--candidate_posterior_fuse",
+        action="store_true",
+        help=(
+            "When using candidate_graph, refit each source segment into a posterior 3D track "
+            "from its reprojection-validated cross-view support set instead of only updating scores."
+        ),
+    )
     parser.add_argument("--track_build_mode", default="source_segments", choices=["source_segments", "merge", "layer_bins", "candidate_graph"])
     parser.add_argument("--min_track_segments", type=int, default=2)
     parser.add_argument("--min_track_views", type=int, default=1)
@@ -1358,6 +1366,7 @@ def _candidate_graph_tracks(
     source_strength = (segments["score"] * np.clip(segments["weight"], 0.0, 1.0)).astype(np.float32)
     support_count = np.ones((n,), dtype=np.int32)
     support_views: List[set[int]] = [set([int(v)]) for v in segments["source_view"].tolist()]
+    support_ids: List[List[int]] = [[int(i)] for i in range(n)]
     support_score_sum = source_strength.astype(np.float64).copy()
     reproj_error_sum = np.zeros((n,), dtype=np.float64)
     reproj_dir_sum = np.zeros((n,), dtype=np.float64)
@@ -1392,6 +1401,7 @@ def _candidate_graph_tracks(
                         score_j = float(source_strength[j])
                         support_count[i] += 1
                         support_views[i].add(int(segments["source_view"][j]))
+                        support_ids[i].append(int(j))
                         support_score_sum[i] += score_j
                         reproj_error_sum[i] += reproj_error
                         reproj_dir_sum[i] += dir_score_2d
@@ -1400,6 +1410,9 @@ def _candidate_graph_tracks(
                         residual_sum[i] += _line_distance(segments["center"][j], segments["center"][i], segments["direction"][i])
                         weighted_color[i] += segments["color"][j].astype(np.float64) * score_j
                         weight_sum[i] += score_j
+
+    if bool(args.candidate_posterior_fuse):
+        tracks = _aggregate_tracks({i: ids for i, ids in enumerate(support_ids)}, segments, args)
 
     tracks["segment_count"] = support_count.astype(np.int32)
     tracks["view_count"] = np.asarray([len(v) for v in support_views], dtype=np.int32)
@@ -1843,6 +1856,7 @@ def main() -> None:
             "candidate_probation_min_source_strength": float(args.candidate_probation_min_source_strength),
             "candidate_probation_max_line_residual_px": float(args.candidate_probation_max_line_residual_px),
             "candidate_keep_probation": bool(args.candidate_keep_probation),
+            "candidate_posterior_fuse": bool(args.candidate_posterior_fuse),
             "curve_source": str(args.curve_source),
             "curve_image_mode": str(args.curve_image_mode),
             "curve_highpass_blur_radius": float(args.curve_highpass_blur_radius),

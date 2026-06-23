@@ -74,6 +74,13 @@ OPACITY_MIN="${OPACITY_MIN:-0.008}"
 OPACITY_MAX="${OPACITY_MAX:-0.12}"
 COLOR_GAIN="${COLOR_GAIN:-1.0}"
 JITTER_PERP="${JITTER_PERP:-0.0}"
+POSTERIOR_QUALITY_ENABLE="${POSTERIOR_QUALITY_ENABLE:-0}"
+POSTERIOR_TARGET_VIEWS="${POSTERIOR_TARGET_VIEWS:-3.0}"
+POSTERIOR_ERROR_PX="${POSTERIOR_ERROR_PX:-5.0}"
+POSTERIOR_LINE_RESIDUAL_PX="${POSTERIOR_LINE_RESIDUAL_PX:-8.0}"
+POSTERIOR_MIN_SCALE_MULT="${POSTERIOR_MIN_SCALE_MULT:-0.25}"
+POSTERIOR_MIN_OPACITY_MULT="${POSTERIOR_MIN_OPACITY_MULT:-0.30}"
+POSTERIOR_LONG_STEP_FACTOR="${POSTERIOR_LONG_STEP_FACTOR:-0.45}"
 SEED="${SEED:-12345}"
 WRITE_CPU_MERGED_PREVIEW="${WRITE_CPU_MERGED_PREVIEW:-0}"
 
@@ -97,6 +104,7 @@ echo "[spray-curve-tracks-v0] selection : ${SELECTION}"
 echo "[spray-curve-tracks-v0] sampling  : spacing=${SAMPLE_SPACING_PX}px max_samples=${MAX_SAMPLES_PER_TRACK}"
 echo "[spray-curve-tracks-v0] width     : short_px=${SCALE_SHORT_PX} width_factor=${SCALE_SHORT_WIDTH_FACTOR}"
 echo "[spray-curve-tracks-v0] opacity   : floor=${OPACITY_FLOOR} scale=${OPACITY_SCALE} max=${OPACITY_MAX}"
+echo "[spray-curve-tracks-v0] posterior : enable=${POSTERIOR_QUALITY_ENABLE} target_views=${POSTERIOR_TARGET_VIEWS} err=${POSTERIOR_ERROR_PX}px line=${POSTERIOR_LINE_RESIDUAL_PX}px"
 
 SPRAY_ARGS=(
   --base_model_dir "${BASE_MODEL_DIR}"
@@ -124,6 +132,12 @@ SPRAY_ARGS=(
   --opacity_max "${OPACITY_MAX}"
   --color_gain "${COLOR_GAIN}"
   --jitter_perp "${JITTER_PERP}"
+  --posterior_target_views "${POSTERIOR_TARGET_VIEWS}"
+  --posterior_error_px "${POSTERIOR_ERROR_PX}"
+  --posterior_line_residual_px "${POSTERIOR_LINE_RESIDUAL_PX}"
+  --posterior_min_scale_mult "${POSTERIOR_MIN_SCALE_MULT}"
+  --posterior_min_opacity_mult "${POSTERIOR_MIN_OPACITY_MULT}"
+  --posterior_long_step_factor "${POSTERIOR_LONG_STEP_FACTOR}"
   --seed "${SEED}"
 )
 if [[ "${OVERWRITE}" == "1" ]]; then
@@ -134,6 +148,9 @@ if [[ "${FALLBACK_TO_KEEP}" == "1" ]]; then
 fi
 if [[ "${WRITE_CPU_MERGED_PREVIEW}" == "1" ]]; then
   SPRAY_ARGS+=(--write_cpu_merged_preview)
+fi
+if [[ "${POSTERIOR_QUALITY_ENABLE}" == "1" ]]; then
+  SPRAY_ARGS+=(--posterior_quality_enable)
 fi
 
 "${PYTHON_BIN}" "${SOF_ROOT}/scripts/spray_sr_hf_curve_tracks_to_gaussian_layer_v0.py" "${SPRAY_ARGS[@]}"

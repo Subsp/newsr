@@ -51,6 +51,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--opacity_max", type=float, default=0.12)
     parser.add_argument("--color_gain", type=float, default=1.0)
     parser.add_argument("--jitter_perp", type=float, default=0.0)
+    parser.add_argument(
+        "--posterior_quality_enable",
+        action="store_true",
+        help="Use track posterior/support statistics to shrink and fade uncertain newborn carriers.",
+    )
+    parser.add_argument("--posterior_target_views", type=float, default=3.0)
+    parser.add_argument("--posterior_error_px", type=float, default=5.0)
+    parser.add_argument("--posterior_line_residual_px", type=float, default=8.0)
+    parser.add_argument("--posterior_min_scale_mult", type=float, default=0.25)
+    parser.add_argument("--posterior_min_opacity_mult", type=float, default=0.30)
+    parser.add_argument("--posterior_long_step_factor", type=float, default=0.45)
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--write_cpu_merged_preview", action="store_true")
     return parser.parse_args()
@@ -139,6 +150,21 @@ def _select_tracks(data: Dict[str, np.ndarray], args: argparse.Namespace) -> np.
     return ids.astype(np.int64)
 
 
+def _posterior_quality(data: Dict[str, np.ndarray], args: argparse.Namespace, num_tracks: int) -> np.ndarray:
+    if not bool(args.posterior_quality_enable):
+        return np.ones((num_tracks,), dtype=np.float32)
+    view_count = np.asarray(data.get("view_count", np.ones((num_tracks,), dtype=np.int32)), dtype=np.float32).reshape(-1)
+    dir_consistency = np.asarray(data.get("dir_consistency", np.ones((num_tracks,), dtype=np.float32)), dtype=np.float32).reshape(-1)
+    reproj_error = np.asarray(data.get("reproject_error_px", np.zeros((num_tracks,), dtype=np.float32)), dtype=np.float32).reshape(-1)
+    line_residual = np.asarray(data.get("line_residual_px", np.zeros((num_tracks,), dtype=np.float32)), dtype=np.float32).reshape(-1)
+    support = np.clip(view_count / max(float(args.posterior_target_views), 1.0), 0.0, 1.0)
+    reproj = np.exp(-np.maximum(reproj_error, 0.0) / max(float(args.posterior_error_px), 1e-6))
+    line = np.exp(-np.maximum(line_residual, 0.0) / max(float(args.posterior_line_residual_px), 1e-6))
+    direction = np.clip(dir_consistency, 0.0, 1.0)
+    quality = (0.25 + 0.75 * support) * reproj * line * (0.35 + 0.65 * direction)
+    return np.clip(quality, 0.03, 1.0).astype(np.float32)
+
+
 def _sample_tracks(data: Dict[str, np.ndarray], track_ids: np.ndarray, args: argparse.Namespace) -> Dict[str, np.ndarray]:
     rng = np.random.default_rng(int(args.seed))
     num_tracks = int(data["p0"].shape[0])
@@ -158,6 +184,7 @@ def _sample_tracks(data: Dict[str, np.ndarray], track_ids: np.ndarray, args: arg
         data.get("view_count", np.ones((num_tracks,), dtype=np.int32)),
         dtype=np.int32,
     ).reshape(-1)
+    posterior_quality = _posterior_quality(data, args, num_tracks)
     chunks: Dict[str, list[np.ndarray]] = {
         "xyz": [],
         "color": [],
@@ -169,6 +196,8 @@ def _sample_tracks(data: Dict[str, np.ndarray], track_ids: np.ndarray, args: arg
         "track_score": [],
         "track_view_count": [],
         "track_width_px": [],
+        "posterior_quality": [],
+        "posterior_scale_mult": [],
     }
     total = 0
     for tid in track_ids.tolist():
@@ -189,6 +218,14 @@ def _sample_tracks(data: Dict[str, np.ndarray], track_ids: np.ndarray, args: arg
             samples = min(samples, remaining)
         if samples <= 0:
             continue
+        quality = float(posterior_quality[tid])
+        scale_mult = 1.0
+        opacity_mult = 1.0
+        if bool(args.posterior_quality_enable):
+            scale_min = float(args.posterior_min_scale_mult)
+            scale_mult = float(np.clip(scale_min + (1.0 - scale_min) * quality, scale_min, 1.0))
+            opacity_min = float(args.posterior_min_opacity_mult)
+            opacity_mult = float(np.clip(opacity_min + (1.0 - opacity_min) * quality, opacity_min, 1.0))
         if samples == 1:
             t = np.asarray([0.5], dtype=np.float32)
         else:
@@ -201,13 +238,18 @@ def _sample_tracks(data: Dict[str, np.ndarray], track_ids: np.ndarray, args: arg
             jitter = rng.normal(size=(samples, 1)).astype(np.float32) * float(args.jitter_perp) * pix_world
             xyz = xyz + short_axis * jitter
         rot = _matrix_to_quaternion_wxyz(np.stack([direction_batch, short_axis, normal_axis], axis=2))
-        scale_long = np.full((samples,), spacing * float(args.scale_long_factor), dtype=np.float32)
-        scale_short = np.full((samples,), width_px * float(args.scale_short_width_factor) * pix_world, dtype=np.float32)
-        scale_normal = np.full((samples,), float(args.scale_normal_px) * pix_world, dtype=np.float32)
+        scale_long_value = spacing * float(args.scale_long_factor)
+        if bool(args.posterior_quality_enable):
+            local_step = length / max(float(samples), 1.0)
+            scale_long_value = min(scale_long_value, local_step * float(args.posterior_long_step_factor))
+        scale_long = np.full((samples,), scale_long_value * scale_mult, dtype=np.float32)
+        scale_short = np.full((samples,), width_px * float(args.scale_short_width_factor) * pix_world * scale_mult, dtype=np.float32)
+        scale_normal = np.full((samples,), float(args.scale_normal_px) * pix_world * scale_mult, dtype=np.float32)
         scale = np.stack([scale_long, scale_short, scale_normal], axis=1)
         scale = np.clip(scale, float(args.scale_min), float(args.scale_max)).astype(np.float32)
         score = float(score_arr[tid])
         opacity = float(args.opacity_floor) + float(args.opacity_scale) * (max(score, 0.0) ** float(args.opacity_power))
+        opacity *= opacity_mult
         opacity = float(np.clip(opacity, float(args.opacity_min), float(args.opacity_max)))
         color = np.clip(data["color"][tid].astype(np.float32) * float(args.color_gain), 0.0, 1.0)
         chunks["xyz"].append(xyz.astype(np.float32))
@@ -220,6 +262,8 @@ def _sample_tracks(data: Dict[str, np.ndarray], track_ids: np.ndarray, args: arg
         chunks["track_score"].append(np.full((samples,), score, dtype=np.float32))
         chunks["track_view_count"].append(np.full((samples,), int(view_count_arr[tid]), dtype=np.int32))
         chunks["track_width_px"].append(np.full((samples,), width_px, dtype=np.float32))
+        chunks["posterior_quality"].append(np.full((samples,), quality, dtype=np.float32))
+        chunks["posterior_scale_mult"].append(np.full((samples,), scale_mult, dtype=np.float32))
         total += samples
     if total <= 0:
         raise RuntimeError("Selected tracks produced zero newborn Gaussians.")
@@ -316,6 +360,13 @@ def main() -> None:
             "opacity_min": float(args.opacity_min),
             "opacity_max": float(args.opacity_max),
             "color_gain": float(args.color_gain),
+            "posterior_quality_enable": bool(args.posterior_quality_enable),
+            "posterior_target_views": float(args.posterior_target_views),
+            "posterior_error_px": float(args.posterior_error_px),
+            "posterior_line_residual_px": float(args.posterior_line_residual_px),
+            "posterior_min_scale_mult": float(args.posterior_min_scale_mult),
+            "posterior_min_opacity_mult": float(args.posterior_min_opacity_mult),
+            "posterior_long_step_factor": float(args.posterior_long_step_factor),
         },
         "newborn_stats": {
             "opacity_mean": float(newborn["opacity"].mean()),
@@ -325,6 +376,9 @@ def main() -> None:
             "track_score_mean": float(newborn["track_score"].mean()),
             "track_view_count_mean": float(newborn["track_view_count"].mean()),
             "track_width_px_mean": float(newborn["track_width_px"].mean()),
+            "posterior_quality_mean": float(newborn["posterior_quality"].mean()),
+            "posterior_quality_p10": float(np.percentile(newborn["posterior_quality"], 10)),
+            "posterior_scale_mult_mean": float(newborn["posterior_scale_mult"].mean()),
         },
     }
     summary_path = output_model_dir / "spray_sr_hf_curve_tracks_to_gaussian_layer_v0_summary.json"
