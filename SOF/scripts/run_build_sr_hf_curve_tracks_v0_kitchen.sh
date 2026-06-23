@@ -56,6 +56,11 @@ DENSE_STROKE_GRID_PX="${DENSE_STROKE_GRID_PX:-2}"
 DENSE_STROKE_MAX_PER_VIEW="${DENSE_STROKE_MAX_PER_VIEW:-32768}"
 DENSE_STROKE_LENGTH_PX="${DENSE_STROKE_LENGTH_PX:-4.0}"
 DENSE_STROKE_SHORT_PX="${DENSE_STROKE_SHORT_PX:-0.55}"
+PROFILE_WIDTH_ENABLE="${PROFILE_WIDTH_ENABLE:-1}"
+PROFILE_WIDTH_RADIUS_PX="${PROFILE_WIDTH_RADIUS_PX:-6}"
+PROFILE_WIDTH_FALLOFF="${PROFILE_WIDTH_FALLOFF:-0.35}"
+PROFILE_WIDTH_MIN_PX="${PROFILE_WIDTH_MIN_PX:-0.4}"
+PROFILE_WIDTH_MAX_PX="${PROFILE_WIDTH_MAX_PX:-5.0}"
 MAX_PRIMITIVES_PER_VIEW="${MAX_PRIMITIVES_PER_VIEW:-32768}"
 MIN_SCORE="${MIN_SCORE:-0.05}"
 MIN_WEIGHT="${MIN_WEIGHT:-0.01}"
@@ -121,6 +126,10 @@ ARGS=(
   --dense_stroke_max_per_view "${DENSE_STROKE_MAX_PER_VIEW}"
   --dense_stroke_length_px "${DENSE_STROKE_LENGTH_PX}"
   --dense_stroke_short_px "${DENSE_STROKE_SHORT_PX}"
+  --profile_width_radius_px "${PROFILE_WIDTH_RADIUS_PX}"
+  --profile_width_falloff "${PROFILE_WIDTH_FALLOFF}"
+  --profile_width_min_px "${PROFILE_WIDTH_MIN_PX}"
+  --profile_width_max_px "${PROFILE_WIDTH_MAX_PX}"
   --keep_kinds "${KEEP_KINDS}"
   --max_primitives_per_view "${MAX_PRIMITIVES_PER_VIEW}"
   --min_score "${MIN_SCORE}"
@@ -162,6 +171,9 @@ fi
 if [[ "${DENSE_STROKE_ENABLE}" == "1" ]]; then
   ARGS+=(--dense_stroke_enable)
 fi
+if [[ "${PROFILE_WIDTH_ENABLE}" == "1" ]]; then
+  ARGS+=(--profile_width_enable)
+fi
 if [[ "${MERGE_SAME_VIEW}" == "1" ]]; then
   ARGS+=(--merge_same_view)
 fi
@@ -175,6 +187,7 @@ echo "[sr-hf-curve-tracks-v0] output    : ${OUTPUT_ROOT}"
 echo "[sr-hf-curve-tracks-v0] limit     : ${LIMIT}"
 echo "[sr-hf-curve-tracks-v0] source    : ${CURVE_SOURCE} track_mode=${TRACK_BUILD_MODE}"
 echo "[sr-hf-curve-tracks-v0] dense     : enable=${DENSE_STROKE_ENABLE} grid=${DENSE_STROKE_GRID_PX}px max=${DENSE_STROKE_MAX_PER_VIEW}"
+echo "[sr-hf-curve-tracks-v0] width     : enable=${PROFILE_WIDTH_ENABLE} radius=${PROFILE_WIDTH_RADIUS_PX}px falloff=${PROFILE_WIDTH_FALLOFF}"
 echo "[sr-hf-curve-tracks-v0] merge     : radius=${MERGE_RADIUS_PX}px/${MERGE_RADIUS_ABS} angle=${MERGE_ANGLE_DEG} same_view=${MERGE_SAME_VIEW}"
 
 "${PYTHON_BIN}" "${SOF_ROOT}/scripts/build_sr_hf_curve_tracks_v0.py" "${ARGS[@]}"

@@ -325,6 +325,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dense_stroke_max_per_view", type=int, default=32768)
     parser.add_argument("--dense_stroke_length_px", type=float, default=4.0)
     parser.add_argument("--dense_stroke_short_px", type=float, default=0.55)
+    parser.add_argument("--profile_width_enable", action="store_true")
+    parser.add_argument("--profile_width_radius_px", type=int, default=6)
+    parser.add_argument("--profile_width_falloff", type=float, default=0.35)
+    parser.add_argument("--profile_width_min_px", type=float, default=0.4)
+    parser.add_argument("--profile_width_max_px", type=float, default=5.0)
     parser.add_argument("--keep_kinds", default="1,2", help="Comma-separated primitive kind ids. Defaults to geometry+texture.")
     parser.add_argument("--max_primitives_per_view", type=int, default=32768)
     parser.add_argument("--min_score", type=float, default=0.05)
@@ -642,15 +647,49 @@ def _primitive_from_skeleton(
             "kind": np.zeros((0,), dtype=np.int32),
         }
     xy = np.concatenate(xy_items, axis=0)
+    theta = np.concatenate(theta_items, axis=0).astype(np.float32)
+    sigma_short = _estimate_profile_half_width_px(strength_img, xy, theta, args)
     return {
         "xy": xy,
-        "theta": np.concatenate(theta_items, axis=0).astype(np.float32),
+        "theta": theta,
         "sigma_long": np.concatenate(sigma_long_items, axis=0).astype(np.float32),
-        "sigma_short": np.concatenate(sigma_short_items, axis=0).astype(np.float32),
+        "sigma_short": sigma_short,
         "color": np.clip(np.concatenate(color_items, axis=0), 0.0, 1.0).astype(np.float32),
         "score": np.concatenate(score_items, axis=0).astype(np.float32),
         "kind": np.full((xy.shape[0],), KIND_GEOMETRY, dtype=np.int32),
     }
+
+
+def _estimate_profile_half_width_px(strength_img: np.ndarray, xy: np.ndarray, theta: np.ndarray, args: argparse.Namespace) -> np.ndarray:
+    fallback = np.full((xy.shape[0],), max(float(args.dense_stroke_short_px), 1e-6), dtype=np.float32)
+    if not bool(args.profile_width_enable) or xy.shape[0] == 0:
+        return fallback
+    radius = max(int(args.profile_width_radius_px), 1)
+    falloff = float(np.clip(float(args.profile_width_falloff), 1e-3, 0.99))
+    min_px = max(float(args.profile_width_min_px), 1e-6)
+    max_px = max(float(args.profile_width_max_px), min_px)
+    size = (int(strength_img.shape[1]), int(strength_img.shape[0]))
+    peak = _bilinear_scalar(strength_img, xy.astype(np.float32), size)
+    normal = np.stack([-np.sin(theta), np.cos(theta)], axis=1).astype(np.float32)
+    half_width = fallback.copy()
+    for i in range(xy.shape[0]):
+        if not np.isfinite(peak[i]) or peak[i] <= 1e-6:
+            continue
+        threshold = float(peak[i]) * falloff
+        side_widths = []
+        for sign in (-1.0, 1.0):
+            last = 0.0
+            for d in range(1, radius + 1):
+                sample_xy = (xy[i : i + 1] + sign * float(d) * normal[i : i + 1]).astype(np.float32)
+                value = float(_bilinear_scalar(strength_img, sample_xy, size)[0])
+                if value >= threshold:
+                    last = float(d)
+                elif last > 0.0:
+                    break
+            side_widths.append(last)
+        width = max(float(np.mean(side_widths)), min_px)
+        half_width[i] = float(np.clip(width, min_px, max_px))
+    return half_width.astype(np.float32)
 
 
 def _empty_primitive() -> Dict[str, np.ndarray]:
@@ -725,7 +764,7 @@ def _primitive_from_dense_strokes(
         dense_len / max(2.0 * float(args.segment_length_scale), 1e-6),
         dtype=np.float32,
     )
-    sigma_short = np.full((xy.shape[0],), max(float(args.dense_stroke_short_px), 1e-6), dtype=np.float32)
+    sigma_short = _estimate_profile_half_width_px(strength_img, xy, theta, args)
     return {
         "xy": xy,
         "theta": theta,
@@ -1020,6 +1059,7 @@ def _lift_view_segments(
         "source_xy": primitive["xy"][final_ids].astype(np.float32),
         "source_p0": p0[valid_len].astype(np.float32),
         "source_p1": p1[valid_len].astype(np.float32),
+        "source_width_px": primitive["sigma_short"][final_ids].astype(np.float32),
         "score": primitive["score"][final_ids].astype(np.float32),
         "weight": weight[final_ids].astype(np.float32),
         "kind": primitive["kind"][final_ids].astype(np.int32),
@@ -1044,6 +1084,7 @@ def _lift_view_segments(
         "score_mean": float(lifted["score"].mean()),
         "pixel_world_mean": float(lifted["pixel_world"].mean()),
         "length_mean": float(lifted["length"].mean()),
+        "width_px_mean": float(lifted["source_width_px"].mean()),
         "matched_pixel_distance_mean": float(lifted["matched_pixel_distance"].mean()),
     }
     return lifted, info
@@ -1132,6 +1173,7 @@ def _concat_segments(chunks: Sequence[Dict[str, np.ndarray]]) -> Dict[str, np.nd
         "source_xy",
         "source_p0",
         "source_p1",
+        "source_width_px",
         "score",
         "weight",
         "kind",
@@ -1204,6 +1246,8 @@ def _tracks_from_source_segments(segments: Dict[str, np.ndarray], args: argparse
     tracks["score_max"] = segments["score"].astype(np.float32)
     tracks["weight_mean"] = segments["weight"].astype(np.float32)
     tracks["length"] = segments["length"].astype(np.float32)
+    tracks["width_px_mean"] = segments["source_width_px"].astype(np.float32)
+    tracks["width_px_max"] = segments["source_width_px"].astype(np.float32)
     tracks["pixel_world_mean"] = segments["pixel_world"].astype(np.float32)
     tracks["segment_count"] = np.ones((n,), dtype=np.int32)
     tracks["view_count"] = np.ones((n,), dtype=np.int32)
@@ -1233,6 +1277,8 @@ def _empty_tracks() -> Dict[str, np.ndarray]:
         "score_max": np.zeros((0,), dtype=np.float32),
         "weight_mean": np.zeros((0,), dtype=np.float32),
         "length": np.zeros((0,), dtype=np.float32),
+        "width_px_mean": np.zeros((0,), dtype=np.float32),
+        "width_px_max": np.zeros((0,), dtype=np.float32),
         "pixel_world_mean": np.zeros((0,), dtype=np.float32),
         "segment_count": np.zeros((0,), dtype=np.int32),
         "view_count": np.zeros((0,), dtype=np.int32),
@@ -1280,6 +1326,8 @@ def _aggregate_tracks(groups: Dict[int, List[int]], segments: Dict[str, np.ndarr
         out["score_max"].append(float(np.max(segments["score"][idx])))
         out["weight_mean"].append(float(np.mean(segments["weight"][idx])))
         out["length"].append(float(np.linalg.norm(p1 - p0)))
+        out["width_px_mean"].append(float(np.average(segments["source_width_px"][idx], weights=weights)))
+        out["width_px_max"].append(float(np.max(segments["source_width_px"][idx])))
         out["pixel_world_mean"].append(float(np.mean(segments["pixel_world"][idx])))
         out["segment_count"].append(int(idx.size))
         out["view_count"].append(int(views.size))
@@ -1525,6 +1573,11 @@ def main() -> None:
             "dense_stroke_max_per_view": int(args.dense_stroke_max_per_view),
             "dense_stroke_length_px": float(args.dense_stroke_length_px),
             "dense_stroke_short_px": float(args.dense_stroke_short_px),
+            "profile_width_enable": bool(args.profile_width_enable),
+            "profile_width_radius_px": int(args.profile_width_radius_px),
+            "profile_width_falloff": float(args.profile_width_falloff),
+            "profile_width_min_px": float(args.profile_width_min_px),
+            "profile_width_max_px": float(args.profile_width_max_px),
             "track_build_mode": str(args.track_build_mode),
             "min_track_segments": int(args.min_track_segments),
             "min_track_views": int(args.min_track_views),
@@ -1541,9 +1594,11 @@ def main() -> None:
             "segment_score_mean": _mean(segments_all["score"]),
             "segment_weight_mean": _mean(segments_all["weight"]),
             "segment_length_mean": _mean(segments_all["length"]),
+            "segment_width_px_mean": _mean(segments_all["source_width_px"]),
             "track_view_count_mean": _mean(tracks["view_count"].astype(np.float32)),
             "track_segment_count_mean": _mean(tracks["segment_count"].astype(np.float32)),
             "track_length_mean": _mean(tracks["length"]),
+            "track_width_px_mean": _mean(tracks["width_px_mean"]),
             "keep_view_count_mean": _mean(tracks["view_count"][keep].astype(np.float32)),
             "strong_view_count_mean": _mean(tracks["view_count"][strong].astype(np.float32)),
         },

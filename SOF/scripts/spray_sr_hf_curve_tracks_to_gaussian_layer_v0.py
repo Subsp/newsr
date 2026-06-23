@@ -35,6 +35,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max_samples_per_track", type=int, default=12)
     parser.add_argument("--scale_long_factor", type=float, default=0.75)
     parser.add_argument("--scale_short_px", type=float, default=0.55)
+    parser.add_argument(
+        "--scale_short_width_factor",
+        type=float,
+        default=1.0,
+        help="Multiply track-estimated image-space half width before converting it to 3D short-axis scale.",
+    )
     parser.add_argument("--scale_normal_px", type=float, default=0.35)
     parser.add_argument("--scale_min", type=float, default=4e-4)
     parser.add_argument("--scale_max", type=float, default=1.5e-2)
@@ -144,6 +150,10 @@ def _sample_tracks(data: Dict[str, np.ndarray], track_ids: np.ndarray, args: arg
         data.get("score_max", np.ones((num_tracks,), dtype=np.float32)),
         dtype=np.float32,
     ).reshape(-1)
+    width_px_arr = np.asarray(
+        data.get("width_px_mean", np.full((num_tracks,), float(args.scale_short_px), dtype=np.float32)),
+        dtype=np.float32,
+    ).reshape(-1)
     view_count_arr = np.asarray(
         data.get("view_count", np.ones((num_tracks,), dtype=np.int32)),
         dtype=np.int32,
@@ -158,6 +168,7 @@ def _sample_tracks(data: Dict[str, np.ndarray], track_ids: np.ndarray, args: arg
         "track_t": [],
         "track_score": [],
         "track_view_count": [],
+        "track_width_px": [],
     }
     total = 0
     for tid in track_ids.tolist():
@@ -167,6 +178,7 @@ def _sample_tracks(data: Dict[str, np.ndarray], track_ids: np.ndarray, args: arg
         normal = data["normal"][tid].astype(np.float32)
         length = max(float(np.linalg.norm(p1 - p0)), 1e-8)
         pix_world = max(float(pixel_world_arr[tid]), 1e-6)
+        width_px = max(float(width_px_arr[tid]), float(args.scale_short_px))
         spacing = np.clip(float(args.sample_spacing_px) * pix_world, float(args.sample_spacing_min), float(args.sample_spacing_max))
         samples = max(1, int(math.ceil(length / max(spacing, 1e-8))))
         samples = min(samples, int(args.max_samples_per_track))
@@ -190,7 +202,7 @@ def _sample_tracks(data: Dict[str, np.ndarray], track_ids: np.ndarray, args: arg
             xyz = xyz + short_axis * jitter
         rot = _matrix_to_quaternion_wxyz(np.stack([direction_batch, short_axis, normal_axis], axis=2))
         scale_long = np.full((samples,), spacing * float(args.scale_long_factor), dtype=np.float32)
-        scale_short = np.full((samples,), float(args.scale_short_px) * pix_world, dtype=np.float32)
+        scale_short = np.full((samples,), width_px * float(args.scale_short_width_factor) * pix_world, dtype=np.float32)
         scale_normal = np.full((samples,), float(args.scale_normal_px) * pix_world, dtype=np.float32)
         scale = np.stack([scale_long, scale_short, scale_normal], axis=1)
         scale = np.clip(scale, float(args.scale_min), float(args.scale_max)).astype(np.float32)
@@ -207,6 +219,7 @@ def _sample_tracks(data: Dict[str, np.ndarray], track_ids: np.ndarray, args: arg
         chunks["track_t"].append(t.astype(np.float32))
         chunks["track_score"].append(np.full((samples,), score, dtype=np.float32))
         chunks["track_view_count"].append(np.full((samples,), int(view_count_arr[tid]), dtype=np.int32))
+        chunks["track_width_px"].append(np.full((samples,), width_px, dtype=np.float32))
         total += samples
     if total <= 0:
         raise RuntimeError("Selected tracks produced zero newborn Gaussians.")
@@ -296,6 +309,7 @@ def main() -> None:
             "max_samples_per_track": int(args.max_samples_per_track),
             "scale_long_factor": float(args.scale_long_factor),
             "scale_short_px": float(args.scale_short_px),
+            "scale_short_width_factor": float(args.scale_short_width_factor),
             "scale_normal_px": float(args.scale_normal_px),
             "opacity_floor": float(args.opacity_floor),
             "opacity_scale": float(args.opacity_scale),
@@ -310,6 +324,7 @@ def main() -> None:
             "color_mean": [float(x) for x in newborn["color"].mean(axis=0)],
             "track_score_mean": float(newborn["track_score"].mean()),
             "track_view_count_mean": float(newborn["track_view_count"].mean()),
+            "track_width_px_mean": float(newborn["track_width_px"].mean()),
         },
     }
     summary_path = output_model_dir / "spray_sr_hf_curve_tracks_to_gaussian_layer_v0_summary.json"
