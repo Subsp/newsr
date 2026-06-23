@@ -81,6 +81,15 @@ POSTERIOR_LINE_RESIDUAL_PX="${POSTERIOR_LINE_RESIDUAL_PX:-8.0}"
 POSTERIOR_MIN_SCALE_MULT="${POSTERIOR_MIN_SCALE_MULT:-0.25}"
 POSTERIOR_MIN_OPACITY_MULT="${POSTERIOR_MIN_OPACITY_MULT:-0.30}"
 POSTERIOR_LONG_STEP_FACTOR="${POSTERIOR_LONG_STEP_FACTOR:-0.45}"
+CONFORMAL_SAMPLING_ENABLE="${CONFORMAL_SAMPLING_ENABLE:-0}"
+CONFORMAL_SPACING_PX="${CONFORMAL_SPACING_PX:-1.5}"
+CONFORMAL_MAX_SAMPLES_PER_TRACK="${CONFORMAL_MAX_SAMPLES_PER_TRACK:-48}"
+CONFORMAL_LONG_STEP_FACTOR="${CONFORMAL_LONG_STEP_FACTOR:-0.35}"
+CONFORMAL_LONG_WIDTH_FACTOR="${CONFORMAL_LONG_WIDTH_FACTOR:-1.6}"
+CONFORMAL_SHORT_WIDTH_FACTOR="${CONFORMAL_SHORT_WIDTH_FACTOR:-0.55}"
+CONFORMAL_NORMAL_WIDTH_FACTOR="${CONFORMAL_NORMAL_WIDTH_FACTOR:-0.30}"
+CONFORMAL_LANES="${CONFORMAL_LANES:-1}"
+CONFORMAL_LANE_EXTENT="${CONFORMAL_LANE_EXTENT:-0.55}"
 SEED="${SEED:-12345}"
 WRITE_CPU_MERGED_PREVIEW="${WRITE_CPU_MERGED_PREVIEW:-0}"
 
@@ -105,6 +114,7 @@ echo "[spray-curve-tracks-v0] sampling  : spacing=${SAMPLE_SPACING_PX}px max_sam
 echo "[spray-curve-tracks-v0] width     : short_px=${SCALE_SHORT_PX} width_factor=${SCALE_SHORT_WIDTH_FACTOR}"
 echo "[spray-curve-tracks-v0] opacity   : floor=${OPACITY_FLOOR} scale=${OPACITY_SCALE} max=${OPACITY_MAX}"
 echo "[spray-curve-tracks-v0] posterior : enable=${POSTERIOR_QUALITY_ENABLE} target_views=${POSTERIOR_TARGET_VIEWS} err=${POSTERIOR_ERROR_PX}px line=${POSTERIOR_LINE_RESIDUAL_PX}px"
+echo "[spray-curve-tracks-v0] conformal : enable=${CONFORMAL_SAMPLING_ENABLE} spacing=${CONFORMAL_SPACING_PX}px max_samples=${CONFORMAL_MAX_SAMPLES_PER_TRACK} lanes=${CONFORMAL_LANES}"
 
 SPRAY_ARGS=(
   --base_model_dir "${BASE_MODEL_DIR}"
@@ -138,6 +148,14 @@ SPRAY_ARGS=(
   --posterior_min_scale_mult "${POSTERIOR_MIN_SCALE_MULT}"
   --posterior_min_opacity_mult "${POSTERIOR_MIN_OPACITY_MULT}"
   --posterior_long_step_factor "${POSTERIOR_LONG_STEP_FACTOR}"
+  --conformal_spacing_px "${CONFORMAL_SPACING_PX}"
+  --conformal_max_samples_per_track "${CONFORMAL_MAX_SAMPLES_PER_TRACK}"
+  --conformal_long_step_factor "${CONFORMAL_LONG_STEP_FACTOR}"
+  --conformal_long_width_factor "${CONFORMAL_LONG_WIDTH_FACTOR}"
+  --conformal_short_width_factor "${CONFORMAL_SHORT_WIDTH_FACTOR}"
+  --conformal_normal_width_factor "${CONFORMAL_NORMAL_WIDTH_FACTOR}"
+  --conformal_lanes "${CONFORMAL_LANES}"
+  --conformal_lane_extent "${CONFORMAL_LANE_EXTENT}"
   --seed "${SEED}"
 )
 if [[ "${OVERWRITE}" == "1" ]]; then
@@ -151,6 +169,9 @@ if [[ "${WRITE_CPU_MERGED_PREVIEW}" == "1" ]]; then
 fi
 if [[ "${POSTERIOR_QUALITY_ENABLE}" == "1" ]]; then
   SPRAY_ARGS+=(--posterior_quality_enable)
+fi
+if [[ "${CONFORMAL_SAMPLING_ENABLE}" == "1" ]]; then
+  SPRAY_ARGS+=(--conformal_sampling_enable)
 fi
 
 "${PYTHON_BIN}" "${SOF_ROOT}/scripts/spray_sr_hf_curve_tracks_to_gaussian_layer_v0.py" "${SPRAY_ARGS[@]}"

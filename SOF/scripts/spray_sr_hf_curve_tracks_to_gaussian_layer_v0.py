@@ -62,6 +62,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--posterior_min_scale_mult", type=float, default=0.25)
     parser.add_argument("--posterior_min_opacity_mult", type=float, default=0.30)
     parser.add_argument("--posterior_long_step_factor", type=float, default=0.45)
+    parser.add_argument(
+        "--conformal_sampling_enable",
+        action="store_true",
+        help="Sample each 3D track as dense local footprint carriers instead of sparse long ellipsoids.",
+    )
+    parser.add_argument("--conformal_spacing_px", type=float, default=1.5)
+    parser.add_argument("--conformal_max_samples_per_track", type=int, default=48)
+    parser.add_argument("--conformal_long_step_factor", type=float, default=0.35)
+    parser.add_argument("--conformal_long_width_factor", type=float, default=1.6)
+    parser.add_argument("--conformal_short_width_factor", type=float, default=0.55)
+    parser.add_argument("--conformal_normal_width_factor", type=float, default=0.30)
+    parser.add_argument("--conformal_lanes", type=int, default=1)
+    parser.add_argument("--conformal_lane_extent", type=float, default=0.55)
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--write_cpu_merged_preview", action="store_true")
     return parser.parse_args()
@@ -208,14 +221,24 @@ def _sample_tracks(data: Dict[str, np.ndarray], track_ids: np.ndarray, args: arg
         length = max(float(np.linalg.norm(p1 - p0)), 1e-8)
         pix_world = max(float(pixel_world_arr[tid]), 1e-6)
         width_px = max(float(width_px_arr[tid]), float(args.scale_short_px))
-        spacing = np.clip(float(args.sample_spacing_px) * pix_world, float(args.sample_spacing_min), float(args.sample_spacing_max))
+        if bool(args.conformal_sampling_enable):
+            spacing_px = float(args.conformal_spacing_px)
+            max_samples = int(args.conformal_max_samples_per_track)
+            lanes = max(1, int(args.conformal_lanes))
+        else:
+            spacing_px = float(args.sample_spacing_px)
+            max_samples = int(args.max_samples_per_track)
+            lanes = 1
+        spacing = np.clip(spacing_px * pix_world, float(args.sample_spacing_min), float(args.sample_spacing_max))
         samples = max(1, int(math.ceil(length / max(spacing, 1e-8))))
-        samples = min(samples, int(args.max_samples_per_track))
+        samples = min(samples, max_samples)
         remaining = int(args.max_total_newborn) - total if int(args.max_total_newborn) > 0 else None
         if remaining is not None and remaining <= 0:
             break
+        if remaining is not None and bool(args.conformal_sampling_enable):
+            lanes = max(1, min(lanes, remaining))
         if remaining is not None:
-            samples = min(samples, remaining)
+            samples = min(samples, max(1, remaining // lanes))
         if samples <= 0:
             continue
         quality = float(posterior_quality[tid])
@@ -237,14 +260,41 @@ def _sample_tracks(data: Dict[str, np.ndarray], track_ids: np.ndarray, args: arg
         if float(args.jitter_perp) > 0:
             jitter = rng.normal(size=(samples, 1)).astype(np.float32) * float(args.jitter_perp) * pix_world
             xyz = xyz + short_axis * jitter
+        if bool(args.conformal_sampling_enable) and lanes > 1:
+            lane_offsets = np.linspace(
+                -float(args.conformal_lane_extent),
+                float(args.conformal_lane_extent),
+                lanes,
+                dtype=np.float32,
+            )
+            lane_offsets = lane_offsets * width_px * pix_world
+            xyz = np.repeat(xyz, lanes, axis=0) + np.repeat(short_axis, lanes, axis=0) * np.tile(lane_offsets[:, None], (samples, 1))
+            direction_batch = np.repeat(direction_batch, lanes, axis=0)
+            short_axis = np.repeat(short_axis, lanes, axis=0)
+            normal_axis = np.repeat(normal_axis, lanes, axis=0)
+            t = np.repeat(t, lanes, axis=0)
+        out_count = int(xyz.shape[0])
         rot = _matrix_to_quaternion_wxyz(np.stack([direction_batch, short_axis, normal_axis], axis=2))
         scale_long_value = spacing * float(args.scale_long_factor)
         if bool(args.posterior_quality_enable):
             local_step = length / max(float(samples), 1.0)
             scale_long_value = min(scale_long_value, local_step * float(args.posterior_long_step_factor))
-        scale_long = np.full((samples,), scale_long_value * scale_mult, dtype=np.float32)
-        scale_short = np.full((samples,), width_px * float(args.scale_short_width_factor) * pix_world * scale_mult, dtype=np.float32)
-        scale_normal = np.full((samples,), float(args.scale_normal_px) * pix_world * scale_mult, dtype=np.float32)
+        if bool(args.conformal_sampling_enable):
+            width_world = width_px * pix_world
+            local_step = length / max(float(samples), 1.0)
+            scale_long_value = min(
+                scale_long_value,
+                local_step * float(args.conformal_long_step_factor),
+                width_world * float(args.conformal_long_width_factor),
+            )
+            scale_short_value = width_world * float(args.conformal_short_width_factor) / max(math.sqrt(float(lanes)), 1.0)
+            scale_normal_value = min(float(args.scale_normal_px) * pix_world, width_world * float(args.conformal_normal_width_factor))
+        else:
+            scale_short_value = width_px * float(args.scale_short_width_factor) * pix_world
+            scale_normal_value = float(args.scale_normal_px) * pix_world
+        scale_long = np.full((out_count,), scale_long_value * scale_mult, dtype=np.float32)
+        scale_short = np.full((out_count,), scale_short_value * scale_mult, dtype=np.float32)
+        scale_normal = np.full((out_count,), scale_normal_value * scale_mult, dtype=np.float32)
         scale = np.stack([scale_long, scale_short, scale_normal], axis=1)
         scale = np.clip(scale, float(args.scale_min), float(args.scale_max)).astype(np.float32)
         score = float(score_arr[tid])
@@ -253,18 +303,18 @@ def _sample_tracks(data: Dict[str, np.ndarray], track_ids: np.ndarray, args: arg
         opacity = float(np.clip(opacity, float(args.opacity_min), float(args.opacity_max)))
         color = np.clip(data["color"][tid].astype(np.float32) * float(args.color_gain), 0.0, 1.0)
         chunks["xyz"].append(xyz.astype(np.float32))
-        chunks["color"].append(np.tile(color[None, :], (samples, 1)).astype(np.float32))
-        chunks["opacity"].append(np.full((samples, 1), opacity, dtype=np.float32))
+        chunks["color"].append(np.tile(color[None, :], (out_count, 1)).astype(np.float32))
+        chunks["opacity"].append(np.full((out_count, 1), opacity, dtype=np.float32))
         chunks["scale"].append(scale)
         chunks["rotation"].append(rot)
-        chunks["track_index"].append(np.full((samples,), int(tid), dtype=np.int64))
+        chunks["track_index"].append(np.full((out_count,), int(tid), dtype=np.int64))
         chunks["track_t"].append(t.astype(np.float32))
-        chunks["track_score"].append(np.full((samples,), score, dtype=np.float32))
-        chunks["track_view_count"].append(np.full((samples,), int(view_count_arr[tid]), dtype=np.int32))
-        chunks["track_width_px"].append(np.full((samples,), width_px, dtype=np.float32))
-        chunks["posterior_quality"].append(np.full((samples,), quality, dtype=np.float32))
-        chunks["posterior_scale_mult"].append(np.full((samples,), scale_mult, dtype=np.float32))
-        total += samples
+        chunks["track_score"].append(np.full((out_count,), score, dtype=np.float32))
+        chunks["track_view_count"].append(np.full((out_count,), int(view_count_arr[tid]), dtype=np.int32))
+        chunks["track_width_px"].append(np.full((out_count,), width_px, dtype=np.float32))
+        chunks["posterior_quality"].append(np.full((out_count,), quality, dtype=np.float32))
+        chunks["posterior_scale_mult"].append(np.full((out_count,), scale_mult, dtype=np.float32))
+        total += out_count
     if total <= 0:
         raise RuntimeError("Selected tracks produced zero newborn Gaussians.")
     return {key: np.concatenate(value, axis=0) for key, value in chunks.items()}
@@ -367,6 +417,15 @@ def main() -> None:
             "posterior_min_scale_mult": float(args.posterior_min_scale_mult),
             "posterior_min_opacity_mult": float(args.posterior_min_opacity_mult),
             "posterior_long_step_factor": float(args.posterior_long_step_factor),
+            "conformal_sampling_enable": bool(args.conformal_sampling_enable),
+            "conformal_spacing_px": float(args.conformal_spacing_px),
+            "conformal_max_samples_per_track": int(args.conformal_max_samples_per_track),
+            "conformal_long_step_factor": float(args.conformal_long_step_factor),
+            "conformal_long_width_factor": float(args.conformal_long_width_factor),
+            "conformal_short_width_factor": float(args.conformal_short_width_factor),
+            "conformal_normal_width_factor": float(args.conformal_normal_width_factor),
+            "conformal_lanes": int(args.conformal_lanes),
+            "conformal_lane_extent": float(args.conformal_lane_extent),
         },
         "newborn_stats": {
             "opacity_mean": float(newborn["opacity"].mean()),
