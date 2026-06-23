@@ -263,6 +263,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
 
+    parser.add_argument("--curve_source", default="skeleton", choices=["skeleton", "primitive"])
+    parser.add_argument("--skeleton_threshold_percentile", type=float, default=86.0)
+    parser.add_argument("--skeleton_min_weight", type=float, default=0.025)
+    parser.add_argument("--skeleton_min_path_pixels", type=int, default=8)
+    parser.add_argument("--skeleton_sample_step_px", type=float, default=3.0)
+    parser.add_argument("--skeleton_smooth_window", type=int, default=3)
+    parser.add_argument("--skeleton_max_thinning_iters", type=int, default=80)
     parser.add_argument("--keep_kinds", default="1,2", help="Comma-separated primitive kind ids. Defaults to geometry+texture.")
     parser.add_argument("--max_primitives_per_view", type=int, default=8192)
     parser.add_argument("--min_score", type=float, default=0.05)
@@ -284,6 +291,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--merge_angle_deg", type=float, default=18.0)
     parser.add_argument("--merge_min_overlap", type=float, default=0.05)
     parser.add_argument("--merge_same_view", action="store_true")
+    parser.add_argument("--track_build_mode", default="source_segments", choices=["source_segments", "merge"])
     parser.add_argument("--min_track_segments", type=int, default=2)
     parser.add_argument("--min_track_views", type=int, default=1)
     parser.add_argument("--strong_track_min_views", type=int, default=2)
@@ -338,6 +346,256 @@ def _bilinear_scalar(image: np.ndarray, xy: np.ndarray, size: Tuple[int, int]) -
 
 def _bilinear_rgb(image: np.ndarray, xy: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
     return np.stack([_bilinear_scalar(image[..., c], xy, size) for c in range(3)], axis=1).astype(np.float32)
+
+
+def _thin_binary_mask(mask: np.ndarray, max_iters: int) -> np.ndarray:
+    """Zhang-Suen thinning. This keeps us dependency-light on the server."""
+    img = (mask.astype(np.uint8) > 0).copy()
+    if img.size == 0:
+        return img.astype(bool)
+    img[[0, -1], :] = 0
+    img[:, [0, -1]] = 0
+    for _ in range(max(1, int(max_iters))):
+        changed = False
+        for sub_iter in (0, 1):
+            p2 = img[:-2, 1:-1]
+            p3 = img[:-2, 2:]
+            p4 = img[1:-1, 2:]
+            p5 = img[2:, 2:]
+            p6 = img[2:, 1:-1]
+            p7 = img[2:, :-2]
+            p8 = img[1:-1, :-2]
+            p9 = img[:-2, :-2]
+            center = img[1:-1, 1:-1]
+            neighbors = [p2, p3, p4, p5, p6, p7, p8, p9]
+            n_count = sum(neighbors)
+            transitions = np.zeros_like(center, dtype=np.uint8)
+            for a, b in zip(neighbors, neighbors[1:] + neighbors[:1]):
+                transitions += ((a == 0) & (b == 1)).astype(np.uint8)
+            if sub_iter == 0:
+                m1 = p2 * p4 * p6
+                m2 = p4 * p6 * p8
+            else:
+                m1 = p2 * p4 * p8
+                m2 = p2 * p6 * p8
+            remove = (
+                (center == 1)
+                & (n_count >= 2)
+                & (n_count <= 6)
+                & (transitions == 1)
+                & (m1 == 0)
+                & (m2 == 0)
+            )
+            if np.any(remove):
+                center[remove] = 0
+                changed = True
+        if not changed:
+            break
+    return img.astype(bool)
+
+
+def _skeleton_neighbors(point: Tuple[int, int], skel: np.ndarray) -> List[Tuple[int, int]]:
+    x, y = point
+    h, w = skel.shape
+    out: List[Tuple[int, int]] = []
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dx == 0 and dy == 0:
+                continue
+            xx = x + dx
+            yy = y + dy
+            if 0 <= xx < w and 0 <= yy < h and bool(skel[yy, xx]):
+                out.append((xx, yy))
+    return out
+
+
+def _trace_skeleton_paths(skel: np.ndarray, min_pixels: int) -> List[np.ndarray]:
+    points_yx = np.argwhere(skel)
+    if points_yx.size == 0:
+        return []
+    points = [(int(x), int(y)) for y, x in points_yx]
+    point_set = set(points)
+    degree = {p: len(_skeleton_neighbors(p, skel)) for p in points}
+    starts = [p for p in points if degree[p] != 2]
+    visited_edges: set[Tuple[Tuple[int, int], Tuple[int, int]]] = set()
+
+    def edge_key(a: Tuple[int, int], b: Tuple[int, int]) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+        return (a, b) if a <= b else (b, a)
+
+    def walk(start: Tuple[int, int], nxt: Tuple[int, int]) -> np.ndarray:
+        path = [start, nxt]
+        visited_edges.add(edge_key(start, nxt))
+        prev = start
+        cur = nxt
+        while degree.get(cur, 0) == 2:
+            candidates = [p for p in _skeleton_neighbors(cur, skel) if p != prev]
+            if not candidates:
+                break
+            nxt2 = candidates[0]
+            key = edge_key(cur, nxt2)
+            if key in visited_edges:
+                break
+            visited_edges.add(key)
+            path.append(nxt2)
+            prev, cur = cur, nxt2
+        return np.asarray(path, dtype=np.float32)
+
+    paths: List[np.ndarray] = []
+    for start in starts:
+        for nxt in _skeleton_neighbors(start, skel):
+            if edge_key(start, nxt) in visited_edges:
+                continue
+            path = walk(start, nxt)
+            if path.shape[0] >= int(min_pixels):
+                paths.append(path)
+
+    # Closed loops have no endpoints/junctions. Start one path per unvisited loop.
+    for start in points:
+        neighbors = _skeleton_neighbors(start, skel)
+        for nxt in neighbors:
+            if edge_key(start, nxt) in visited_edges:
+                continue
+            path = [start, nxt]
+            visited_edges.add(edge_key(start, nxt))
+            prev = start
+            cur = nxt
+            while True:
+                candidates = [p for p in _skeleton_neighbors(cur, skel) if p != prev]
+                if not candidates:
+                    break
+                nxt2 = candidates[0]
+                key = edge_key(cur, nxt2)
+                if key in visited_edges or nxt2 not in point_set:
+                    break
+                visited_edges.add(key)
+                path.append(nxt2)
+                prev, cur = cur, nxt2
+                if cur == start:
+                    break
+            arr = np.asarray(path, dtype=np.float32)
+            if arr.shape[0] >= int(min_pixels):
+                paths.append(arr)
+    return paths
+
+
+def _smooth_path(path: np.ndarray, window: int) -> np.ndarray:
+    win = max(1, int(window))
+    if win <= 1 or path.shape[0] < 3:
+        return path.astype(np.float32)
+    if win % 2 == 0:
+        win += 1
+    half = win // 2
+    padded = np.pad(path.astype(np.float32), ((half, half), (0, 0)), mode="edge")
+    out = np.zeros_like(path, dtype=np.float32)
+    for i in range(path.shape[0]):
+        out[i] = padded[i : i + win].mean(axis=0)
+    out[0] = path[0]
+    out[-1] = path[-1]
+    return out
+
+
+def _resample_path(path: np.ndarray, step_px: float) -> np.ndarray:
+    if path.shape[0] <= 1:
+        return path.astype(np.float32)
+    deltas = np.diff(path.astype(np.float32), axis=0)
+    seg_len = np.linalg.norm(deltas, axis=1)
+    total = float(seg_len.sum())
+    if total <= 1e-6:
+        return path[:1].astype(np.float32)
+    step = max(float(step_px), 1.0)
+    samples = np.arange(0.0, total, step, dtype=np.float32)
+    if samples.size == 0 or samples[-1] < total:
+        samples = np.concatenate([samples, np.asarray([total], dtype=np.float32)])
+    cum = np.concatenate([np.asarray([0.0], dtype=np.float32), np.cumsum(seg_len).astype(np.float32)])
+    out = []
+    for s in samples:
+        idx = int(np.searchsorted(cum, float(s), side="right") - 1)
+        idx = max(0, min(idx, seg_len.shape[0] - 1))
+        denom = max(float(seg_len[idx]), 1e-8)
+        t = (float(s) - float(cum[idx])) / denom
+        out.append(path[idx] * (1.0 - t) + path[idx + 1] * t)
+    return np.asarray(out, dtype=np.float32)
+
+
+def _primitive_from_skeleton(
+    weight_img: np.ndarray,
+    rgb_img: Optional[np.ndarray],
+    args: argparse.Namespace,
+) -> Dict[str, np.ndarray]:
+    positive = weight_img[np.isfinite(weight_img) & (weight_img > 0)]
+    if positive.size == 0:
+        return {
+            "xy": np.zeros((0, 2), dtype=np.float32),
+            "theta": np.zeros((0,), dtype=np.float32),
+            "sigma_long": np.zeros((0,), dtype=np.float32),
+            "sigma_short": np.zeros((0,), dtype=np.float32),
+            "color": np.zeros((0, 3), dtype=np.float32),
+            "score": np.zeros((0,), dtype=np.float32),
+            "kind": np.zeros((0,), dtype=np.int32),
+        }
+    threshold = max(
+        float(args.skeleton_min_weight),
+        float(np.percentile(positive, float(args.skeleton_threshold_percentile))),
+    )
+    mask = weight_img >= threshold
+    skel = _thin_binary_mask(mask, int(args.skeleton_max_thinning_iters))
+    paths = _trace_skeleton_paths(skel, int(args.skeleton_min_path_pixels))
+    xy_items: List[np.ndarray] = []
+    theta_items: List[np.ndarray] = []
+    sigma_long_items: List[np.ndarray] = []
+    sigma_short_items: List[np.ndarray] = []
+    score_items: List[np.ndarray] = []
+    color_items: List[np.ndarray] = []
+    h, w = weight_img.shape
+    size = (int(w), int(h))
+    for path in paths:
+        path = _smooth_path(path, int(args.skeleton_smooth_window))
+        path = _resample_path(path, float(args.skeleton_sample_step_px))
+        if path.shape[0] < 2:
+            continue
+        p0 = path[:-1]
+        p1 = path[1:]
+        vec = p1 - p0
+        length = np.linalg.norm(vec, axis=1)
+        ok = length >= 1.0
+        if not np.any(ok):
+            continue
+        p0 = p0[ok]
+        p1 = p1[ok]
+        vec = vec[ok]
+        length = length[ok]
+        center = (p0 + p1) * 0.5
+        theta = np.arctan2(vec[:, 1], vec[:, 0]).astype(np.float32)
+        score = _bilinear_scalar(weight_img, center, size)
+        xy_items.append(center.astype(np.float32))
+        theta_items.append(theta)
+        sigma_long_items.append((length / max(2.0 * float(args.segment_length_scale), 1e-6)).astype(np.float32))
+        sigma_short_items.append(np.full((center.shape[0],), 0.5, dtype=np.float32))
+        score_items.append(score.astype(np.float32))
+        if rgb_img is not None:
+            color_items.append(_bilinear_rgb(rgb_img, center, size))
+        else:
+            color_items.append(np.repeat(score[:, None], 3, axis=1).astype(np.float32))
+    if not xy_items:
+        return {
+            "xy": np.zeros((0, 2), dtype=np.float32),
+            "theta": np.zeros((0,), dtype=np.float32),
+            "sigma_long": np.zeros((0,), dtype=np.float32),
+            "sigma_short": np.zeros((0,), dtype=np.float32),
+            "color": np.zeros((0, 3), dtype=np.float32),
+            "score": np.zeros((0,), dtype=np.float32),
+            "kind": np.zeros((0,), dtype=np.int32),
+        }
+    xy = np.concatenate(xy_items, axis=0)
+    return {
+        "xy": xy,
+        "theta": np.concatenate(theta_items, axis=0).astype(np.float32),
+        "sigma_long": np.concatenate(sigma_long_items, axis=0).astype(np.float32),
+        "sigma_short": np.concatenate(sigma_short_items, axis=0).astype(np.float32),
+        "color": np.clip(np.concatenate(color_items, axis=0), 0.0, 1.0).astype(np.float32),
+        "score": np.concatenate(score_items, axis=0).astype(np.float32),
+        "kind": np.full((xy.shape[0],), KIND_GEOMETRY, dtype=np.int32),
+    }
 
 
 def _load_primitive(path: Path) -> Dict[str, np.ndarray]:
@@ -472,13 +730,24 @@ def _lift_view_segments(
     weight_lookup: Dict[str, Path],
 ) -> Tuple[Optional[Dict[str, np.ndarray]], Dict[str, object]]:
     stem = primitive_path.stem
-    primitive = _load_primitive(primitive_path)
     cam, cam_match = _camera_for_view(cameras, stem, view_index, str(args.match_policy))
     if cam is None:
         return None, {"stem": stem, "status": "missing_camera"}
     rgb_path = _resolve(rgb_paths, rgb_lookup, stem, view_index, str(args.match_policy)) if rgb_paths else None
     weight_path = _resolve(weight_paths, weight_lookup, stem, view_index, str(args.match_policy)) if weight_paths else None
-    source_size = _infer_source_size(primitive, rgb_path, weight_path)
+    if str(args.curve_source) == "skeleton":
+        if weight_path is None or not weight_path.is_file():
+            return None, {"stem": stem, "status": "missing_weight_for_skeleton"}
+        with Image.open(weight_path) as image:
+            source_size = image.size
+        weight_img_for_curve = _load_gray(weight_path, size=source_size)
+        rgb_img_for_curve = _load_rgb(rgb_path, size=source_size) if rgb_path is not None and rgb_path.is_file() else None
+        primitive = _primitive_from_skeleton(weight_img_for_curve, rgb_img_for_curve, args)
+        primitive_source = "skeleton"
+    else:
+        primitive = _load_primitive(primitive_path)
+        source_size = _infer_source_size(primitive, rgb_path, weight_path)
+        primitive_source = "primitive"
     ids, weight = _filter_primitive_ids(primitive, weight_path, source_size, args)
     if ids.size == 0:
         return None, {"stem": stem, "status": "empty_after_filter", "available": int(primitive["xy"].shape[0])}
@@ -595,6 +864,8 @@ def _lift_view_segments(
         "source_primitive": final_ids.astype(np.int64),
         "source_stem_id": np.full((int(np.count_nonzero(valid_len)),), int(view_index), dtype=np.int32),
         "source_xy": primitive["xy"][final_ids].astype(np.float32),
+        "source_p0": p0[valid_len].astype(np.float32),
+        "source_p1": p1[valid_len].astype(np.float32),
         "score": primitive["score"][final_ids].astype(np.float32),
         "weight": weight[final_ids].astype(np.float32),
         "kind": primitive["kind"][final_ids].astype(np.int32),
@@ -607,6 +878,7 @@ def _lift_view_segments(
     info = {
         "stem": stem,
         "status": "ok",
+        "primitive_source": primitive_source,
         "camera_match": cam_match,
         "available": int(primitive["xy"].shape[0]),
         "candidate": int(ids.size),
@@ -703,6 +975,8 @@ def _concat_segments(chunks: Sequence[Dict[str, np.ndarray]]) -> Dict[str, np.nd
         "source_primitive",
         "source_stem_id",
         "source_xy",
+        "source_p0",
+        "source_p1",
         "score",
         "weight",
         "kind",
@@ -757,6 +1031,38 @@ def _merge_segments(segments: Dict[str, np.ndarray], args: argparse.Namespace) -
         groups[uf.find(i)].append(i)
     tracks = _aggregate_tracks(groups, segments, args)
     keep = (tracks["segment_count"] >= int(args.min_track_segments)) & (tracks["view_count"] >= int(args.min_track_views))
+    return tracks, keep.astype(bool)
+
+
+def _tracks_from_source_segments(segments: Dict[str, np.ndarray], args: argparse.Namespace) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
+    n = int(segments["p0"].shape[0])
+    if n == 0:
+        return _empty_tracks(), np.zeros((0,), dtype=bool)
+    tracks = _empty_tracks()
+    tracks["p0"] = segments["p0"].astype(np.float32)
+    tracks["p1"] = segments["p1"].astype(np.float32)
+    tracks["center"] = segments["center"].astype(np.float32)
+    tracks["direction"] = segments["direction"].astype(np.float32)
+    tracks["normal"] = segments["normal"].astype(np.float32)
+    tracks["color"] = segments["color"].astype(np.float32)
+    tracks["score_mean"] = segments["score"].astype(np.float32)
+    tracks["score_max"] = segments["score"].astype(np.float32)
+    tracks["weight_mean"] = segments["weight"].astype(np.float32)
+    tracks["length"] = segments["length"].astype(np.float32)
+    tracks["pixel_world_mean"] = segments["pixel_world"].astype(np.float32)
+    tracks["segment_count"] = np.ones((n,), dtype=np.int32)
+    tracks["view_count"] = np.ones((n,), dtype=np.int32)
+    tracks["kind_geometry_count"] = (segments["kind"] == KIND_GEOMETRY).astype(np.int32)
+    tracks["kind_texture_count"] = (segments["kind"] == KIND_TEXTURE).astype(np.int32)
+    tracks["kind_noise_count"] = (segments["kind"] == KIND_NOISE).astype(np.int32)
+    keep = (
+        np.isfinite(tracks["length"])
+        & (tracks["length"] > 1e-8)
+        & np.isfinite(tracks["score_max"])
+        & (tracks["score_max"] >= float(args.min_score))
+        & np.isfinite(tracks["weight_mean"])
+        & (tracks["weight_mean"] >= float(args.min_weight))
+    )
     return tracks, keep.astype(bool)
 
 
@@ -859,10 +1165,14 @@ def _draw_segments_overlay(path: Path, size: Tuple[int, int], segments: Dict[str
         ids = ids[np.argsort(score)[::-1][: int(max_draw)]]
     colors = {KIND_GEOMETRY: (255, 70, 25), KIND_TEXTURE: (255, 220, 40), KIND_NOISE: (70, 130, 255)}
     for i in ids.tolist():
-        x, y = segments["source_xy"][i]
-        # This overlay shows source centers. Track projections are saved separately.
         color = colors.get(int(segments["kind"][i]), (255, 255, 255))
-        draw.ellipse((float(x) - 1.0, float(y) - 1.0, float(x) + 1.0, float(y) + 1.0), fill=color)
+        if "source_p0" in segments and "source_p1" in segments:
+            x0, y0 = segments["source_p0"][i]
+            x1, y1 = segments["source_p1"][i]
+            draw.line((float(x0), float(y0), float(x1), float(y1)), fill=color, width=1)
+        else:
+            x, y = segments["source_xy"][i]
+            draw.ellipse((float(x) - 1.0, float(y) - 1.0, float(x) + 1.0, float(y) + 1.0), fill=color)
     path.parent.mkdir(parents=True, exist_ok=True)
     image.save(path)
 
@@ -970,7 +1280,10 @@ def main() -> None:
 
     segments_all = _concat_segments(chunks)
     segments_merge, merge_source_ids = _limit_segments_for_merge(segments_all, int(args.max_segments_for_merge))
-    tracks, keep = _merge_segments(segments_merge, args)
+    if str(args.track_build_mode) == "source_segments":
+        tracks, keep = _tracks_from_source_segments(segments_merge, args)
+    else:
+        tracks, keep = _merge_segments(segments_merge, args)
     strong = keep & (tracks["view_count"] >= int(args.strong_track_min_views))
 
     np.savez_compressed(output_root / "segments_all_v0.npz", **segments_all)
@@ -1034,6 +1347,12 @@ def main() -> None:
             "merge_angle_deg": float(args.merge_angle_deg),
             "merge_min_overlap": float(args.merge_min_overlap),
             "merge_same_view": bool(args.merge_same_view),
+            "curve_source": str(args.curve_source),
+            "skeleton_threshold_percentile": float(args.skeleton_threshold_percentile),
+            "skeleton_min_weight": float(args.skeleton_min_weight),
+            "skeleton_min_path_pixels": int(args.skeleton_min_path_pixels),
+            "skeleton_sample_step_px": float(args.skeleton_sample_step_px),
+            "track_build_mode": str(args.track_build_mode),
             "min_track_segments": int(args.min_track_segments),
             "min_track_views": int(args.min_track_views),
             "strong_track_min_views": int(args.strong_track_min_views),
