@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SOF_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+
+WORK_ROOT="${WORK_ROOT:-/root/autodl-tmp}"
+SCENE_NAME="${SCENE_NAME:-kitchen}"
+SCENE_ROOT="${SCENE_ROOT:-${WORK_ROOT}/${SCENE_NAME}}"
+SCENE_ASSET_ROOT="${SCENE_ASSET_ROOT:-${SCENE_ROOT}/_hrgsrefiner_assets}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+
+BASE_EXPERIMENT_NAME="${BASE_EXPERIMENT_NAME:-mip30k_rerun_check_directsrc_r1_v0}"
+BASE_MODEL_DIR="${BASE_MODEL_DIR:-${SCENE_ASSET_ROOT}/kitchen_mip_vanilla_images8_v1/${BASE_EXPERIMENT_NAME}}"
+BASE_ITERATION="${BASE_ITERATION:-30000}"
+
+EVIDENCE_NAME="${EVIDENCE_NAME:-qwen_vosr_sr_hf_effective_verywide_8view_v0}"
+EVIDENCE_ROOT="${EVIDENCE_ROOT:-${SCENE_ASSET_ROOT}/sr_hf_evidence/${EVIDENCE_NAME}}"
+PRIMITIVE_DIR="${PRIMITIVE_DIR:-${EVIDENCE_ROOT}/primitives}"
+WEIGHT_DIR="${WEIGHT_DIR:-${EVIDENCE_ROOT}/effective_hf_weight}"
+RGB_DIR="${RGB_DIR:-${EVIDENCE_ROOT}/effective_hf_carrier_rgb}"
+
+OUTPUT_NAME="${OUTPUT_NAME:-${BASE_EXPERIMENT_NAME}_${EVIDENCE_NAME}_curve_tracks_v0}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${SCENE_ASSET_ROOT}/sr_hf_curve_tracks/${OUTPUT_NAME}}"
+
+MATCH_POLICY="${MATCH_POLICY:-order_if_needed}"
+LIMIT="${LIMIT:-8}"
+OVERWRITE="${OVERWRITE:-0}"
+KEEP_KINDS="${KEEP_KINDS:-1,2}"
+MAX_PRIMITIVES_PER_VIEW="${MAX_PRIMITIVES_PER_VIEW:-8192}"
+MIN_SCORE="${MIN_SCORE:-0.05}"
+MIN_WEIGHT="${MIN_WEIGHT:-0.01}"
+BASE_OPACITY_MIN="${BASE_OPACITY_MIN:-0.02}"
+DEPTH_MIN="${DEPTH_MIN:-0.02}"
+SEARCH_RADIUS_PX="${SEARCH_RADIUS_PX:-5}"
+ENDPOINT_SEARCH_RADIUS_PX="${ENDPOINT_SEARCH_RADIUS_PX:-3}"
+REQUIRE_ENDPOINT_MATCH="${REQUIRE_ENDPOINT_MATCH:-0}"
+MAX_ENDPOINT_DEPTH_DELTA_PX="${MAX_ENDPOINT_DEPTH_DELTA_PX:-8.0}"
+FRONT_OFFSET_PX="${FRONT_OFFSET_PX:-0.25}"
+SEGMENT_LENGTH_SCALE="${SEGMENT_LENGTH_SCALE:-2.5}"
+SEGMENT_MIN_LENGTH_PX="${SEGMENT_MIN_LENGTH_PX:-2.0}"
+SEGMENT_MAX_LENGTH_PX="${SEGMENT_MAX_LENGTH_PX:-18.0}"
+
+MAX_SEGMENTS_FOR_MERGE="${MAX_SEGMENTS_FOR_MERGE:-50000}"
+MERGE_RADIUS_PX="${MERGE_RADIUS_PX:-6.0}"
+MERGE_RADIUS_ABS="${MERGE_RADIUS_ABS:-0.006}"
+MERGE_ANGLE_DEG="${MERGE_ANGLE_DEG:-18.0}"
+MERGE_MIN_OVERLAP="${MERGE_MIN_OVERLAP:-0.05}"
+MERGE_SAME_VIEW="${MERGE_SAME_VIEW:-1}"
+MIN_TRACK_SEGMENTS="${MIN_TRACK_SEGMENTS:-2}"
+MIN_TRACK_VIEWS="${MIN_TRACK_VIEWS:-1}"
+STRONG_TRACK_MIN_VIEWS="${STRONG_TRACK_MIN_VIEWS:-2}"
+DEBUG_LIMIT="${DEBUG_LIMIT:-8}"
+MAX_DRAW_SEGMENTS="${MAX_DRAW_SEGMENTS:-8192}"
+
+for required in "${BASE_MODEL_DIR}" "${BASE_MODEL_DIR}/point_cloud/iteration_${BASE_ITERATION}/point_cloud.ply" "${PRIMITIVE_DIR}"; do
+  if [[ ! -e "${required}" ]]; then
+    echo "[sr-hf-curve-tracks-v0] required path not found: ${required}" >&2
+    exit 1
+  fi
+done
+
+ARGS=(
+  --base_model_dir "${BASE_MODEL_DIR}"
+  --base_iteration "${BASE_ITERATION}"
+  --primitive_dir "${PRIMITIVE_DIR}"
+  --output_root "${OUTPUT_ROOT}"
+  --match_policy "${MATCH_POLICY}"
+  --limit "${LIMIT}"
+  --keep_kinds "${KEEP_KINDS}"
+  --max_primitives_per_view "${MAX_PRIMITIVES_PER_VIEW}"
+  --min_score "${MIN_SCORE}"
+  --min_weight "${MIN_WEIGHT}"
+  --base_opacity_min "${BASE_OPACITY_MIN}"
+  --depth_min "${DEPTH_MIN}"
+  --search_radius_px "${SEARCH_RADIUS_PX}"
+  --endpoint_search_radius_px "${ENDPOINT_SEARCH_RADIUS_PX}"
+  --max_endpoint_depth_delta_px "${MAX_ENDPOINT_DEPTH_DELTA_PX}"
+  --front_offset_px "${FRONT_OFFSET_PX}"
+  --segment_length_scale "${SEGMENT_LENGTH_SCALE}"
+  --segment_min_length_px "${SEGMENT_MIN_LENGTH_PX}"
+  --segment_max_length_px "${SEGMENT_MAX_LENGTH_PX}"
+  --max_segments_for_merge "${MAX_SEGMENTS_FOR_MERGE}"
+  --merge_radius_px "${MERGE_RADIUS_PX}"
+  --merge_radius_abs "${MERGE_RADIUS_ABS}"
+  --merge_angle_deg "${MERGE_ANGLE_DEG}"
+  --merge_min_overlap "${MERGE_MIN_OVERLAP}"
+  --min_track_segments "${MIN_TRACK_SEGMENTS}"
+  --min_track_views "${MIN_TRACK_VIEWS}"
+  --strong_track_min_views "${STRONG_TRACK_MIN_VIEWS}"
+  --debug_limit "${DEBUG_LIMIT}"
+  --max_draw_segments "${MAX_DRAW_SEGMENTS}"
+)
+
+if [[ -d "${WEIGHT_DIR}" ]]; then
+  ARGS+=(--weight_dir "${WEIGHT_DIR}")
+fi
+if [[ -d "${RGB_DIR}" ]]; then
+  ARGS+=(--rgb_dir "${RGB_DIR}")
+fi
+if [[ "${OVERWRITE}" == "1" ]]; then
+  ARGS+=(--overwrite)
+fi
+if [[ "${REQUIRE_ENDPOINT_MATCH}" == "1" ]]; then
+  ARGS+=(--require_endpoint_match)
+fi
+if [[ "${MERGE_SAME_VIEW}" == "1" ]]; then
+  ARGS+=(--merge_same_view)
+fi
+
+echo "[sr-hf-curve-tracks-v0] base      : ${BASE_MODEL_DIR}"
+echo "[sr-hf-curve-tracks-v0] primitives: ${PRIMITIVE_DIR}"
+echo "[sr-hf-curve-tracks-v0] weight    : ${WEIGHT_DIR}"
+echo "[sr-hf-curve-tracks-v0] rgb       : ${RGB_DIR}"
+echo "[sr-hf-curve-tracks-v0] output    : ${OUTPUT_ROOT}"
+echo "[sr-hf-curve-tracks-v0] limit     : ${LIMIT}"
+echo "[sr-hf-curve-tracks-v0] merge     : radius=${MERGE_RADIUS_PX}px/${MERGE_RADIUS_ABS} angle=${MERGE_ANGLE_DEG} same_view=${MERGE_SAME_VIEW}"
+
+"${PYTHON_BIN}" "${SOF_ROOT}/scripts/build_sr_hf_curve_tracks_v0.py" "${ARGS[@]}"
+
+echo "[sr-hf-curve-tracks-v0] shallow outputs:"
+echo "  ${OUTPUT_ROOT}/summary.json"
+echo "  ${OUTPUT_ROOT}/sr_hf_curve_tracks_v0.npz"
+echo "  ${OUTPUT_ROOT}/tracks_keep_v0.obj"
+echo "  ${OUTPUT_ROOT}/tracks_strong_v0.obj"
+echo "  ${OUTPUT_ROOT}/segment_overlay"
+echo "  ${OUTPUT_ROOT}/track_projection"

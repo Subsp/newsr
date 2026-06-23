@@ -1,0 +1,1076 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import shutil
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover
+    def tqdm(iterable: Iterable[object], **_: object) -> Iterable[object]:
+        return iterable
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+SH_C0 = 0.28209479177387814
+
+
+KIND_GEOMETRY = 1
+KIND_TEXTURE = 2
+KIND_NOISE = 3
+
+
+def _list_files(root: Path, exts: Sequence[str]) -> List[Path]:
+    if not root.is_dir():
+        raise FileNotFoundError(f"Directory not found: {root}")
+    ext_set = {x.lower() for x in exts}
+    return sorted(p for p in root.iterdir() if p.is_file() and p.suffix.lower() in ext_set)
+
+
+def _lookup(paths: Sequence[Path]) -> Dict[str, Path]:
+    return {p.stem.lower(): p for p in paths}
+
+
+def _resolve(paths: Sequence[Path], lookup: Dict[str, Path], stem: str, index: int, policy: str) -> Optional[Path]:
+    if policy in {"stem", "order_if_needed"}:
+        found = lookup.get(stem.lower())
+        if found is not None:
+            return found
+        if policy == "stem":
+            return None
+    if policy in {"order", "order_if_needed"} and index < len(paths):
+        return paths[index]
+    return None
+
+
+def _load_rgb(path: Path, size: Optional[Tuple[int, int]] = None) -> np.ndarray:
+    image = Image.open(path).convert("RGB")
+    if size is not None and image.size != size:
+        image = image.resize(size, Image.BICUBIC)
+    return np.asarray(image, dtype=np.float32) / 255.0
+
+
+def _load_gray(path: Path, size: Optional[Tuple[int, int]] = None) -> np.ndarray:
+    image = Image.open(path).convert("L")
+    if size is not None and image.size != size:
+        image = image.resize(size, Image.BICUBIC)
+    return np.asarray(image, dtype=np.float32) / 255.0
+
+
+def _load_cameras(base_model_dir: Path) -> Dict[str, Dict[str, object]]:
+    path = base_model_dir / "cameras.json"
+    if not path.is_file():
+        raise FileNotFoundError(f"cameras.json not found: {path}")
+    cameras = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(cameras, list):
+        raise ValueError(f"Expected cameras.json list, got {type(cameras).__name__}")
+    out: Dict[str, Dict[str, object]] = {}
+    for index, cam in enumerate(cameras):
+        name = str(cam.get("img_name", cam.get("image_name", "")))
+        if not name:
+            continue
+        item = dict(cam)
+        item["_index"] = index
+        out[Path(name).stem.lower()] = item
+    return out
+
+
+def _camera_basis(cam: Dict[str, object]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, int, int]:
+    rot = np.asarray(cam["rotation"], dtype=np.float32)
+    pos = np.asarray(cam["position"], dtype=np.float32)
+    if rot.shape != (3, 3):
+        raise ValueError(f"Invalid camera rotation shape: {rot.shape}")
+    if pos.shape != (3,):
+        raise ValueError(f"Invalid camera position shape: {pos.shape}")
+    return pos, rot[:, 0], rot[:, 1], rot[:, 2], float(cam["fx"]), float(cam["fy"]), int(cam["width"]), int(cam["height"])
+
+
+def _unproject_points(
+    cam: Dict[str, object],
+    xy: np.ndarray,
+    depth: np.ndarray,
+    source_size: Tuple[int, int],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
+    pos, cam_x, cam_y, cam_z, fx, fy, cam_w, cam_h = _camera_basis(cam)
+    sw, sh = source_size
+    px = xy[:, 0] / max(float(sw - 1), 1.0) * max(float(cam_w - 1), 1.0)
+    py = xy[:, 1] / max(float(sh - 1), 1.0) * max(float(cam_h - 1), 1.0)
+    x_cam = (px - float(cam_w) * 0.5) / max(fx, 1e-8) * depth
+    y_cam = (py - float(cam_h) * 0.5) / max(fy, 1e-8) * depth
+    xyz = (
+        pos[None, :]
+        + x_cam[:, None] * cam_x[None, :]
+        + y_cam[:, None] * cam_y[None, :]
+        + depth[:, None] * cam_z[None, :]
+    ).astype(np.float32)
+    normal = xyz - pos[None, :]
+    normal = normal / np.maximum(np.linalg.norm(normal, axis=1, keepdims=True), 1e-8)
+    return xyz, cam_x.astype(np.float32), cam_y.astype(np.float32), normal.astype(np.float32), px.astype(np.float32), fx, fy
+
+
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    x = np.clip(x.astype(np.float32), -60.0, 60.0)
+    return (1.0 / (1.0 + np.exp(-x))).astype(np.float32)
+
+
+def _load_base_vertices(base_ply: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    from plyfile import PlyData
+
+    ply = PlyData.read(str(base_ply))
+    vertices = ply["vertex"].data
+    names = set(vertices.dtype.names or ())
+    if not {"x", "y", "z"}.issubset(names):
+        raise ValueError(f"Base PLY lacks xyz fields: {base_ply}")
+    xyz = np.stack([vertices["x"], vertices["y"], vertices["z"]], axis=1).astype(np.float32)
+    if "opacity" in names:
+        opacity = _sigmoid(np.asarray(vertices["opacity"], dtype=np.float32).reshape(-1))
+    else:
+        opacity = np.ones((xyz.shape[0],), dtype=np.float32)
+    if {"f_dc_0", "f_dc_1", "f_dc_2"}.issubset(names):
+        dc = np.stack([vertices["f_dc_0"], vertices["f_dc_1"], vertices["f_dc_2"]], axis=1).astype(np.float32)
+        rgb = np.clip(dc * float(SH_C0) + 0.5, 0.0, 1.0).astype(np.float32)
+    else:
+        rgb = np.full((xyz.shape[0], 3), 0.5, dtype=np.float32)
+    return vertices, xyz, opacity, rgb
+
+
+def _project_base_to_source(
+    xyz: np.ndarray,
+    opacity: np.ndarray,
+    cam: Dict[str, object],
+    source_size: Tuple[int, int],
+    base_opacity_min: float,
+    depth_min: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[int, int], np.ndarray]:
+    pos, cam_x, cam_y, cam_z, fx, fy, cam_w, cam_h = _camera_basis(cam)
+    rel = xyz - pos[None, :]
+    depth = rel @ cam_z.astype(np.float32)
+    x_cam = rel @ cam_x.astype(np.float32)
+    y_cam = rel @ cam_y.astype(np.float32)
+    px_cam = x_cam / np.maximum(depth, 1e-8) * float(fx) + float(cam_w) * 0.5
+    py_cam = y_cam / np.maximum(depth, 1e-8) * float(fy) + float(cam_h) * 0.5
+    sw, sh = source_size
+    px = px_cam / max(float(cam_w - 1), 1.0) * max(float(sw - 1), 1.0)
+    py = py_cam / max(float(cam_h - 1), 1.0) * max(float(sh - 1), 1.0)
+    valid = (
+        np.isfinite(px)
+        & np.isfinite(py)
+        & np.isfinite(depth)
+        & (depth > float(depth_min))
+        & (px >= 0.0)
+        & (py >= 0.0)
+        & (px <= float(sw - 1))
+        & (py <= float(sh - 1))
+        & (opacity >= float(base_opacity_min))
+    )
+    return px.astype(np.float32), py.astype(np.float32), depth.astype(np.float32), (sw, sh), valid
+
+
+def _build_visible_layer_index(
+    base_xy_depth: Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[int, int], np.ndarray],
+) -> Tuple[np.ndarray, np.ndarray]:
+    px, py, depth, source_size, valid = base_xy_depth
+    sw, sh = source_size
+    grid_index = np.full((int(sw) * int(sh),), -1, dtype=np.int64)
+    grid_depth = np.full((int(sw) * int(sh),), np.inf, dtype=np.float32)
+    valid_ids = np.flatnonzero(valid)
+    if valid_ids.size == 0:
+        return grid_index.reshape(sh, sw), grid_depth.reshape(sh, sw)
+    xi = np.rint(px[valid_ids]).astype(np.int64)
+    yi = np.rint(py[valid_ids]).astype(np.int64)
+    inside = (xi >= 0) & (xi < sw) & (yi >= 0) & (yi < sh)
+    valid_ids = valid_ids[inside]
+    xi = xi[inside]
+    yi = yi[inside]
+    if valid_ids.size == 0:
+        return grid_index.reshape(sh, sw), grid_depth.reshape(sh, sw)
+    lin = yi * int(sw) + xi
+    d = depth[valid_ids]
+    order = np.lexsort((d, lin))
+    sorted_lin = lin[order]
+    first = np.concatenate(([True], sorted_lin[1:] != sorted_lin[:-1]))
+    winners = order[first]
+    win_lin = lin[winners]
+    grid_index[win_lin] = valid_ids[winners]
+    grid_depth[win_lin] = d[winners]
+    return grid_index.reshape(sh, sw), grid_depth.reshape(sh, sw)
+
+
+def _match_primitives_to_visible_layer(
+    mu: np.ndarray,
+    grid_index: np.ndarray,
+    grid_depth: np.ndarray,
+    radius: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    h, w = grid_index.shape
+    n = int(mu.shape[0])
+    best_index = np.full((n,), -1, dtype=np.int64)
+    best_depth = np.full((n,), np.inf, dtype=np.float32)
+    best_dist2 = np.full((n,), np.inf, dtype=np.float32)
+    offsets: List[Tuple[int, int]] = []
+    r = max(int(radius), 0)
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            if dx * dx + dy * dy <= r * r:
+                offsets.append((dx, dy))
+    offsets.sort(key=lambda item: item[0] * item[0] + item[1] * item[1])
+    center_x = np.rint(mu[:, 0]).astype(np.int64)
+    center_y = np.rint(mu[:, 1]).astype(np.int64)
+    for dx, dy in offsets:
+        xs = center_x + int(dx)
+        ys = center_y + int(dy)
+        inside = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+        if not np.any(inside):
+            continue
+        idx = np.full((n,), -1, dtype=np.int64)
+        dep = np.full((n,), np.inf, dtype=np.float32)
+        idx[inside] = grid_index[ys[inside], xs[inside]]
+        hit = idx >= 0
+        if not np.any(hit):
+            continue
+        dep[hit] = grid_depth[ys[hit], xs[hit]]
+        dist2 = (xs.astype(np.float32) - mu[:, 0]) ** 2 + (ys.astype(np.float32) - mu[:, 1]) ** 2
+        update = hit & ((dist2 < best_dist2) | ((dist2 == best_dist2) & (dep < best_depth)))
+        best_index[update] = idx[update]
+        best_depth[update] = dep[update]
+        best_dist2[update] = dist2[update]
+    matched = best_index >= 0
+    return matched, best_index, best_depth, np.sqrt(np.maximum(best_dist2, 0.0)).astype(np.float32)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Lift SR-HF 2D primitive evidence onto the visible Gaussian layer and merge it into "
+            "LIMAP-style 3D curve/line tracks. This is intentionally a cache builder: it does not "
+            "modify the Gaussian field yet."
+        )
+    )
+    parser.add_argument("--base_model_dir", required=True)
+    parser.add_argument("--base_iteration", type=int, default=30000)
+    parser.add_argument("--primitive_dir", required=True)
+    parser.add_argument("--output_root", required=True)
+    parser.add_argument("--weight_dir", default="")
+    parser.add_argument("--rgb_dir", default="")
+    parser.add_argument("--match_policy", default="order_if_needed", choices=["stem", "order", "order_if_needed"])
+    parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--overwrite", action="store_true")
+
+    parser.add_argument("--keep_kinds", default="1,2", help="Comma-separated primitive kind ids. Defaults to geometry+texture.")
+    parser.add_argument("--max_primitives_per_view", type=int, default=8192)
+    parser.add_argument("--min_score", type=float, default=0.05)
+    parser.add_argument("--min_weight", type=float, default=0.01)
+    parser.add_argument("--base_opacity_min", type=float, default=0.02)
+    parser.add_argument("--depth_min", type=float, default=0.02)
+    parser.add_argument("--search_radius_px", type=int, default=5)
+    parser.add_argument("--endpoint_search_radius_px", type=int, default=3)
+    parser.add_argument("--require_endpoint_match", action="store_true")
+    parser.add_argument("--max_endpoint_depth_delta_px", type=float, default=8.0)
+    parser.add_argument("--front_offset_px", type=float, default=0.25)
+    parser.add_argument("--segment_length_scale", type=float, default=2.5)
+    parser.add_argument("--segment_min_length_px", type=float, default=2.0)
+    parser.add_argument("--segment_max_length_px", type=float, default=18.0)
+
+    parser.add_argument("--max_segments_for_merge", type=int, default=50000)
+    parser.add_argument("--merge_radius_px", type=float, default=6.0)
+    parser.add_argument("--merge_radius_abs", type=float, default=0.006)
+    parser.add_argument("--merge_angle_deg", type=float, default=18.0)
+    parser.add_argument("--merge_min_overlap", type=float, default=0.05)
+    parser.add_argument("--merge_same_view", action="store_true")
+    parser.add_argument("--min_track_segments", type=int, default=2)
+    parser.add_argument("--min_track_views", type=int, default=1)
+    parser.add_argument("--strong_track_min_views", type=int, default=2)
+    parser.add_argument("--debug_limit", type=int, default=8)
+    parser.add_argument("--max_draw_segments", type=int, default=8192)
+    return parser.parse_args()
+
+
+def _parse_kind_set(text: str) -> set[int]:
+    out: set[int] = set()
+    for part in str(text).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        out.add(int(part))
+    return out
+
+
+def _infer_source_size(
+    primitive: Dict[str, np.ndarray],
+    rgb_path: Optional[Path],
+    weight_path: Optional[Path],
+) -> Tuple[int, int]:
+    for path in (rgb_path, weight_path):
+        if path is not None and path.is_file():
+            with Image.open(path) as image:
+                return image.size
+    xy = np.asarray(primitive["xy"], dtype=np.float32)
+    width = int(math.ceil(float(np.nanmax(xy[:, 0])) + 1.0)) if xy.size else 1
+    height = int(math.ceil(float(np.nanmax(xy[:, 1])) + 1.0)) if xy.size else 1
+    return max(width, 1), max(height, 1)
+
+
+def _bilinear_scalar(image: np.ndarray, xy: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
+    sw, sh = size
+    x = np.clip(xy[:, 0].astype(np.float32), 0.0, float(sw - 1))
+    y = np.clip(xy[:, 1].astype(np.float32), 0.0, float(sh - 1))
+    x0 = np.floor(x).astype(np.int64)
+    y0 = np.floor(y).astype(np.int64)
+    x1 = np.clip(x0 + 1, 0, sw - 1)
+    y1 = np.clip(y0 + 1, 0, sh - 1)
+    wx = (x - x0.astype(np.float32))[:, None]
+    wy = (y - y0.astype(np.float32))[:, None]
+    v00 = image[y0, x0].reshape(-1, 1)
+    v10 = image[y0, x1].reshape(-1, 1)
+    v01 = image[y1, x0].reshape(-1, 1)
+    v11 = image[y1, x1].reshape(-1, 1)
+    v0 = v00 * (1.0 - wx) + v10 * wx
+    v1 = v01 * (1.0 - wx) + v11 * wx
+    return (v0 * (1.0 - wy) + v1 * wy).reshape(-1).astype(np.float32)
+
+
+def _bilinear_rgb(image: np.ndarray, xy: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
+    return np.stack([_bilinear_scalar(image[..., c], xy, size) for c in range(3)], axis=1).astype(np.float32)
+
+
+def _load_primitive(path: Path) -> Dict[str, np.ndarray]:
+    data = dict(np.load(path))
+    if "xy" in data:
+        xy = np.asarray(data["xy"], dtype=np.float32)
+    elif "mu_xy" in data:
+        xy = np.asarray(data["mu_xy"], dtype=np.float32)
+    else:
+        raise KeyError(f"{path} must contain xy or mu_xy")
+    count = int(xy.shape[0])
+    if "theta" in data:
+        theta = np.asarray(data["theta"], dtype=np.float32).reshape(-1)
+    elif "cholesky" in data:
+        theta = _theta_from_cholesky(np.asarray(data["cholesky"], dtype=np.float32), count)
+    else:
+        theta = np.zeros((count,), dtype=np.float32)
+    sigma_long = np.asarray(data.get("sigma_long", np.full((count,), 4.0, dtype=np.float32)), dtype=np.float32).reshape(-1)
+    sigma_short = np.asarray(data.get("sigma_short", np.full((count,), 0.7, dtype=np.float32)), dtype=np.float32).reshape(-1)
+    color = np.asarray(data.get("color", np.ones((count, 3), dtype=np.float32)), dtype=np.float32).reshape(count, 3)
+    score = np.asarray(data.get("score", data.get("opacity", np.ones((count,), dtype=np.float32))), dtype=np.float32).reshape(-1)
+    kind = np.asarray(data.get("kind", np.full((count,), KIND_GEOMETRY, dtype=np.int32)), dtype=np.int32).reshape(-1)
+    return {
+        "xy": xy,
+        "theta": theta[:count],
+        "sigma_long": sigma_long[:count],
+        "sigma_short": sigma_short[:count],
+        "color": color[:count],
+        "score": score[:count],
+        "kind": kind[:count],
+    }
+
+
+def _theta_from_cholesky(cholesky: np.ndarray, count: int) -> np.ndarray:
+    if cholesky.shape[0] != count or cholesky.shape[1] < 3:
+        return np.zeros((count,), dtype=np.float32)
+    theta = np.zeros((count,), dtype=np.float32)
+    for i in range(count):
+        a = float(cholesky[i, 0])
+        b = float(cholesky[i, 1])
+        c = float(cholesky[i, 2])
+        cov = np.asarray([[a * a, a * b], [a * b, b * b + c * c]], dtype=np.float32)
+        vals, vecs = np.linalg.eigh(cov + np.eye(2, dtype=np.float32) * 1e-8)
+        long_vec = vecs[:, int(np.argmax(vals))]
+        theta[i] = math.atan2(float(long_vec[1]), float(long_vec[0]))
+    return theta
+
+
+def _camera_for_view(
+    cameras: Dict[str, Dict[str, object]],
+    stem: str,
+    view_index: int,
+    match_policy: str,
+) -> Tuple[Optional[Dict[str, object]], str]:
+    cam = cameras.get(stem.lower())
+    if cam is not None:
+        return cam, "stem"
+    if match_policy == "stem":
+        return None, "missing"
+    values = list(cameras.values())
+    if view_index >= len(values):
+        return None, "missing"
+    return values[view_index], "order"
+
+
+def _project_points_to_source(
+    points: np.ndarray,
+    cam: Dict[str, object],
+    source_size: Tuple[int, int],
+) -> Tuple[np.ndarray, np.ndarray]:
+    pos, cam_x, cam_y, cam_z, fx, fy, cam_w, cam_h = _camera_basis(cam)
+    rel = points.astype(np.float32) - pos[None, :]
+    depth = rel @ cam_z.astype(np.float32)
+    x_cam = rel @ cam_x.astype(np.float32)
+    y_cam = rel @ cam_y.astype(np.float32)
+    px_cam = x_cam / np.maximum(depth, 1e-8) * float(fx) + float(cam_w) * 0.5
+    py_cam = y_cam / np.maximum(depth, 1e-8) * float(fy) + float(cam_h) * 0.5
+    sw, sh = source_size
+    x = px_cam / max(float(cam_w - 1), 1.0) * max(float(sw - 1), 1.0)
+    y = py_cam / max(float(cam_h - 1), 1.0) * max(float(sh - 1), 1.0)
+    return np.stack([x, y], axis=1).astype(np.float32), depth.astype(np.float32)
+
+
+def _primitive_segments_2d(primitive: Dict[str, np.ndarray], length_scale: float, min_len: float, max_len: float) -> Tuple[np.ndarray, np.ndarray]:
+    xy = primitive["xy"].astype(np.float32)
+    theta = primitive["theta"].astype(np.float32)
+    half_len = np.clip(primitive["sigma_long"].astype(np.float32) * float(length_scale), float(min_len), float(max_len))
+    direction = np.stack([np.cos(theta), np.sin(theta)], axis=1).astype(np.float32)
+    p0 = xy - direction * half_len[:, None]
+    p1 = xy + direction * half_len[:, None]
+    return p0.astype(np.float32), p1.astype(np.float32)
+
+
+def _filter_primitive_ids(
+    primitive: Dict[str, np.ndarray],
+    weight_path: Optional[Path],
+    source_size: Tuple[int, int],
+    args: argparse.Namespace,
+) -> Tuple[np.ndarray, np.ndarray]:
+    xy = primitive["xy"]
+    score = primitive["score"].astype(np.float32)
+    kind = primitive["kind"].astype(np.int32)
+    finite = np.isfinite(xy).all(axis=1) & np.isfinite(score)
+    keep_kinds = _parse_kind_set(str(args.keep_kinds))
+    finite &= np.asarray([int(k) in keep_kinds for k in kind], dtype=bool)
+    finite &= score >= float(args.min_score)
+    weight = np.ones((xy.shape[0],), dtype=np.float32)
+    if weight_path is not None and weight_path.is_file():
+        weight_img = _load_gray(weight_path, size=source_size)
+        weight = _bilinear_scalar(weight_img, xy, source_size)
+        finite &= weight >= float(args.min_weight)
+    ids = np.flatnonzero(finite)
+    if ids.size == 0:
+        return ids, weight
+    rank_score = score[ids] * np.clip(weight[ids], 0.0, 1.0)
+    order = np.argsort(rank_score)[::-1]
+    if int(args.max_primitives_per_view) > 0:
+        order = order[: int(args.max_primitives_per_view)]
+    return ids[order], weight
+
+
+def _lift_view_segments(
+    primitive_path: Path,
+    view_index: int,
+    args: argparse.Namespace,
+    cameras: Dict[str, Dict[str, object]],
+    base_xyz: np.ndarray,
+    base_opacity: np.ndarray,
+    rgb_paths: Sequence[Path],
+    rgb_lookup: Dict[str, Path],
+    weight_paths: Sequence[Path],
+    weight_lookup: Dict[str, Path],
+) -> Tuple[Optional[Dict[str, np.ndarray]], Dict[str, object]]:
+    stem = primitive_path.stem
+    primitive = _load_primitive(primitive_path)
+    cam, cam_match = _camera_for_view(cameras, stem, view_index, str(args.match_policy))
+    if cam is None:
+        return None, {"stem": stem, "status": "missing_camera"}
+    rgb_path = _resolve(rgb_paths, rgb_lookup, stem, view_index, str(args.match_policy)) if rgb_paths else None
+    weight_path = _resolve(weight_paths, weight_lookup, stem, view_index, str(args.match_policy)) if weight_paths else None
+    source_size = _infer_source_size(primitive, rgb_path, weight_path)
+    ids, weight = _filter_primitive_ids(primitive, weight_path, source_size, args)
+    if ids.size == 0:
+        return None, {"stem": stem, "status": "empty_after_filter", "available": int(primitive["xy"].shape[0])}
+
+    visible_projection = _project_base_to_source(
+        base_xyz,
+        base_opacity,
+        cam,
+        source_size,
+        float(args.base_opacity_min),
+        float(args.depth_min),
+    )
+    grid_index, grid_depth = _build_visible_layer_index(visible_projection)
+
+    xy = primitive["xy"][ids]
+    matched, matched_base_idx, matched_depth, matched_dist = _match_primitives_to_visible_layer(
+        xy,
+        grid_index,
+        grid_depth,
+        int(args.search_radius_px),
+    )
+    if not np.any(matched):
+        return None, {
+            "stem": stem,
+            "status": "empty_after_layer_match",
+            "candidate": int(ids.size),
+            "source_size": [int(source_size[0]), int(source_size[1])],
+        }
+
+    p0_all, p1_all = _primitive_segments_2d(
+        primitive,
+        float(args.segment_length_scale),
+        float(args.segment_min_length_px),
+        float(args.segment_max_length_px),
+    )
+    kept_ids = ids[matched]
+    kept_xy = xy[matched]
+    kept_depth = matched_depth[matched]
+    kept_base_idx = matched_base_idx[matched]
+    kept_dist = matched_dist[matched]
+    p0 = p0_all[kept_ids]
+    p1 = p1_all[kept_ids]
+
+    endpoint_depth = np.repeat(kept_depth[:, None], 2, axis=1).astype(np.float32)
+    if int(args.endpoint_search_radius_px) > 0 or bool(args.require_endpoint_match):
+        endpoints = np.concatenate([p0, p1], axis=0)
+        ep_matched, _ep_idx, ep_depth, _ep_dist = _match_primitives_to_visible_layer(
+            endpoints,
+            grid_index,
+            grid_depth,
+            int(args.endpoint_search_radius_px),
+        )
+        ep_matched = ep_matched.reshape(2, -1).T
+        ep_depth = ep_depth.reshape(2, -1).T
+        max_delta = np.maximum(float(args.max_endpoint_depth_delta_px), 0.0)
+        pixel_world = kept_depth / max((float(cam["fx"]) + float(cam["fy"])) * 0.5, 1e-8)
+        valid_depth = ep_matched & (np.abs(ep_depth - kept_depth[:, None]) <= max_delta * pixel_world[:, None])
+        endpoint_depth = np.where(valid_depth, ep_depth, endpoint_depth)
+        if bool(args.require_endpoint_match):
+            ok = valid_depth.all(axis=1)
+            kept_ids = kept_ids[ok]
+            kept_xy = kept_xy[ok]
+            kept_depth = kept_depth[ok]
+            kept_base_idx = kept_base_idx[ok]
+            kept_dist = kept_dist[ok]
+            p0 = p0[ok]
+            p1 = p1[ok]
+            endpoint_depth = endpoint_depth[ok]
+            if kept_ids.size == 0:
+                return None, {"stem": stem, "status": "empty_after_endpoint_match", "candidate": int(ids.size)}
+
+    endpoints_2d = np.concatenate([p0, p1], axis=0).astype(np.float32)
+    endpoints_depth = np.concatenate([endpoint_depth[:, 0], endpoint_depth[:, 1]], axis=0).astype(np.float32)
+    endpoints_3d, cam_x, cam_y, endpoint_normal, _px, fx, fy = _unproject_points(cam, endpoints_2d, endpoints_depth, source_size)
+    count = int(kept_ids.size)
+    p0_3d = endpoints_3d[:count]
+    p1_3d = endpoints_3d[count:]
+    center_3d, _cx, _cy, center_normal, _cpx, _cfx, _cfy = _unproject_points(cam, kept_xy, kept_depth, source_size)
+    pix_world = kept_depth / max((float(fx) + float(fy)) * 0.5, 1e-8)
+    source_pixel_scale = 0.5 * (
+        max(float(cam["width"] - 1), 1.0) / max(float(source_size[0] - 1), 1.0)
+        + max(float(cam["height"] - 1), 1.0) / max(float(source_size[1] - 1), 1.0)
+    )
+    pix_world = (pix_world * source_pixel_scale).astype(np.float32)
+    if float(args.front_offset_px) > 0:
+        offset = float(args.front_offset_px) * pix_world[:, None] * center_normal
+        p0_3d = p0_3d - offset
+        p1_3d = p1_3d - offset
+        center_3d = center_3d - offset
+
+    direction = p1_3d - p0_3d
+    length = np.linalg.norm(direction, axis=1)
+    valid_len = np.isfinite(length) & (length > 1e-8)
+    if not np.any(valid_len):
+        return None, {"stem": stem, "status": "empty_after_3d_length_filter", "candidate": int(ids.size)}
+    direction = direction[valid_len] / length[valid_len, None]
+
+    final_ids = kept_ids[valid_len]
+    rgb_color = np.clip(primitive["color"][final_ids], 0.0, 1.0).astype(np.float32)
+    if rgb_path is not None and rgb_path.is_file():
+        rgb_img = _load_rgb(rgb_path, size=source_size)
+        sampled = _bilinear_rgb(rgb_img, primitive["xy"][final_ids], source_size)
+        low = np.mean(np.abs(rgb_color), axis=1, keepdims=True) < 1e-5
+        rgb_color = np.where(low, sampled, rgb_color).astype(np.float32)
+
+    lifted = {
+        "p0": p0_3d[valid_len].astype(np.float32),
+        "p1": p1_3d[valid_len].astype(np.float32),
+        "center": center_3d[valid_len].astype(np.float32),
+        "direction": direction.astype(np.float32),
+        "normal": center_normal[valid_len].astype(np.float32),
+        "length": length[valid_len].astype(np.float32),
+        "source_view": np.full((int(np.count_nonzero(valid_len)),), int(view_index), dtype=np.int32),
+        "source_primitive": final_ids.astype(np.int64),
+        "source_stem_id": np.full((int(np.count_nonzero(valid_len)),), int(view_index), dtype=np.int32),
+        "source_xy": primitive["xy"][final_ids].astype(np.float32),
+        "score": primitive["score"][final_ids].astype(np.float32),
+        "weight": weight[final_ids].astype(np.float32),
+        "kind": primitive["kind"][final_ids].astype(np.int32),
+        "color": rgb_color,
+        "matched_base_index": kept_base_idx[valid_len].astype(np.int64),
+        "matched_depth": kept_depth[valid_len].astype(np.float32),
+        "matched_pixel_distance": kept_dist[valid_len].astype(np.float32),
+        "pixel_world": pix_world[valid_len].astype(np.float32),
+    }
+    info = {
+        "stem": stem,
+        "status": "ok",
+        "camera_match": cam_match,
+        "available": int(primitive["xy"].shape[0]),
+        "candidate": int(ids.size),
+        "lifted": int(lifted["p0"].shape[0]),
+        "source_size": [int(source_size[0]), int(source_size[1])],
+        "camera_index": int(cam.get("_index", view_index)),
+        "weight_mean": float(lifted["weight"].mean()),
+        "score_mean": float(lifted["score"].mean()),
+        "pixel_world_mean": float(lifted["pixel_world"].mean()),
+        "length_mean": float(lifted["length"].mean()),
+        "matched_pixel_distance_mean": float(lifted["matched_pixel_distance"].mean()),
+    }
+    return lifted, info
+
+
+class _UnionFind:
+    def __init__(self, n: int):
+        self.parent = np.arange(n, dtype=np.int64)
+        self.rank = np.zeros((n,), dtype=np.int8)
+
+    def find(self, x: int) -> int:
+        p = int(self.parent[x])
+        if p != x:
+            self.parent[x] = self.find(p)
+        return int(self.parent[x])
+
+    def union(self, a: int, b: int) -> None:
+        ra = self.find(a)
+        rb = self.find(b)
+        if ra == rb:
+            return
+        if self.rank[ra] < self.rank[rb]:
+            self.parent[ra] = rb
+        elif self.rank[ra] > self.rank[rb]:
+            self.parent[rb] = ra
+        else:
+            self.parent[rb] = ra
+            self.rank[ra] += 1
+
+
+def _line_distance(point: np.ndarray, center: np.ndarray, direction: np.ndarray) -> float:
+    delta = point - center
+    proj = float(delta @ direction)
+    residual = delta - proj * direction
+    return float(np.linalg.norm(residual))
+
+
+def _overlap_ratio(p0_a: np.ndarray, p1_a: np.ndarray, p0_b: np.ndarray, p1_b: np.ndarray, axis: np.ndarray) -> float:
+    a = np.asarray([float(p0_a @ axis), float(p1_a @ axis)], dtype=np.float32)
+    b = np.asarray([float(p0_b @ axis), float(p1_b @ axis)], dtype=np.float32)
+    amin, amax = float(a.min()), float(a.max())
+    bmin, bmax = float(b.min()), float(b.max())
+    overlap = max(0.0, min(amax, bmax) - max(amin, bmin))
+    denom = max(min(amax - amin, bmax - bmin), 1e-8)
+    return float(overlap / denom)
+
+
+def _should_merge(i: int, j: int, segments: Dict[str, np.ndarray], args: argparse.Namespace) -> bool:
+    if not bool(args.merge_same_view) and int(segments["source_view"][i]) == int(segments["source_view"][j]):
+        return False
+    di = segments["direction"][i]
+    dj = segments["direction"][j]
+    cos_angle = abs(float(di @ dj))
+    if cos_angle < math.cos(math.radians(float(args.merge_angle_deg))):
+        return False
+    ci = segments["center"][i]
+    cj = segments["center"][j]
+    radius = max(
+        float(args.merge_radius_abs),
+        float(args.merge_radius_px) * 0.5 * float(segments["pixel_world"][i] + segments["pixel_world"][j]),
+    )
+    center_dist = float(np.linalg.norm(ci - cj))
+    if center_dist > radius * 2.0:
+        return False
+    line_dist = max(
+        _line_distance(ci, cj, dj),
+        _line_distance(cj, ci, di),
+    )
+    if line_dist > radius:
+        return False
+    overlap = _overlap_ratio(segments["p0"][i], segments["p1"][i], segments["p0"][j], segments["p1"][j], di)
+    return bool(overlap >= float(args.merge_min_overlap) or center_dist <= radius)
+
+
+def _concat_segments(chunks: Sequence[Dict[str, np.ndarray]]) -> Dict[str, np.ndarray]:
+    keys = [
+        "p0",
+        "p1",
+        "center",
+        "direction",
+        "normal",
+        "length",
+        "source_view",
+        "source_primitive",
+        "source_stem_id",
+        "source_xy",
+        "score",
+        "weight",
+        "kind",
+        "color",
+        "matched_base_index",
+        "matched_depth",
+        "matched_pixel_distance",
+        "pixel_world",
+    ]
+    return {key: np.concatenate([chunk[key] for chunk in chunks], axis=0) for key in keys}
+
+
+def _limit_segments_for_merge(segments: Dict[str, np.ndarray], max_count: int) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
+    n = int(segments["p0"].shape[0])
+    if int(max_count) <= 0 or n <= int(max_count):
+        ids = np.arange(n, dtype=np.int64)
+        return segments, ids
+    rank = segments["score"] * np.clip(segments["weight"], 0.0, 1.0)
+    ids = np.argsort(rank)[::-1][: int(max_count)].astype(np.int64)
+    limited: Dict[str, np.ndarray] = {}
+    for key, value in segments.items():
+        if value.shape[:1] == (n,):
+            limited[key] = value[ids]
+        else:
+            limited[key] = value
+    return limited, ids
+
+
+def _merge_segments(segments: Dict[str, np.ndarray], args: argparse.Namespace) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
+    n = int(segments["p0"].shape[0])
+    if n == 0:
+        return _empty_tracks(), np.zeros((0,), dtype=bool)
+    uf = _UnionFind(n)
+    median_pix = float(np.median(segments["pixel_world"])) if n > 0 else 1e-3
+    cell_size = max(float(args.merge_radius_abs), float(args.merge_radius_px) * median_pix, 1e-6)
+    grid: Dict[Tuple[int, int, int], List[int]] = defaultdict(list)
+    rank = segments["score"] * np.clip(segments["weight"], 0.0, 1.0)
+    order = np.argsort(rank)[::-1]
+    centers = segments["center"]
+    for idx in order.tolist():
+        cell = tuple(np.floor(centers[idx] / cell_size).astype(np.int64).tolist())
+        for dz in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    for j in grid.get((cell[0] + dx, cell[1] + dy, cell[2] + dz), []):
+                        if _should_merge(idx, j, segments, args):
+                            uf.union(idx, j)
+        grid[cell].append(idx)
+
+    groups: Dict[int, List[int]] = defaultdict(list)
+    for i in range(n):
+        groups[uf.find(i)].append(i)
+    tracks = _aggregate_tracks(groups, segments, args)
+    keep = (tracks["segment_count"] >= int(args.min_track_segments)) & (tracks["view_count"] >= int(args.min_track_views))
+    return tracks, keep.astype(bool)
+
+
+def _empty_tracks() -> Dict[str, np.ndarray]:
+    return {
+        "p0": np.zeros((0, 3), dtype=np.float32),
+        "p1": np.zeros((0, 3), dtype=np.float32),
+        "center": np.zeros((0, 3), dtype=np.float32),
+        "direction": np.zeros((0, 3), dtype=np.float32),
+        "normal": np.zeros((0, 3), dtype=np.float32),
+        "color": np.zeros((0, 3), dtype=np.float32),
+        "score_mean": np.zeros((0,), dtype=np.float32),
+        "score_max": np.zeros((0,), dtype=np.float32),
+        "weight_mean": np.zeros((0,), dtype=np.float32),
+        "length": np.zeros((0,), dtype=np.float32),
+        "pixel_world_mean": np.zeros((0,), dtype=np.float32),
+        "segment_count": np.zeros((0,), dtype=np.int32),
+        "view_count": np.zeros((0,), dtype=np.int32),
+        "kind_geometry_count": np.zeros((0,), dtype=np.int32),
+        "kind_texture_count": np.zeros((0,), dtype=np.int32),
+        "kind_noise_count": np.zeros((0,), dtype=np.int32),
+    }
+
+
+def _aggregate_tracks(groups: Dict[int, List[int]], segments: Dict[str, np.ndarray], args: argparse.Namespace) -> Dict[str, np.ndarray]:
+    out: Dict[str, List[object]] = {key: [] for key in _empty_tracks().keys()}
+    for ids in groups.values():
+        idx = np.asarray(ids, dtype=np.int64)
+        weights = np.clip(segments["score"][idx] * segments["weight"][idx], 1e-4, None).astype(np.float32)
+        points = np.concatenate([segments["p0"][idx], segments["p1"][idx]], axis=0)
+        point_weights = np.repeat(weights, 2)
+        center = (points * point_weights[:, None]).sum(axis=0) / max(float(point_weights.sum()), 1e-8)
+        centered = points - center[None, :]
+        cov = (centered * point_weights[:, None]).T @ centered / max(float(point_weights.sum()), 1e-8)
+        vals, vecs = np.linalg.eigh(cov + np.eye(3, dtype=np.float32) * 1e-10)
+        direction = vecs[:, int(np.argmax(vals))].astype(np.float32)
+        mean_dir = (segments["direction"][idx] * weights[:, None]).sum(axis=0)
+        if float(direction @ mean_dir) < 0.0:
+            direction = -direction
+        direction = direction / max(float(np.linalg.norm(direction)), 1e-8)
+        proj = centered @ direction
+        p0 = center + float(proj.min()) * direction
+        p1 = center + float(proj.max()) * direction
+        normal = (segments["normal"][idx] * weights[:, None]).sum(axis=0)
+        normal = normal - float(normal @ direction) * direction
+        if float(np.linalg.norm(normal)) < 1e-8:
+            normal = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+            normal = normal - float(normal @ direction) * direction
+        normal = normal / max(float(np.linalg.norm(normal)), 1e-8)
+        color = (segments["color"][idx] * weights[:, None]).sum(axis=0) / max(float(weights.sum()), 1e-8)
+        kinds = segments["kind"][idx]
+        views = np.unique(segments["source_view"][idx])
+        out["p0"].append(p0.astype(np.float32))
+        out["p1"].append(p1.astype(np.float32))
+        out["center"].append(center.astype(np.float32))
+        out["direction"].append(direction.astype(np.float32))
+        out["normal"].append(normal.astype(np.float32))
+        out["color"].append(np.clip(color, 0.0, 1.0).astype(np.float32))
+        out["score_mean"].append(float(np.mean(segments["score"][idx])))
+        out["score_max"].append(float(np.max(segments["score"][idx])))
+        out["weight_mean"].append(float(np.mean(segments["weight"][idx])))
+        out["length"].append(float(np.linalg.norm(p1 - p0)))
+        out["pixel_world_mean"].append(float(np.mean(segments["pixel_world"][idx])))
+        out["segment_count"].append(int(idx.size))
+        out["view_count"].append(int(views.size))
+        out["kind_geometry_count"].append(int(np.count_nonzero(kinds == KIND_GEOMETRY)))
+        out["kind_texture_count"].append(int(np.count_nonzero(kinds == KIND_TEXTURE)))
+        out["kind_noise_count"].append(int(np.count_nonzero(kinds == KIND_NOISE)))
+    result: Dict[str, np.ndarray] = {}
+    for key, values in out.items():
+        empty = _empty_tracks()[key]
+        if not values:
+            result[key] = empty
+            continue
+        dtype = empty.dtype
+        result[key] = np.asarray(values, dtype=dtype)
+    return result
+
+
+def _write_obj(path: Path, tracks: Dict[str, np.ndarray], keep: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines: List[str] = []
+    p0 = tracks["p0"][keep]
+    p1 = tracks["p1"][keep]
+    for a, b in zip(p0, p1):
+        lines.append(f"v {float(a[0]):.8f} {float(a[1]):.8f} {float(a[2]):.8f}\n")
+        lines.append(f"v {float(b[0]):.8f} {float(b[1]):.8f} {float(b[2]):.8f}\n")
+    for i in range(p0.shape[0]):
+        lines.append(f"l {2 * i + 1} {2 * i + 2}\n")
+    path.write_text("".join(lines), encoding="utf-8")
+
+
+def _draw_segments_overlay(path: Path, size: Tuple[int, int], segments: Dict[str, np.ndarray], view_id: int, max_draw: int) -> None:
+    sw, sh = size
+    image = Image.new("RGB", (sw, sh), (0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    ids = np.flatnonzero(segments["source_view"] == int(view_id))
+    if ids.size > int(max_draw):
+        score = segments["score"][ids] * np.clip(segments["weight"][ids], 0.0, 1.0)
+        ids = ids[np.argsort(score)[::-1][: int(max_draw)]]
+    colors = {KIND_GEOMETRY: (255, 70, 25), KIND_TEXTURE: (255, 220, 40), KIND_NOISE: (70, 130, 255)}
+    for i in ids.tolist():
+        x, y = segments["source_xy"][i]
+        # This overlay shows source centers. Track projections are saved separately.
+        color = colors.get(int(segments["kind"][i]), (255, 255, 255))
+        draw.ellipse((float(x) - 1.0, float(y) - 1.0, float(x) + 1.0, float(y) + 1.0), fill=color)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(path)
+
+
+def _draw_track_projection(
+    path: Path,
+    size: Tuple[int, int],
+    cam: Dict[str, object],
+    tracks: Dict[str, np.ndarray],
+    keep: np.ndarray,
+    max_draw: int,
+    strong_min_views: int,
+) -> None:
+    sw, sh = size
+    image = Image.new("RGB", (sw, sh), (0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    ids = np.flatnonzero(keep)
+    if ids.size > int(max_draw):
+        rank = tracks["score_max"][ids] * np.maximum(tracks["view_count"][ids], 1)
+        ids = ids[np.argsort(rank)[::-1][: int(max_draw)]]
+    p0_xy, p0_depth = _project_points_to_source(tracks["p0"][ids], cam, size)
+    p1_xy, p1_depth = _project_points_to_source(tracks["p1"][ids], cam, size)
+    for local, tid in enumerate(ids.tolist()):
+        if p0_depth[local] <= 0 or p1_depth[local] <= 0:
+            continue
+        x0, y0 = p0_xy[local]
+        x1, y1 = p1_xy[local]
+        if max(x0, x1) < 0 or max(y0, y1) < 0 or min(x0, x1) >= sw or min(y0, y1) >= sh:
+            continue
+        if int(tracks["view_count"][tid]) >= int(strong_min_views):
+            color = (80, 255, 120)
+        else:
+            color = (255, 210, 50)
+        draw.line((float(x0), float(y0), float(x1), float(y1)), fill=color, width=1)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(path)
+
+
+def _mean(values: np.ndarray) -> float:
+    return float(values.mean()) if values.size else float("nan")
+
+
+def main() -> None:
+    args = _parse_args()
+    base_model_dir = Path(args.base_model_dir).expanduser().resolve()
+    primitive_dir = Path(args.primitive_dir).expanduser().resolve()
+    output_root = Path(args.output_root).expanduser().resolve()
+    weight_dir = Path(args.weight_dir).expanduser().resolve() if str(args.weight_dir) else None
+    rgb_dir = Path(args.rgb_dir).expanduser().resolve() if str(args.rgb_dir) else None
+
+    if output_root.exists() and any(output_root.iterdir()) and not bool(args.overwrite):
+        raise FileExistsError(f"Output root is not empty; use --overwrite: {output_root}")
+    if output_root.exists() and bool(args.overwrite):
+        shutil.rmtree(output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    base_ply = base_model_dir / "point_cloud" / f"iteration_{int(args.base_iteration)}" / "point_cloud.ply"
+    if not base_ply.is_file():
+        raise FileNotFoundError(f"Base PLY not found: {base_ply}")
+    primitive_paths = _list_files(primitive_dir, [".npz"])
+    if int(args.limit) > 0:
+        primitive_paths = primitive_paths[: int(args.limit)]
+    if not primitive_paths:
+        raise RuntimeError(f"No primitive files found in {primitive_dir}")
+    rgb_paths = _list_files(rgb_dir, IMAGE_EXTS) if rgb_dir is not None and rgb_dir.is_dir() else []
+    rgb_lookup = _lookup(rgb_paths)
+    weight_paths = _list_files(weight_dir, IMAGE_EXTS) if weight_dir is not None and weight_dir.is_dir() else []
+    weight_lookup = _lookup(weight_paths)
+    cameras = _load_cameras(base_model_dir)
+    _base_vertices, base_xyz, base_opacity, _base_rgb = _load_base_vertices(base_ply)
+
+    chunks: List[Dict[str, np.ndarray]] = []
+    per_view: List[Dict[str, object]] = []
+    stems: List[str] = []
+    source_sizes: List[Tuple[int, int]] = []
+    for view_index, primitive_path in enumerate(tqdm(primitive_paths, desc="lift SR-HF curves")):
+        lifted, info = _lift_view_segments(
+            primitive_path,
+            view_index,
+            args,
+            cameras,
+            base_xyz,
+            base_opacity,
+            rgb_paths,
+            rgb_lookup,
+            weight_paths,
+            weight_lookup,
+        )
+        per_view.append(info)
+        stems.append(primitive_path.stem)
+        if "source_size" in info:
+            source_sizes.append((int(info["source_size"][0]), int(info["source_size"][1])))
+        else:
+            source_sizes.append((1, 1))
+        if lifted is None:
+            print(f"[sr-hf-curve-tracks-v0] skip {view_index + 1}/{len(primitive_paths)} {primitive_path.stem}: {info['status']}")
+            continue
+        chunks.append(lifted)
+        print(
+            f"[sr-hf-curve-tracks-v0] {view_index + 1}/{len(primitive_paths)} {primitive_path.stem} "
+            f"lifted={lifted['p0'].shape[0]}"
+        )
+    if not chunks:
+        raise RuntimeError("No SR-HF segments were lifted.")
+
+    segments_all = _concat_segments(chunks)
+    segments_merge, merge_source_ids = _limit_segments_for_merge(segments_all, int(args.max_segments_for_merge))
+    tracks, keep = _merge_segments(segments_merge, args)
+    strong = keep & (tracks["view_count"] >= int(args.strong_track_min_views))
+
+    np.savez_compressed(output_root / "segments_all_v0.npz", **segments_all)
+    np.savez_compressed(output_root / "segments_for_merge_v0.npz", **segments_merge, source_segment_ids=merge_source_ids)
+    np.savez_compressed(output_root / "sr_hf_curve_tracks_v0.npz", **tracks, keep=keep, strong=strong)
+    _write_obj(output_root / "tracks_keep_v0.obj", tracks, keep)
+    _write_obj(output_root / "tracks_strong_v0.obj", tracks, strong)
+
+    dirs = {
+        "segment_overlay": output_root / "segment_overlay",
+        "track_projection": output_root / "track_projection",
+    }
+    for directory in dirs.values():
+        directory.mkdir(parents=True, exist_ok=True)
+    for view_index, stem in enumerate(stems[: int(args.debug_limit)]):
+        cam, _cam_match = _camera_for_view(cameras, stem, view_index, str(args.match_policy))
+        if cam is None:
+            continue
+        size = source_sizes[view_index]
+        _draw_segments_overlay(
+            dirs["segment_overlay"] / f"{stem}.png",
+            size,
+            segments_all,
+            view_index,
+            int(args.max_draw_segments),
+        )
+        _draw_track_projection(
+            dirs["track_projection"] / f"{stem}.png",
+            size,
+            cam,
+            tracks,
+            keep,
+            int(args.max_draw_segments),
+            int(args.strong_track_min_views),
+        )
+
+    summary = {
+        "version": "build_sr_hf_curve_tracks_v0",
+        "base_model_dir": str(base_model_dir),
+        "base_iteration": int(args.base_iteration),
+        "base_ply": str(base_ply),
+        "primitive_dir": str(primitive_dir),
+        "weight_dir": "" if weight_dir is None else str(weight_dir),
+        "rgb_dir": "" if rgb_dir is None else str(rgb_dir),
+        "output_root": str(output_root),
+        "num_views": len(primitive_paths),
+        "stems": stems,
+        "per_view": per_view,
+        "params": {
+            "keep_kinds": str(args.keep_kinds),
+            "max_primitives_per_view": int(args.max_primitives_per_view),
+            "min_score": float(args.min_score),
+            "min_weight": float(args.min_weight),
+            "search_radius_px": int(args.search_radius_px),
+            "endpoint_search_radius_px": int(args.endpoint_search_radius_px),
+            "require_endpoint_match": bool(args.require_endpoint_match),
+            "segment_length_scale": float(args.segment_length_scale),
+            "max_segments_for_merge": int(args.max_segments_for_merge),
+            "merge_radius_px": float(args.merge_radius_px),
+            "merge_radius_abs": float(args.merge_radius_abs),
+            "merge_angle_deg": float(args.merge_angle_deg),
+            "merge_min_overlap": float(args.merge_min_overlap),
+            "merge_same_view": bool(args.merge_same_view),
+            "min_track_segments": int(args.min_track_segments),
+            "min_track_views": int(args.min_track_views),
+            "strong_track_min_views": int(args.strong_track_min_views),
+        },
+        "counts": {
+            "segments_all": int(segments_all["p0"].shape[0]),
+            "segments_for_merge": int(segments_merge["p0"].shape[0]),
+            "tracks_all": int(tracks["p0"].shape[0]),
+            "tracks_keep": int(np.count_nonzero(keep)),
+            "tracks_strong": int(np.count_nonzero(strong)),
+        },
+        "stats": {
+            "segment_score_mean": _mean(segments_all["score"]),
+            "segment_weight_mean": _mean(segments_all["weight"]),
+            "segment_length_mean": _mean(segments_all["length"]),
+            "track_view_count_mean": _mean(tracks["view_count"].astype(np.float32)),
+            "track_segment_count_mean": _mean(tracks["segment_count"].astype(np.float32)),
+            "track_length_mean": _mean(tracks["length"]),
+            "keep_view_count_mean": _mean(tracks["view_count"][keep].astype(np.float32)),
+            "strong_view_count_mean": _mean(tracks["view_count"][strong].astype(np.float32)),
+        },
+        "outputs": {
+            "segments_all": str(output_root / "segments_all_v0.npz"),
+            "segments_for_merge": str(output_root / "segments_for_merge_v0.npz"),
+            "tracks": str(output_root / "sr_hf_curve_tracks_v0.npz"),
+            "tracks_keep_obj": str(output_root / "tracks_keep_v0.obj"),
+            "tracks_strong_obj": str(output_root / "tracks_strong_v0.obj"),
+            "segment_overlay": str(dirs["segment_overlay"]),
+            "track_projection": str(dirs["track_projection"]),
+        },
+    }
+    (output_root / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(json.dumps({"counts": summary["counts"], "stats": summary["stats"]}, indent=2))
+    print(f"[sr-hf-curve-tracks-v0] summary: {output_root / 'summary.json'}")
+    print(f"[sr-hf-curve-tracks-v0] tracks : {output_root / 'sr_hf_curve_tracks_v0.npz'}")
+    print(f"[sr-hf-curve-tracks-v0] inspect: {dirs['track_projection']}")
+
+
+if __name__ == "__main__":
+    main()
