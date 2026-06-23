@@ -351,10 +351,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--merge_angle_deg", type=float, default=18.0)
     parser.add_argument("--merge_min_overlap", type=float, default=0.05)
     parser.add_argument("--merge_same_view", action="store_true")
-    parser.add_argument("--track_build_mode", default="source_segments", choices=["source_segments", "merge"])
+    parser.add_argument("--layer_bin_radius_px", type=float, default=8.0)
+    parser.add_argument("--layer_bin_radius_abs", type=float, default=0.008)
+    parser.add_argument("--layer_dir_bins", type=int, default=8)
+    parser.add_argument("--layer_include_kind", action="store_true")
+    parser.add_argument("--track_build_mode", default="source_segments", choices=["source_segments", "merge", "layer_bins"])
     parser.add_argument("--min_track_segments", type=int, default=2)
     parser.add_argument("--min_track_views", type=int, default=1)
     parser.add_argument("--strong_track_min_views", type=int, default=2)
+    parser.add_argument("--track_min_dir_consistency", type=float, default=0.0)
+    parser.add_argument("--track_max_line_residual_px", type=float, default=0.0)
     parser.add_argument("--debug_limit", type=int, default=8)
     parser.add_argument("--max_draw_segments", type=int, default=32768)
     return parser.parse_args()
@@ -1227,7 +1233,43 @@ def _merge_segments(segments: Dict[str, np.ndarray], args: argparse.Namespace) -
     for i in range(n):
         groups[uf.find(i)].append(i)
     tracks = _aggregate_tracks(groups, segments, args)
-    keep = (tracks["segment_count"] >= int(args.min_track_segments)) & (tracks["view_count"] >= int(args.min_track_views))
+    keep = _track_keep_mask(tracks, args)
+    return tracks, keep.astype(bool)
+
+
+def _canonical_direction_key(direction: np.ndarray, bins: int) -> Tuple[int, int, int]:
+    d = np.asarray(direction, dtype=np.float32)
+    d = d / max(float(np.linalg.norm(d)), 1e-8)
+    for value in d.tolist():
+        if abs(float(value)) > 1e-6:
+            if float(value) < 0.0:
+                d = -d
+            break
+    q = np.round(d * max(int(bins), 1)).astype(np.int32)
+    return int(q[0]), int(q[1]), int(q[2])
+
+
+def _layer_bin_key(i: int, segments: Dict[str, np.ndarray], cell_size: float, args: argparse.Namespace) -> Tuple[Tuple[int, int, int], Tuple[int, int, int], int]:
+    cell = tuple(np.floor(segments["center"][i] / max(float(cell_size), 1e-8)).astype(np.int64).tolist())
+    direction = _canonical_direction_key(segments["direction"][i], int(args.layer_dir_bins))
+    kind = int(segments["kind"][i]) if bool(args.layer_include_kind) else 0
+    return (int(cell[0]), int(cell[1]), int(cell[2])), direction, kind
+
+
+def _aggregate_layer_bins(segments: Dict[str, np.ndarray], args: argparse.Namespace) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
+    n = int(segments["p0"].shape[0])
+    if n == 0:
+        return _empty_tracks(), np.zeros((0,), dtype=bool)
+    median_pix = float(np.median(segments["pixel_world"])) if n > 0 else 1e-3
+    cell_size = max(float(args.layer_bin_radius_abs), float(args.layer_bin_radius_px) * median_pix, 1e-6)
+    rank = segments["score"] * np.clip(segments["weight"], 0.0, 1.0)
+    order = np.argsort(rank)[::-1]
+    groups_by_key: Dict[Tuple[Tuple[int, int, int], Tuple[int, int, int], int], List[int]] = defaultdict(list)
+    for idx in order.tolist():
+        groups_by_key[_layer_bin_key(idx, segments, cell_size, args)].append(idx)
+    groups = {group_id: ids for group_id, ids in enumerate(groups_by_key.values())}
+    tracks = _aggregate_tracks(groups, segments, args)
+    keep = _track_keep_mask(tracks, args)
     return tracks, keep.astype(bool)
 
 
@@ -1254,14 +1296,11 @@ def _tracks_from_source_segments(segments: Dict[str, np.ndarray], args: argparse
     tracks["kind_geometry_count"] = (segments["kind"] == KIND_GEOMETRY).astype(np.int32)
     tracks["kind_texture_count"] = (segments["kind"] == KIND_TEXTURE).astype(np.int32)
     tracks["kind_noise_count"] = (segments["kind"] == KIND_NOISE).astype(np.int32)
-    keep = (
-        np.isfinite(tracks["length"])
-        & (tracks["length"] > 1e-8)
-        & np.isfinite(tracks["score_max"])
-        & (tracks["score_max"] >= float(args.min_score))
-        & np.isfinite(tracks["weight_mean"])
-        & (tracks["weight_mean"] >= float(args.min_weight))
-    )
+    tracks["dir_consistency"] = np.ones((n,), dtype=np.float32)
+    tracks["line_residual"] = np.zeros((n,), dtype=np.float32)
+    tracks["line_residual_px"] = np.zeros((n,), dtype=np.float32)
+    tracks["support_view_ratio"] = np.ones((n,), dtype=np.float32)
+    keep = _track_keep_mask(tracks, args)
     return tracks, keep.astype(bool)
 
 
@@ -1285,7 +1324,31 @@ def _empty_tracks() -> Dict[str, np.ndarray]:
         "kind_geometry_count": np.zeros((0,), dtype=np.int32),
         "kind_texture_count": np.zeros((0,), dtype=np.int32),
         "kind_noise_count": np.zeros((0,), dtype=np.int32),
+        "dir_consistency": np.zeros((0,), dtype=np.float32),
+        "line_residual": np.zeros((0,), dtype=np.float32),
+        "line_residual_px": np.zeros((0,), dtype=np.float32),
+        "support_view_ratio": np.zeros((0,), dtype=np.float32),
     }
+
+
+def _track_keep_mask(tracks: Dict[str, np.ndarray], args: argparse.Namespace) -> np.ndarray:
+    keep = (
+        (tracks["segment_count"] >= int(args.min_track_segments))
+        & (tracks["view_count"] >= int(args.min_track_views))
+        & np.isfinite(tracks["length"])
+        & (tracks["length"] > 1e-8)
+        & np.isfinite(tracks["score_max"])
+        & (tracks["score_max"] >= float(args.min_score))
+        & np.isfinite(tracks["weight_mean"])
+        & (tracks["weight_mean"] >= float(args.min_weight))
+    )
+    min_dir = float(args.track_min_dir_consistency)
+    if min_dir > 0.0 and "dir_consistency" in tracks:
+        keep &= np.isfinite(tracks["dir_consistency"]) & (tracks["dir_consistency"] >= min_dir)
+    max_res_px = float(args.track_max_line_residual_px)
+    if max_res_px > 0.0 and "line_residual_px" in tracks:
+        keep &= np.isfinite(tracks["line_residual_px"]) & (tracks["line_residual_px"] <= max_res_px)
+    return keep.astype(bool)
 
 
 def _aggregate_tracks(groups: Dict[int, List[int]], segments: Dict[str, np.ndarray], args: argparse.Namespace) -> Dict[str, np.ndarray]:
@@ -1307,6 +1370,11 @@ def _aggregate_tracks(groups: Dict[int, List[int]], segments: Dict[str, np.ndarr
         proj = centered @ direction
         p0 = center + float(proj.min()) * direction
         p1 = center + float(proj.max()) * direction
+        residual = centered - proj[:, None] * direction[None, :]
+        line_residual = float(np.average(np.linalg.norm(residual, axis=1), weights=point_weights))
+        line_residual_px = line_residual / max(float(np.mean(segments["pixel_world"][idx])), 1e-8)
+        dir_alignment = np.abs(segments["direction"][idx] @ direction)
+        dir_consistency = float(np.average(dir_alignment, weights=weights))
         normal = (segments["normal"][idx] * weights[:, None]).sum(axis=0)
         normal = normal - float(normal @ direction) * direction
         if float(np.linalg.norm(normal)) < 1e-8:
@@ -1334,6 +1402,10 @@ def _aggregate_tracks(groups: Dict[int, List[int]], segments: Dict[str, np.ndarr
         out["kind_geometry_count"].append(int(np.count_nonzero(kinds == KIND_GEOMETRY)))
         out["kind_texture_count"].append(int(np.count_nonzero(kinds == KIND_TEXTURE)))
         out["kind_noise_count"].append(int(np.count_nonzero(kinds == KIND_NOISE)))
+        out["dir_consistency"].append(dir_consistency)
+        out["line_residual"].append(line_residual)
+        out["line_residual_px"].append(line_residual_px)
+        out["support_view_ratio"].append(float(views.size) / max(float(idx.size), 1.0))
     result: Dict[str, np.ndarray] = {}
     for key, values in out.items():
         empty = _empty_tracks()[key]
@@ -1492,8 +1564,12 @@ def main() -> None:
     segments_merge, merge_source_ids = _limit_segments_for_merge(segments_all, int(args.max_segments_for_merge))
     if str(args.track_build_mode) == "source_segments":
         tracks, keep = _tracks_from_source_segments(segments_merge, args)
-    else:
+    elif str(args.track_build_mode) == "merge":
         tracks, keep = _merge_segments(segments_merge, args)
+    elif str(args.track_build_mode) == "layer_bins":
+        tracks, keep = _aggregate_layer_bins(segments_merge, args)
+    else:
+        raise ValueError(f"Unsupported track_build_mode: {args.track_build_mode}")
     strong = keep & (tracks["view_count"] >= int(args.strong_track_min_views))
 
     np.savez_compressed(output_root / "segments_all_v0.npz", **segments_all)
@@ -1558,6 +1634,10 @@ def main() -> None:
             "merge_angle_deg": float(args.merge_angle_deg),
             "merge_min_overlap": float(args.merge_min_overlap),
             "merge_same_view": bool(args.merge_same_view),
+            "layer_bin_radius_px": float(args.layer_bin_radius_px),
+            "layer_bin_radius_abs": float(args.layer_bin_radius_abs),
+            "layer_dir_bins": int(args.layer_dir_bins),
+            "layer_include_kind": bool(args.layer_include_kind),
             "curve_source": str(args.curve_source),
             "curve_image_mode": str(args.curve_image_mode),
             "curve_highpass_blur_radius": float(args.curve_highpass_blur_radius),
@@ -1582,6 +1662,8 @@ def main() -> None:
             "min_track_segments": int(args.min_track_segments),
             "min_track_views": int(args.min_track_views),
             "strong_track_min_views": int(args.strong_track_min_views),
+            "track_min_dir_consistency": float(args.track_min_dir_consistency),
+            "track_max_line_residual_px": float(args.track_max_line_residual_px),
         },
         "counts": {
             "segments_all": int(segments_all["p0"].shape[0]),
@@ -1599,6 +1681,9 @@ def main() -> None:
             "track_segment_count_mean": _mean(tracks["segment_count"].astype(np.float32)),
             "track_length_mean": _mean(tracks["length"]),
             "track_width_px_mean": _mean(tracks["width_px_mean"]),
+            "track_dir_consistency_mean": _mean(tracks["dir_consistency"]),
+            "track_line_residual_px_mean": _mean(tracks["line_residual_px"]),
+            "track_support_view_ratio_mean": _mean(tracks["support_view_ratio"]),
             "keep_view_count_mean": _mean(tracks["view_count"][keep].astype(np.float32)),
             "strong_view_count_mean": _mean(tracks["view_count"][strong].astype(np.float32)),
         },

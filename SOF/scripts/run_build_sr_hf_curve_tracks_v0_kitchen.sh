@@ -81,10 +81,16 @@ MERGE_RADIUS_ABS="${MERGE_RADIUS_ABS:-0.006}"
 MERGE_ANGLE_DEG="${MERGE_ANGLE_DEG:-18.0}"
 MERGE_MIN_OVERLAP="${MERGE_MIN_OVERLAP:-0.05}"
 MERGE_SAME_VIEW="${MERGE_SAME_VIEW:-1}"
-TRACK_BUILD_MODE="${TRACK_BUILD_MODE:-source_segments}"
-MIN_TRACK_SEGMENTS="${MIN_TRACK_SEGMENTS:-2}"
+LAYER_BIN_RADIUS_PX="${LAYER_BIN_RADIUS_PX:-8.0}"
+LAYER_BIN_RADIUS_ABS="${LAYER_BIN_RADIUS_ABS:-0.008}"
+LAYER_DIR_BINS="${LAYER_DIR_BINS:-8}"
+LAYER_INCLUDE_KIND="${LAYER_INCLUDE_KIND:-0}"
+TRACK_BUILD_MODE="${TRACK_BUILD_MODE:-layer_bins}"
+MIN_TRACK_SEGMENTS="${MIN_TRACK_SEGMENTS:-1}"
 MIN_TRACK_VIEWS="${MIN_TRACK_VIEWS:-1}"
 STRONG_TRACK_MIN_VIEWS="${STRONG_TRACK_MIN_VIEWS:-2}"
+TRACK_MIN_DIR_CONSISTENCY="${TRACK_MIN_DIR_CONSISTENCY:-0.15}"
+TRACK_MAX_LINE_RESIDUAL_PX="${TRACK_MAX_LINE_RESIDUAL_PX:-10.0}"
 DEBUG_LIMIT="${DEBUG_LIMIT:-8}"
 MAX_DRAW_SEGMENTS="${MAX_DRAW_SEGMENTS:-32768}"
 
@@ -148,10 +154,15 @@ ARGS=(
   --merge_radius_abs "${MERGE_RADIUS_ABS}"
   --merge_angle_deg "${MERGE_ANGLE_DEG}"
   --merge_min_overlap "${MERGE_MIN_OVERLAP}"
+  --layer_bin_radius_px "${LAYER_BIN_RADIUS_PX}"
+  --layer_bin_radius_abs "${LAYER_BIN_RADIUS_ABS}"
+  --layer_dir_bins "${LAYER_DIR_BINS}"
   --track_build_mode "${TRACK_BUILD_MODE}"
   --min_track_segments "${MIN_TRACK_SEGMENTS}"
   --min_track_views "${MIN_TRACK_VIEWS}"
   --strong_track_min_views "${STRONG_TRACK_MIN_VIEWS}"
+  --track_min_dir_consistency "${TRACK_MIN_DIR_CONSISTENCY}"
+  --track_max_line_residual_px "${TRACK_MAX_LINE_RESIDUAL_PX}"
   --debug_limit "${DEBUG_LIMIT}"
   --max_draw_segments "${MAX_DRAW_SEGMENTS}"
 )
@@ -177,6 +188,9 @@ fi
 if [[ "${MERGE_SAME_VIEW}" == "1" ]]; then
   ARGS+=(--merge_same_view)
 fi
+if [[ "${LAYER_INCLUDE_KIND}" == "1" ]]; then
+  ARGS+=(--layer_include_kind)
+fi
 
 echo "[sr-hf-curve-tracks-v0] base      : ${BASE_MODEL_DIR}"
 echo "[sr-hf-curve-tracks-v0] primitives: ${PRIMITIVE_DIR}"
@@ -189,6 +203,7 @@ echo "[sr-hf-curve-tracks-v0] source    : ${CURVE_SOURCE} track_mode=${TRACK_BUI
 echo "[sr-hf-curve-tracks-v0] dense     : enable=${DENSE_STROKE_ENABLE} grid=${DENSE_STROKE_GRID_PX}px max=${DENSE_STROKE_MAX_PER_VIEW}"
 echo "[sr-hf-curve-tracks-v0] width     : enable=${PROFILE_WIDTH_ENABLE} radius=${PROFILE_WIDTH_RADIUS_PX}px falloff=${PROFILE_WIDTH_FALLOFF}"
 echo "[sr-hf-curve-tracks-v0] merge     : radius=${MERGE_RADIUS_PX}px/${MERGE_RADIUS_ABS} angle=${MERGE_ANGLE_DEG} same_view=${MERGE_SAME_VIEW}"
+echo "[sr-hf-curve-tracks-v0] layer     : radius=${LAYER_BIN_RADIUS_PX}px/${LAYER_BIN_RADIUS_ABS} dir_bins=${LAYER_DIR_BINS} include_kind=${LAYER_INCLUDE_KIND}"
 
 "${PYTHON_BIN}" "${SOF_ROOT}/scripts/build_sr_hf_curve_tracks_v0.py" "${ARGS[@]}"
 
