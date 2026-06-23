@@ -24,7 +24,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--track_payload", required=True)
     parser.add_argument("--output_model_dir", required=True)
     parser.add_argument("--newborn_model_dir", default="")
-    parser.add_argument("--selection", default="keep", choices=["keep", "strong", "all"])
+    parser.add_argument("--selection", default="keep", choices=["keep", "strong", "survive", "probation", "suppress", "all"])
     parser.add_argument("--fallback_to_keep", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--max_tracks", type=int, default=0)

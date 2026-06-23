@@ -355,7 +355,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--layer_bin_radius_abs", type=float, default=0.008)
     parser.add_argument("--layer_dir_bins", type=int, default=8)
     parser.add_argument("--layer_include_kind", action="store_true")
-    parser.add_argument("--track_build_mode", default="source_segments", choices=["source_segments", "merge", "layer_bins"])
+    parser.add_argument("--candidate_radius_px", type=float, default=6.0)
+    parser.add_argument("--candidate_radius_abs", type=float, default=0.006)
+    parser.add_argument("--candidate_reproj_radius_px", type=float, default=5.0)
+    parser.add_argument("--candidate_dir_angle_deg", type=float, default=25.0)
+    parser.add_argument("--candidate_normal_angle_deg", type=float, default=60.0)
+    parser.add_argument("--candidate_depth_delta_px", type=float, default=12.0)
+    parser.add_argument("--candidate_min_survive_views", type=int, default=2)
+    parser.add_argument("--candidate_probation_min_source_strength", type=float, default=0.04)
+    parser.add_argument("--candidate_probation_max_line_residual_px", type=float, default=8.0)
+    parser.add_argument("--candidate_keep_probation", action="store_true")
+    parser.add_argument("--track_build_mode", default="source_segments", choices=["source_segments", "merge", "layer_bins", "candidate_graph"])
     parser.add_argument("--min_track_segments", type=int, default=2)
     parser.add_argument("--min_track_views", type=int, default=1)
     parser.add_argument("--strong_track_min_views", type=int, default=2)
@@ -1273,6 +1283,156 @@ def _aggregate_layer_bins(segments: Dict[str, np.ndarray], args: argparse.Namesp
     return tracks, keep.astype(bool)
 
 
+def _source_segment_direction(segments: Dict[str, np.ndarray], ids: np.ndarray) -> np.ndarray:
+    direction = segments["source_p1"][ids].astype(np.float32) - segments["source_p0"][ids].astype(np.float32)
+    return direction / np.maximum(np.linalg.norm(direction, axis=1, keepdims=True), 1e-8)
+
+
+def _candidate_reprojection_pass(
+    i: int,
+    j: int,
+    segments: Dict[str, np.ndarray],
+    view_cameras: Sequence[Optional[Dict[str, object]]],
+    source_sizes: Sequence[Tuple[int, int]],
+    args: argparse.Namespace,
+) -> Tuple[bool, float, float]:
+    view_j = int(segments["source_view"][j])
+    if view_j < 0 or view_j >= len(view_cameras):
+        return False, float("inf"), 0.0
+    cam_j = view_cameras[view_j]
+    if cam_j is None:
+        return False, float("inf"), 0.0
+    size_j = source_sizes[view_j]
+    points = np.stack([segments["center"][i], segments["p0"][i], segments["p1"][i]], axis=0).astype(np.float32)
+    xy, depth = _project_points_to_source(points, cam_j, size_j)
+    sw, sh = size_j
+    if (
+        not np.isfinite(xy).all()
+        or not np.isfinite(depth).all()
+        or float(depth[0]) <= float(args.depth_min)
+        or float(xy[0, 0]) < 0.0
+        or float(xy[0, 1]) < 0.0
+        or float(xy[0, 0]) > float(sw - 1)
+        or float(xy[0, 1]) > float(sh - 1)
+    ):
+        return False, float("inf"), 0.0
+    reproj_error = float(np.linalg.norm(xy[0] - segments["source_xy"][j]))
+    if reproj_error > float(args.candidate_reproj_radius_px):
+        return False, reproj_error, 0.0
+    if float(args.candidate_depth_delta_px) > 0.0:
+        depth_tol = float(args.candidate_depth_delta_px) * max(float(segments["pixel_world"][j]), 1e-8)
+        if abs(float(depth[0]) - float(segments["matched_depth"][j])) > depth_tol:
+            return False, reproj_error, 0.0
+    projected_dir = xy[2] - xy[1]
+    projected_dir = projected_dir / max(float(np.linalg.norm(projected_dir)), 1e-8)
+    target_dir = segments["source_p1"][j] - segments["source_p0"][j]
+    target_dir = target_dir / max(float(np.linalg.norm(target_dir)), 1e-8)
+    dir_score = abs(float(projected_dir @ target_dir))
+    if dir_score < math.cos(math.radians(float(args.candidate_dir_angle_deg))):
+        return False, reproj_error, dir_score
+    return True, reproj_error, dir_score
+
+
+def _candidate_graph_tracks(
+    segments: Dict[str, np.ndarray],
+    view_cameras: Sequence[Optional[Dict[str, object]]],
+    source_sizes: Sequence[Tuple[int, int]],
+    args: argparse.Namespace,
+) -> Tuple[Dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    n = int(segments["p0"].shape[0])
+    if n == 0:
+        empty = _empty_tracks()
+        z = np.zeros((0,), dtype=bool)
+        return empty, z, z, z, z
+    tracks, _ = _tracks_from_source_segments(segments, args)
+    median_pix = float(np.median(segments["pixel_world"])) if n > 0 else 1e-3
+    cell_size = max(float(args.candidate_radius_abs), float(args.candidate_radius_px) * median_pix, 1e-6)
+    grid: Dict[Tuple[int, int, int], List[int]] = defaultdict(list)
+    centers = segments["center"]
+    for idx in range(n):
+        cell = tuple(np.floor(centers[idx] / cell_size).astype(np.int64).tolist())
+        grid[(int(cell[0]), int(cell[1]), int(cell[2]))].append(idx)
+
+    cos_dir = math.cos(math.radians(float(args.candidate_dir_angle_deg)))
+    cos_normal = math.cos(math.radians(float(args.candidate_normal_angle_deg)))
+    source_strength = (segments["score"] * np.clip(segments["weight"], 0.0, 1.0)).astype(np.float32)
+    support_count = np.ones((n,), dtype=np.int32)
+    support_views: List[set[int]] = [set([int(v)]) for v in segments["source_view"].tolist()]
+    support_score_sum = source_strength.astype(np.float64).copy()
+    reproj_error_sum = np.zeros((n,), dtype=np.float64)
+    reproj_dir_sum = np.zeros((n,), dtype=np.float64)
+    reproj_count = np.zeros((n,), dtype=np.int32)
+    dir_sum = np.ones((n,), dtype=np.float64)
+    residual_sum = np.zeros((n,), dtype=np.float64)
+    weighted_color = (segments["color"] * source_strength[:, None]).astype(np.float64)
+    weight_sum = source_strength.astype(np.float64).copy()
+    rank = np.argsort(source_strength)[::-1]
+    for i in rank.tolist():
+        cell = tuple(np.floor(centers[i] / cell_size).astype(np.int64).tolist())
+        radius_i = max(float(args.candidate_radius_abs), float(args.candidate_radius_px) * float(segments["pixel_world"][i]))
+        for dz in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    for j in grid.get((int(cell[0] + dx), int(cell[1] + dy), int(cell[2] + dz)), []):
+                        if i == j or int(segments["source_view"][i]) == int(segments["source_view"][j]):
+                            continue
+                        radius = max(radius_i, float(args.candidate_radius_abs), float(args.candidate_radius_px) * float(segments["pixel_world"][j]))
+                        center_dist = float(np.linalg.norm(segments["center"][i] - segments["center"][j]))
+                        if center_dist > radius:
+                            continue
+                        dir_score_3d = abs(float(segments["direction"][i] @ segments["direction"][j]))
+                        if dir_score_3d < cos_dir:
+                            continue
+                        normal_score = abs(float(segments["normal"][i] @ segments["normal"][j]))
+                        if normal_score < cos_normal:
+                            continue
+                        ok, reproj_error, dir_score_2d = _candidate_reprojection_pass(i, j, segments, view_cameras, source_sizes, args)
+                        if not ok:
+                            continue
+                        score_j = float(source_strength[j])
+                        support_count[i] += 1
+                        support_views[i].add(int(segments["source_view"][j]))
+                        support_score_sum[i] += score_j
+                        reproj_error_sum[i] += reproj_error
+                        reproj_dir_sum[i] += dir_score_2d
+                        reproj_count[i] += 1
+                        dir_sum[i] += dir_score_3d
+                        residual_sum[i] += _line_distance(segments["center"][j], segments["center"][i], segments["direction"][i])
+                        weighted_color[i] += segments["color"][j].astype(np.float64) * score_j
+                        weight_sum[i] += score_j
+
+    tracks["segment_count"] = support_count.astype(np.int32)
+    tracks["view_count"] = np.asarray([len(v) for v in support_views], dtype=np.int32)
+    tracks["score_mean"] = (support_score_sum / np.maximum(support_count.astype(np.float64), 1.0)).astype(np.float32)
+    tracks["score_max"] = np.maximum(tracks["score_max"], tracks["score_mean"]).astype(np.float32)
+    tracks["weight_mean"] = np.maximum(tracks["weight_mean"], np.clip(tracks["score_mean"], 0.0, 1.0)).astype(np.float32)
+    tracks["color"] = np.clip(weighted_color / np.maximum(weight_sum[:, None], 1e-8), 0.0, 1.0).astype(np.float32)
+    tracks["source_strength"] = source_strength.astype(np.float32)
+    tracks["neighbor_support_score"] = (
+        (support_score_sum - source_strength.astype(np.float64)) / np.maximum(support_count.astype(np.float64) - 1.0, 1.0)
+    ).astype(np.float32)
+    tracks["reproject_error_px"] = (reproj_error_sum / np.maximum(reproj_count.astype(np.float64), 1.0)).astype(np.float32)
+    tracks["reproject_dir_consistency"] = (reproj_dir_sum / np.maximum(reproj_count.astype(np.float64), 1.0)).astype(np.float32)
+    tracks["dir_consistency"] = (dir_sum / np.maximum(support_count.astype(np.float64), 1.0)).astype(np.float32)
+    tracks["line_residual"] = (residual_sum / np.maximum(support_count.astype(np.float64) - 1.0, 1.0)).astype(np.float32)
+    tracks["line_residual_px"] = tracks["line_residual"] / np.maximum(tracks["pixel_world_mean"], 1e-8)
+    tracks["support_view_ratio"] = tracks["view_count"].astype(np.float32) / np.maximum(tracks["segment_count"].astype(np.float32), 1.0)
+    base_keep = _track_keep_mask(tracks, args)
+    survive = base_keep & (tracks["view_count"] >= int(args.candidate_min_survive_views))
+    probation = (
+        base_keep
+        & ~survive
+        & (tracks["source_strength"] >= float(args.candidate_probation_min_source_strength))
+        & (tracks["line_residual_px"] <= float(args.candidate_probation_max_line_residual_px))
+    )
+    if not bool(args.candidate_keep_probation):
+        keep = survive
+    else:
+        keep = survive | probation
+    suppress = ~(survive | probation)
+    return tracks, keep.astype(bool), survive.astype(bool), probation.astype(bool), suppress.astype(bool)
+
+
 def _tracks_from_source_segments(segments: Dict[str, np.ndarray], args: argparse.Namespace) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
     n = int(segments["p0"].shape[0])
     if n == 0:
@@ -1296,6 +1456,10 @@ def _tracks_from_source_segments(segments: Dict[str, np.ndarray], args: argparse
     tracks["kind_geometry_count"] = (segments["kind"] == KIND_GEOMETRY).astype(np.int32)
     tracks["kind_texture_count"] = (segments["kind"] == KIND_TEXTURE).astype(np.int32)
     tracks["kind_noise_count"] = (segments["kind"] == KIND_NOISE).astype(np.int32)
+    tracks["source_strength"] = (segments["score"] * np.clip(segments["weight"], 0.0, 1.0)).astype(np.float32)
+    tracks["neighbor_support_score"] = np.zeros((n,), dtype=np.float32)
+    tracks["reproject_error_px"] = np.zeros((n,), dtype=np.float32)
+    tracks["reproject_dir_consistency"] = np.zeros((n,), dtype=np.float32)
     tracks["dir_consistency"] = np.ones((n,), dtype=np.float32)
     tracks["line_residual"] = np.zeros((n,), dtype=np.float32)
     tracks["line_residual_px"] = np.zeros((n,), dtype=np.float32)
@@ -1324,6 +1488,10 @@ def _empty_tracks() -> Dict[str, np.ndarray]:
         "kind_geometry_count": np.zeros((0,), dtype=np.int32),
         "kind_texture_count": np.zeros((0,), dtype=np.int32),
         "kind_noise_count": np.zeros((0,), dtype=np.int32),
+        "source_strength": np.zeros((0,), dtype=np.float32),
+        "neighbor_support_score": np.zeros((0,), dtype=np.float32),
+        "reproject_error_px": np.zeros((0,), dtype=np.float32),
+        "reproject_dir_consistency": np.zeros((0,), dtype=np.float32),
         "dir_consistency": np.zeros((0,), dtype=np.float32),
         "line_residual": np.zeros((0,), dtype=np.float32),
         "line_residual_px": np.zeros((0,), dtype=np.float32),
@@ -1402,6 +1570,10 @@ def _aggregate_tracks(groups: Dict[int, List[int]], segments: Dict[str, np.ndarr
         out["kind_geometry_count"].append(int(np.count_nonzero(kinds == KIND_GEOMETRY)))
         out["kind_texture_count"].append(int(np.count_nonzero(kinds == KIND_TEXTURE)))
         out["kind_noise_count"].append(int(np.count_nonzero(kinds == KIND_NOISE)))
+        out["source_strength"].append(float(np.max(segments["score"][idx] * np.clip(segments["weight"][idx], 0.0, 1.0))))
+        out["neighbor_support_score"].append(float(np.mean(segments["score"][idx] * np.clip(segments["weight"][idx], 0.0, 1.0))))
+        out["reproject_error_px"].append(0.0)
+        out["reproject_dir_consistency"].append(0.0)
         out["dir_consistency"].append(dir_consistency)
         out["line_residual"].append(line_residual)
         out["line_residual_px"].append(line_residual_px)
@@ -1562,19 +1734,42 @@ def main() -> None:
 
     segments_all = _concat_segments(chunks)
     segments_merge, merge_source_ids = _limit_segments_for_merge(segments_all, int(args.max_segments_for_merge))
+    view_cameras: List[Optional[Dict[str, object]]] = []
+    for view_index, stem in enumerate(stems):
+        cam, _cam_match = _camera_for_view(cameras, stem, view_index, str(args.match_policy))
+        view_cameras.append(cam)
     if str(args.track_build_mode) == "source_segments":
         tracks, keep = _tracks_from_source_segments(segments_merge, args)
+        survive = keep & (tracks["view_count"] >= int(args.strong_track_min_views))
+        probation = keep & ~survive
+        suppress = ~keep
     elif str(args.track_build_mode) == "merge":
         tracks, keep = _merge_segments(segments_merge, args)
+        survive = keep & (tracks["view_count"] >= int(args.strong_track_min_views))
+        probation = keep & ~survive
+        suppress = ~keep
     elif str(args.track_build_mode) == "layer_bins":
         tracks, keep = _aggregate_layer_bins(segments_merge, args)
+        survive = keep & (tracks["view_count"] >= int(args.strong_track_min_views))
+        probation = keep & ~survive
+        suppress = ~keep
+    elif str(args.track_build_mode) == "candidate_graph":
+        tracks, keep, survive, probation, suppress = _candidate_graph_tracks(segments_merge, view_cameras, source_sizes, args)
     else:
         raise ValueError(f"Unsupported track_build_mode: {args.track_build_mode}")
     strong = keep & (tracks["view_count"] >= int(args.strong_track_min_views))
 
     np.savez_compressed(output_root / "segments_all_v0.npz", **segments_all)
     np.savez_compressed(output_root / "segments_for_merge_v0.npz", **segments_merge, source_segment_ids=merge_source_ids)
-    np.savez_compressed(output_root / "sr_hf_curve_tracks_v0.npz", **tracks, keep=keep, strong=strong)
+    np.savez_compressed(
+        output_root / "sr_hf_curve_tracks_v0.npz",
+        **tracks,
+        keep=keep,
+        strong=strong,
+        survive=survive,
+        probation=probation,
+        suppress=suppress,
+    )
     _write_obj(output_root / "tracks_keep_v0.obj", tracks, keep)
     _write_obj(output_root / "tracks_strong_v0.obj", tracks, strong)
 
@@ -1638,6 +1833,16 @@ def main() -> None:
             "layer_bin_radius_abs": float(args.layer_bin_radius_abs),
             "layer_dir_bins": int(args.layer_dir_bins),
             "layer_include_kind": bool(args.layer_include_kind),
+            "candidate_radius_px": float(args.candidate_radius_px),
+            "candidate_radius_abs": float(args.candidate_radius_abs),
+            "candidate_reproj_radius_px": float(args.candidate_reproj_radius_px),
+            "candidate_dir_angle_deg": float(args.candidate_dir_angle_deg),
+            "candidate_normal_angle_deg": float(args.candidate_normal_angle_deg),
+            "candidate_depth_delta_px": float(args.candidate_depth_delta_px),
+            "candidate_min_survive_views": int(args.candidate_min_survive_views),
+            "candidate_probation_min_source_strength": float(args.candidate_probation_min_source_strength),
+            "candidate_probation_max_line_residual_px": float(args.candidate_probation_max_line_residual_px),
+            "candidate_keep_probation": bool(args.candidate_keep_probation),
             "curve_source": str(args.curve_source),
             "curve_image_mode": str(args.curve_image_mode),
             "curve_highpass_blur_radius": float(args.curve_highpass_blur_radius),
@@ -1671,6 +1876,9 @@ def main() -> None:
             "tracks_all": int(tracks["p0"].shape[0]),
             "tracks_keep": int(np.count_nonzero(keep)),
             "tracks_strong": int(np.count_nonzero(strong)),
+            "tracks_survive": int(np.count_nonzero(survive)),
+            "tracks_probation": int(np.count_nonzero(probation)),
+            "tracks_suppress": int(np.count_nonzero(suppress)),
         },
         "stats": {
             "segment_score_mean": _mean(segments_all["score"]),
@@ -1681,11 +1889,17 @@ def main() -> None:
             "track_segment_count_mean": _mean(tracks["segment_count"].astype(np.float32)),
             "track_length_mean": _mean(tracks["length"]),
             "track_width_px_mean": _mean(tracks["width_px_mean"]),
+            "track_source_strength_mean": _mean(tracks["source_strength"]),
+            "track_neighbor_support_score_mean": _mean(tracks["neighbor_support_score"]),
+            "track_reproject_error_px_mean": _mean(tracks["reproject_error_px"]),
+            "track_reproject_dir_consistency_mean": _mean(tracks["reproject_dir_consistency"]),
             "track_dir_consistency_mean": _mean(tracks["dir_consistency"]),
             "track_line_residual_px_mean": _mean(tracks["line_residual_px"]),
             "track_support_view_ratio_mean": _mean(tracks["support_view_ratio"]),
             "keep_view_count_mean": _mean(tracks["view_count"][keep].astype(np.float32)),
             "strong_view_count_mean": _mean(tracks["view_count"][strong].astype(np.float32)),
+            "survive_view_count_mean": _mean(tracks["view_count"][survive].astype(np.float32)),
+            "probation_source_strength_mean": _mean(tracks["source_strength"][probation]),
         },
         "outputs": {
             "segments_all": str(output_root / "segments_all_v0.npz"),

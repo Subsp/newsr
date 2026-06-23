@@ -85,7 +85,17 @@ LAYER_BIN_RADIUS_PX="${LAYER_BIN_RADIUS_PX:-8.0}"
 LAYER_BIN_RADIUS_ABS="${LAYER_BIN_RADIUS_ABS:-0.008}"
 LAYER_DIR_BINS="${LAYER_DIR_BINS:-8}"
 LAYER_INCLUDE_KIND="${LAYER_INCLUDE_KIND:-0}"
-TRACK_BUILD_MODE="${TRACK_BUILD_MODE:-layer_bins}"
+CANDIDATE_RADIUS_PX="${CANDIDATE_RADIUS_PX:-6.0}"
+CANDIDATE_RADIUS_ABS="${CANDIDATE_RADIUS_ABS:-0.006}"
+CANDIDATE_REPROJ_RADIUS_PX="${CANDIDATE_REPROJ_RADIUS_PX:-5.0}"
+CANDIDATE_DIR_ANGLE_DEG="${CANDIDATE_DIR_ANGLE_DEG:-25.0}"
+CANDIDATE_NORMAL_ANGLE_DEG="${CANDIDATE_NORMAL_ANGLE_DEG:-60.0}"
+CANDIDATE_DEPTH_DELTA_PX="${CANDIDATE_DEPTH_DELTA_PX:-12.0}"
+CANDIDATE_MIN_SURVIVE_VIEWS="${CANDIDATE_MIN_SURVIVE_VIEWS:-2}"
+CANDIDATE_PROBATION_MIN_SOURCE_STRENGTH="${CANDIDATE_PROBATION_MIN_SOURCE_STRENGTH:-0.04}"
+CANDIDATE_PROBATION_MAX_LINE_RESIDUAL_PX="${CANDIDATE_PROBATION_MAX_LINE_RESIDUAL_PX:-8.0}"
+CANDIDATE_KEEP_PROBATION="${CANDIDATE_KEEP_PROBATION:-1}"
+TRACK_BUILD_MODE="${TRACK_BUILD_MODE:-candidate_graph}"
 MIN_TRACK_SEGMENTS="${MIN_TRACK_SEGMENTS:-1}"
 MIN_TRACK_VIEWS="${MIN_TRACK_VIEWS:-1}"
 STRONG_TRACK_MIN_VIEWS="${STRONG_TRACK_MIN_VIEWS:-2}"
@@ -157,6 +167,15 @@ ARGS=(
   --layer_bin_radius_px "${LAYER_BIN_RADIUS_PX}"
   --layer_bin_radius_abs "${LAYER_BIN_RADIUS_ABS}"
   --layer_dir_bins "${LAYER_DIR_BINS}"
+  --candidate_radius_px "${CANDIDATE_RADIUS_PX}"
+  --candidate_radius_abs "${CANDIDATE_RADIUS_ABS}"
+  --candidate_reproj_radius_px "${CANDIDATE_REPROJ_RADIUS_PX}"
+  --candidate_dir_angle_deg "${CANDIDATE_DIR_ANGLE_DEG}"
+  --candidate_normal_angle_deg "${CANDIDATE_NORMAL_ANGLE_DEG}"
+  --candidate_depth_delta_px "${CANDIDATE_DEPTH_DELTA_PX}"
+  --candidate_min_survive_views "${CANDIDATE_MIN_SURVIVE_VIEWS}"
+  --candidate_probation_min_source_strength "${CANDIDATE_PROBATION_MIN_SOURCE_STRENGTH}"
+  --candidate_probation_max_line_residual_px "${CANDIDATE_PROBATION_MAX_LINE_RESIDUAL_PX}"
   --track_build_mode "${TRACK_BUILD_MODE}"
   --min_track_segments "${MIN_TRACK_SEGMENTS}"
   --min_track_views "${MIN_TRACK_VIEWS}"
@@ -191,6 +210,9 @@ fi
 if [[ "${LAYER_INCLUDE_KIND}" == "1" ]]; then
   ARGS+=(--layer_include_kind)
 fi
+if [[ "${CANDIDATE_KEEP_PROBATION}" == "1" ]]; then
+  ARGS+=(--candidate_keep_probation)
+fi
 
 echo "[sr-hf-curve-tracks-v0] base      : ${BASE_MODEL_DIR}"
 echo "[sr-hf-curve-tracks-v0] primitives: ${PRIMITIVE_DIR}"
@@ -204,6 +226,7 @@ echo "[sr-hf-curve-tracks-v0] dense     : enable=${DENSE_STROKE_ENABLE} grid=${D
 echo "[sr-hf-curve-tracks-v0] width     : enable=${PROFILE_WIDTH_ENABLE} radius=${PROFILE_WIDTH_RADIUS_PX}px falloff=${PROFILE_WIDTH_FALLOFF}"
 echo "[sr-hf-curve-tracks-v0] merge     : radius=${MERGE_RADIUS_PX}px/${MERGE_RADIUS_ABS} angle=${MERGE_ANGLE_DEG} same_view=${MERGE_SAME_VIEW}"
 echo "[sr-hf-curve-tracks-v0] layer     : radius=${LAYER_BIN_RADIUS_PX}px/${LAYER_BIN_RADIUS_ABS} dir_bins=${LAYER_DIR_BINS} include_kind=${LAYER_INCLUDE_KIND}"
+echo "[sr-hf-curve-tracks-v0] candidate : radius=${CANDIDATE_RADIUS_PX}px/${CANDIDATE_RADIUS_ABS} reproj=${CANDIDATE_REPROJ_RADIUS_PX}px survive_views=${CANDIDATE_MIN_SURVIVE_VIEWS} keep_probation=${CANDIDATE_KEEP_PROBATION}"
 
 "${PYTHON_BIN}" "${SOF_ROOT}/scripts/build_sr_hf_curve_tracks_v0.py" "${ARGS[@]}"
 
