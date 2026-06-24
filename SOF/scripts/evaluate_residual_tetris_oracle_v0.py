@@ -137,6 +137,22 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda_dc", type=float, default=0.05)
     parser.add_argument("--q_percentile", type=float, default=95.0)
     parser.add_argument("--q_tau", type=float, default=0.03)
+    parser.add_argument("--num_wrong_slots", type=int, default=5)
+    parser.add_argument("--num_shuffled_q", type=int, default=5)
+    parser.add_argument("--null_percentile", type=float, default=95.0)
+    parser.add_argument("--selector_corr_threshold", type=float, default=0.20)
+    parser.add_argument("--selector_ee_threshold", type=float, default=0.05)
+    parser.add_argument("--selector_gain_min", type=float, default=0.0)
+    parser.add_argument("--selector_leak_max", type=float, default=0.30)
+    parser.add_argument("--selector_lp_drift_max", type=float, default=1.0)
+    parser.add_argument("--selector_delivery_retention_min", type=float, default=0.50)
+    parser.add_argument("--selector_beta_saturation_max", type=float, default=0.50)
+    parser.add_argument("--selector_beta_max_fraction_max", type=float, default=0.90)
+    parser.add_argument("--selector_null_margin_min", type=float, default=0.0)
+    parser.add_argument("--test_good_corr_threshold", type=float, default=0.20)
+    parser.add_argument("--test_good_ee_threshold", type=float, default=0.05)
+    parser.add_argument("--test_good_leak_max", type=float, default=0.30)
+    parser.add_argument("--test_good_lp_drift_max", type=float, default=1.0)
 
     parser.add_argument("--base_opacity_min", type=float, default=0.02)
     parser.add_argument("--depth_min", type=float, default=0.02)
@@ -504,6 +520,7 @@ def _fit_beta(
     q_mode: str,
     beta_mode: str = "rgb",
     q_global_scale: Optional[float] = None,
+    q_variant: int = 0,
 ) -> Tuple[np.ndarray, Dict[str, float]]:
     if beta_mode not in {"rgb", "luma"}:
         raise ValueError(beta_mode)
@@ -514,7 +531,14 @@ def _fit_beta(
     fit_pixels = 0
     q_values = []
     for obs in obs_list:
-        basis, target, fit_w, off_w, raw_basis, lp_basis = _basis_arrays(obs, candidate, args, q_mode, q_global_scale)
+        basis, target, fit_w, off_w, raw_basis, lp_basis = _basis_arrays(
+            obs,
+            candidate,
+            args,
+            q_mode,
+            q_global_scale,
+            q_variant=q_variant,
+        )
         if beta_mode == "luma":
             target_use = np.sum(target * LUMA[None, None, :], axis=2, keepdims=True)
             basis_use = basis[..., None]
@@ -549,6 +573,8 @@ def _fit_beta(
         "beta_abs_max": float(np.max(np.abs(beta_rgb))),
         "beta_l2": float(np.linalg.norm(beta_rgb)),
         "beta_saturation": float(np.mean(np.abs(beta_rgb) >= float(args.beta_max) * 0.98)),
+        "beta_max_fraction": float(np.max(np.abs(beta_rgb)) / max(float(args.beta_max), 1e-8)),
+        "beta_margin": float(1.0 - np.max(np.abs(beta_rgb)) / max(float(args.beta_max), 1e-8)),
         "q_peak": float(np.max(q_concat)) if q_concat.size else 0.0,
         "q_mean_on_core": float(np.mean(q_concat)) if q_concat.size else 0.0,
         "q_core_coverage": float(np.mean(q_concat > float(args.q_tau))) if q_concat.size else 0.0,
@@ -562,6 +588,7 @@ def _basis_arrays(
     args: argparse.Namespace,
     q_mode: str,
     q_global_scale: Optional[float] = None,
+    q_variant: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     x0, y0, x1, y1 = obs.roi
     xx, yy = _coords(obs.roi)
@@ -585,8 +612,12 @@ def _basis_arrays(
     elif q_mode == "C":
         q = np.clip(obs.q_parent, 0.0, 1.0)
     elif q_mode == "wrong_slot":
+        n_slots = max(int(getattr(args, "num_wrong_slots", 1)), 1)
         shift = max(float(obs.short_px) * 2.0, 2.0)
-        shifted = obs.center + np.asarray([-math.sin(obs.theta) * shift, math.cos(obs.theta) * shift], dtype=np.float32)
+        # Use nearby equal-radius negative slots instead of one hand-picked
+        # offset; this gives a small matched null distribution per cluster.
+        angle = float(obs.theta) + math.pi * 0.5 + 2.0 * math.pi * (int(q_variant) % n_slots) / float(n_slots)
+        shifted = obs.center + np.asarray([math.cos(angle) * shift, math.sin(angle) * shift], dtype=np.float32)
         phi = _piece(
             candidate=candidate,
             xx=xx,
@@ -599,7 +630,11 @@ def _basis_arrays(
         )
         q = np.clip(obs.q_parent, 0.0, 1.0)
     elif q_mode == "shuffled_q":
-        q = np.roll(np.clip(obs.q_parent, 0.0, 1.0), shift=max(1, obs.q_parent.shape[1] // 3), axis=1)
+        n_shuffle = max(int(getattr(args, "num_shuffled_q", 1)), 1)
+        base_q = np.clip(obs.q_parent, 0.0, 1.0)
+        dx = max(1, int(round(base_q.shape[1] * float((int(q_variant) % n_shuffle) + 1) / float(n_shuffle + 1))))
+        dy = max(1, int(round(base_q.shape[0] * float(((int(q_variant) * 7) % n_shuffle) + 1) / float(n_shuffle + 1))))
+        q = np.roll(np.roll(base_q, shift=dx, axis=1), shift=dy, axis=0)
     else:
         raise ValueError(f"Unknown q_mode: {q_mode}")
     raw_basis = q * phi
@@ -619,6 +654,7 @@ def _eval_beta(
     args: argparse.Namespace,
     q_mode: str,
     q_global_scale: Optional[float] = None,
+    q_variant: int = 0,
 ) -> Dict[str, float]:
     target_energy = 0.0
     residual_energy = 0.0
@@ -633,7 +669,14 @@ def _eval_beta(
     target_norm = 0.0
     q_vals = []
     for obs in obs_list:
-        basis, target, fit_w, off_w, raw_basis, lp_basis = _basis_arrays(obs, candidate, args, q_mode, q_global_scale)
+        basis, target, fit_w, off_w, raw_basis, lp_basis = _basis_arrays(
+            obs,
+            candidate,
+            args,
+            q_mode,
+            q_global_scale,
+            q_variant=q_variant,
+        )
         pred_hp = basis[..., None] * beta[None, None, :]
         pred_raw = raw_basis[..., None] * beta[None, None, :]
         pred_lp = lp_basis[..., None] * beta[None, None, :]
@@ -721,6 +764,172 @@ def _score(metrics: Dict[str, float]) -> float:
     amp = float(metrics.get("amplitude_ratio", 0.0))
     amp_penalty = abs(math.log(max(amp, 1e-4))) if math.isfinite(amp) else 4.0
     return corr + 0.35 * ee - 0.20 * min(leak, 10.0) - 0.10 * min(lp, 10.0) - 0.03 * amp_penalty
+
+
+def _finite_float(value: object, default: float = float("nan")) -> float:
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+    return float(default)
+
+
+def _metric_score_from_row(row: Dict[str, object], prefix: str) -> float:
+    return _score(
+        {
+            "corr": _finite_float(row.get(f"{prefix}_corr"), -1.0),
+            "explained_energy": _finite_float(row.get(f"{prefix}_explained_energy"), -1.0),
+            "leak_ratio": _finite_float(row.get(f"{prefix}_leak_ratio"), 1.0),
+            "lp_drift": _finite_float(row.get(f"{prefix}_lp_drift"), 1.0),
+            "amplitude_ratio": _finite_float(row.get(f"{prefix}_amplitude_ratio"), 0.0),
+        }
+    )
+
+
+def _quality_pass(row: Dict[str, object], prefix: str, args: argparse.Namespace, *, use_test_thresholds: bool = False) -> bool:
+    corr_thr = float(args.test_good_corr_threshold if use_test_thresholds else args.selector_corr_threshold)
+    ee_thr = float(args.test_good_ee_threshold if use_test_thresholds else args.selector_ee_threshold)
+    leak_max = float(args.test_good_leak_max if use_test_thresholds else args.selector_leak_max)
+    lp_max = float(args.test_good_lp_drift_max if use_test_thresholds else args.selector_lp_drift_max)
+    return (
+        _finite_float(row.get(f"{prefix}_corr"), -1.0) > corr_thr
+        and _finite_float(row.get(f"{prefix}_explained_energy"), -1.0) > ee_thr
+        and _finite_float(row.get(f"{prefix}_gain"), -1.0) > float(args.selector_gain_min)
+        and _finite_float(row.get(f"{prefix}_leak_ratio"), 1e9) < leak_max
+        and _finite_float(row.get(f"{prefix}_lp_drift"), 1e9) < lp_max
+    )
+
+
+def _null_summary(prefix: str, real_metrics: Dict[str, float], null_metrics: Sequence[Dict[str, float]], args: argparse.Namespace) -> Dict[str, float]:
+    if not null_metrics:
+        return {
+            f"{prefix}_null_count": 0.0,
+            f"{prefix}_null_score_p95": float("nan"),
+            f"{prefix}_null_corr_p95": float("nan"),
+            f"{prefix}_null_EE_p95": float("nan"),
+            f"{prefix}_null_gain_p95": float("nan"),
+            f"{prefix}_margin_score": float("nan"),
+            f"{prefix}_margin_corr": float("nan"),
+            f"{prefix}_margin_EE": float("nan"),
+            f"{prefix}_margin_gain": float("nan"),
+            f"{prefix}_empirical_tail": float("nan"),
+        }
+    percentile = float(args.null_percentile)
+    null_scores = np.asarray([_score(m) for m in null_metrics], dtype=np.float32)
+    null_corr = np.asarray([_finite_float(m.get("corr"), -1.0) for m in null_metrics], dtype=np.float32)
+    null_ee = np.asarray([_finite_float(m.get("explained_energy"), -1.0) for m in null_metrics], dtype=np.float32)
+    null_gain = np.asarray([_finite_float(m.get("gain"), -1e9) for m in null_metrics], dtype=np.float32)
+    real_score = _score(real_metrics)
+    real_corr = _finite_float(real_metrics.get("corr"), -1.0)
+    real_ee = _finite_float(real_metrics.get("explained_energy"), -1.0)
+    real_gain = _finite_float(real_metrics.get("gain"), -1e9)
+    score_p = float(np.percentile(null_scores, percentile))
+    corr_p = float(np.percentile(null_corr, percentile))
+    ee_p = float(np.percentile(null_ee, percentile))
+    gain_p = float(np.percentile(null_gain, percentile))
+    tail = float((1 + int(np.count_nonzero(null_scores >= real_score))) / float(len(null_scores) + 1))
+    return {
+        f"{prefix}_null_count": float(len(null_metrics)),
+        f"{prefix}_null_score_p95": score_p,
+        f"{prefix}_null_corr_p95": corr_p,
+        f"{prefix}_null_EE_p95": ee_p,
+        f"{prefix}_null_gain_p95": gain_p,
+        f"{prefix}_margin_score": float(real_score - score_p),
+        f"{prefix}_margin_corr": float(real_corr - corr_p),
+        f"{prefix}_margin_EE": float(real_ee - ee_p),
+        f"{prefix}_margin_gain": float(real_gain - gain_p),
+        f"{prefix}_empirical_tail": tail,
+    }
+
+
+def _eval_null_family(
+    *,
+    fit: Sequence[EvalObs],
+    eval_obs: Sequence[EvalObs],
+    cand: Candidate,
+    args: argparse.Namespace,
+    q_mode: str,
+    count: int,
+    q_global_scale: Optional[float] = None,
+) -> List[Dict[str, float]]:
+    out: List[Dict[str, float]] = []
+    for variant in range(max(int(count), 0)):
+        beta, _ = _fit_beta(
+            fit,
+            cand,
+            args,
+            q_mode=q_mode,
+            beta_mode="rgb",
+            q_global_scale=q_global_scale,
+            q_variant=variant,
+        )
+        out.append(
+            _eval_beta(
+                eval_obs,
+                cand,
+                beta,
+                args,
+                q_mode=q_mode,
+                q_global_scale=q_global_scale,
+                q_variant=variant,
+            )
+        )
+    return out
+
+
+def _apply_selector_labels(row: Dict[str, object], args: argparse.Namespace) -> None:
+    row["test_positive"] = bool(_finite_float(row.get("C_test_gain"), -1.0) > 0.0)
+    row["test_good_strict"] = bool(_quality_pass(row, "C_test", args, use_test_thresholds=True))
+    row["pass_A_selection"] = bool(_quality_pass(row, "A_selection", args))
+    row["pass_B_selection"] = bool(
+        _quality_pass(row, "B_shape_selection", args)
+        and _quality_pass(row, "B_relative_selection", args)
+    )
+    row["pass_C_selection"] = bool(
+        _quality_pass(row, "C_selection", args)
+        and _finite_float(row.get("delivery_retention_selection"), -1.0) > float(args.selector_delivery_retention_min)
+    )
+    row["pass_controls_selection"] = bool(
+        _finite_float(row.get("slot_selection_margin_score"), -1.0) > float(args.selector_null_margin_min)
+        and _finite_float(row.get("q_selection_margin_score"), -1.0) > float(args.selector_null_margin_min)
+    )
+    beta_sat = _finite_float(row.get("C_fit_beta_beta_saturation"), 1.0)
+    beta_frac = _finite_float(row.get("C_fit_beta_beta_max_fraction"), 1.0)
+    row["pass_capacity"] = bool(
+        beta_sat < float(args.selector_beta_saturation_max)
+        and beta_frac < float(args.selector_beta_max_fraction_max)
+    )
+    ordered = [
+        ("reject_A_basis", bool(row["pass_A_selection"])),
+        ("reject_B_support", bool(row["pass_B_selection"])),
+        ("reject_C_delivery", bool(row["pass_C_selection"])),
+        ("reject_matched_null", bool(row["pass_controls_selection"])),
+        ("reject_beta_saturation", bool(row["pass_capacity"])),
+    ]
+    reject_reason = "pass"
+    for reason, ok in ordered:
+        if not ok:
+            reject_reason = reason
+            break
+    row["selector_reject_reason"] = reject_reason
+    row["selector_core_pass"] = reject_reason == "pass"
+    row["selector_capacity_limited_pass"] = bool(
+        row["pass_A_selection"]
+        and row["pass_B_selection"]
+        and row["pass_C_selection"]
+        and row["pass_controls_selection"]
+        and not row["pass_capacity"]
+    )
+    margins = [
+        _finite_float(row.get("A_selection_corr"), -1.0) - float(args.selector_corr_threshold),
+        _finite_float(row.get("A_selection_explained_energy"), -1.0) - float(args.selector_ee_threshold),
+        _finite_float(row.get("B_shape_selection_explained_energy"), -1.0) - float(args.selector_ee_threshold),
+        _finite_float(row.get("B_relative_selection_explained_energy"), -1.0) - float(args.selector_ee_threshold),
+        _finite_float(row.get("C_selection_corr"), -1.0) - float(args.selector_corr_threshold),
+        _finite_float(row.get("C_selection_explained_energy"), -1.0) - float(args.selector_ee_threshold),
+        _finite_float(row.get("slot_selection_margin_score"), -1.0) - float(args.selector_null_margin_min),
+        _finite_float(row.get("q_selection_margin_score"), -1.0) - float(args.selector_null_margin_min),
+        float(args.selector_beta_max_fraction_max) - _finite_float(row.get("C_fit_beta_beta_max_fraction"), 1.0),
+    ]
+    row["selector_score"] = float(min(margins))
 
 
 def _build_eval_obs(
@@ -878,8 +1087,42 @@ def _eval_cluster(
     beta_b, _ = _fit_beta(fit, cand, args, q_mode="B_shape", beta_mode="rgb")
     beta_br, _ = _fit_beta(fit, cand, args, q_mode="B_relative", beta_mode="rgb", q_global_scale=q_global)
     beta_c, fit_stats_c = _fit_beta(fit, cand, args, q_mode="C", beta_mode="rgb")
-    beta_wrong, _ = _fit_beta(fit, cand, args, q_mode="wrong_slot", beta_mode="rgb")
-    beta_shuf, _ = _fit_beta(fit, cand, args, q_mode="shuffled_q", beta_mode="rgb")
+    slot_selection_null = _eval_null_family(
+        fit=fit,
+        eval_obs=selection,
+        cand=cand,
+        args=args,
+        q_mode="wrong_slot",
+        count=int(args.num_wrong_slots),
+    )
+    slot_test_null = _eval_null_family(
+        fit=fit,
+        eval_obs=test,
+        cand=cand,
+        args=args,
+        q_mode="wrong_slot",
+        count=int(args.num_wrong_slots),
+    )
+    q_selection_null = _eval_null_family(
+        fit=fit,
+        eval_obs=selection,
+        cand=cand,
+        args=args,
+        q_mode="shuffled_q",
+        count=int(args.num_shuffled_q),
+    )
+    q_test_null = _eval_null_family(
+        fit=fit,
+        eval_obs=test,
+        cand=cand,
+        args=args,
+        q_mode="shuffled_q",
+        count=int(args.num_shuffled_q),
+    )
+    beta_wrong, _ = _fit_beta(fit, cand, args, q_mode="wrong_slot", beta_mode="rgb", q_variant=0)
+    beta_shuf, _ = _fit_beta(fit, cand, args, q_mode="shuffled_q", beta_mode="rgb", q_variant=0)
+    c_selection = _eval_beta(selection, cand, beta_c, args, q_mode="C")
+    c_test = _eval_beta(test, cand, beta_c, args, q_mode="C")
 
     result: Dict[str, object] = {
         "valid": True,
@@ -899,21 +1142,40 @@ def _eval_cluster(
     result.update(_prefix("A_fit", _eval_beta(fit, cand, beta_a, args, q_mode="A")))
     result.update(_prefix("A_selection", sel_a))
     result.update(_prefix("A_test", test_a))
+    result.update(_prefix("A_luma_selection", _eval_beta(selection, cand, beta_luma, args, q_mode="A")))
     result.update(_prefix("A_luma_test", _eval_beta(test, cand, beta_luma, args, q_mode="A")))
+    result.update(_prefix("B_shape_selection", _eval_beta(selection, cand, beta_b, args, q_mode="B_shape")))
     result.update(_prefix("B_shape_test", _eval_beta(test, cand, beta_b, args, q_mode="B_shape")))
+    result.update(_prefix("B_relative_selection", _eval_beta(selection, cand, beta_br, args, q_mode="B_relative", q_global_scale=q_global)))
     result.update(_prefix("B_relative_test", _eval_beta(test, cand, beta_br, args, q_mode="B_relative", q_global_scale=q_global)))
     result.update(_prefix("C_fit", _eval_beta(fit, cand, beta_c, args, q_mode="C")))
-    result.update(_prefix("C_test", _eval_beta(test, cand, beta_c, args, q_mode="C")))
-    result.update(_prefix("wrong_slot_test", _eval_beta(test, cand, beta_wrong, args, q_mode="wrong_slot")))
-    result.update(_prefix("shuffled_q_test", _eval_beta(test, cand, beta_shuf, args, q_mode="shuffled_q")))
+    result.update(_prefix("C_selection", c_selection))
+    result.update(_prefix("C_test", c_test))
+    result.update(_prefix("wrong_slot_selection", _eval_beta(selection, cand, beta_wrong, args, q_mode="wrong_slot", q_variant=0)))
+    result.update(_prefix("wrong_slot_test", _eval_beta(test, cand, beta_wrong, args, q_mode="wrong_slot", q_variant=0)))
+    result.update(_prefix("shuffled_q_selection", _eval_beta(selection, cand, beta_shuf, args, q_mode="shuffled_q", q_variant=0)))
+    result.update(_prefix("shuffled_q_test", _eval_beta(test, cand, beta_shuf, args, q_mode="shuffled_q", q_variant=0)))
     result.update(_prefix("C_fit_beta", fit_stats_c))
+    result.update(_null_summary("slot_selection", c_selection, slot_selection_null, args))
+    result.update(_null_summary("slot_test", c_test, slot_test_null, args))
+    result.update(_null_summary("q_selection", c_selection, q_selection_null, args))
+    result.update(_null_summary("q_test", c_test, q_test_null, args))
+    ga_sel = max(float(result.get("A_selection_gain", float("-inf"))), 0.0)
+    gc_sel = float(result.get("C_selection_gain", float("-inf")))
+    result["delivery_retention_selection"] = float(gc_sel / ga_sel) if ga_sel > 1e-10 else float("nan")
     ga = max(float(result.get("A_test_gain", float("-inf"))), 0.0)
     gc = float(result.get("C_test_gain", float("-inf")))
-    result["delivery_retention"] = float(gc / ga) if ga > 1e-10 else float("nan")
+    result["delivery_retention_test"] = float(gc / ga) if ga > 1e-10 else float("nan")
+    result["delivery_retention"] = result["delivery_retention_test"]
+    result["Delta_EE_wrong_slot_selection"] = float(result["C_selection_explained_energy"] - result["wrong_slot_selection_explained_energy"])
+    result["Delta_corr_wrong_slot_selection"] = float(result["C_selection_corr"] - result["wrong_slot_selection_corr"])
+    result["Delta_EE_shuffled_q_selection"] = float(result["C_selection_explained_energy"] - result["shuffled_q_selection_explained_energy"])
+    result["Delta_corr_shuffled_q_selection"] = float(result["C_selection_corr"] - result["shuffled_q_selection_corr"])
     result["Delta_EE_wrong_slot"] = float(result["C_test_explained_energy"] - result["wrong_slot_test_explained_energy"])
     result["Delta_corr_wrong_slot"] = float(result["C_test_corr"] - result["wrong_slot_test_corr"])
     result["Delta_EE_shuffled_q"] = float(result["C_test_explained_energy"] - result["shuffled_q_test_explained_energy"])
     result["Delta_corr_shuffled_q"] = float(result["C_test_corr"] - result["shuffled_q_test_corr"])
+    _apply_selector_labels(result, args)
     return result
 
 
@@ -942,6 +1204,141 @@ def _quantile(rows: Sequence[Dict[str, object]], key: str, q: float) -> float:
         if isinstance(value, (int, float)) and math.isfinite(float(value)):
             values.append(float(value))
     return float(np.percentile(values, q)) if values else float("nan")
+
+
+def _sum_positive(rows: Sequence[Dict[str, object]], key: str) -> float:
+    return float(sum(max(_finite_float(row.get(key), 0.0), 0.0) for row in rows))
+
+
+def _sum_metric(rows: Sequence[Dict[str, object]], key: str) -> float:
+    return float(sum(_finite_float(row.get(key), 0.0) for row in rows))
+
+
+def _selector_report(
+    selected_rows: Sequence[Dict[str, object]],
+    eligible_rows: Sequence[Dict[str, object]],
+    *,
+    label_key: str = "test_good_strict",
+) -> Dict[str, float]:
+    selected = list(selected_rows)
+    eligible = list(eligible_rows)
+    selected_count = len(selected)
+    eligible_count = len(eligible)
+    good_total = sum(1 for row in eligible if bool(row.get(label_key)))
+    selected_good = sum(1 for row in selected if bool(row.get(label_key)))
+    selected_bad = selected_count - selected_good
+    selected_energy = _sum_positive(selected, "cluster_target_energy")
+    eligible_energy = _sum_positive(eligible, "cluster_target_energy")
+    selected_good_energy = _sum_positive([r for r in selected if bool(r.get(label_key))], "cluster_target_energy")
+    selected_bad_energy = max(selected_energy - selected_good_energy, 0.0)
+    selected_gain = _sum_positive(selected, "C_test_gain")
+    oracle_good = [r for r in eligible if bool(r.get(label_key))]
+    oracle_gain = _sum_positive(oracle_good, "C_test_gain")
+    oracle_energy = _sum_positive(oracle_good, "cluster_target_energy")
+    positive_gain_count = sum(1 for row in selected if _finite_float(row.get("C_test_gain"), -1.0) > 0.0)
+    return {
+        "eligible_count": float(eligible_count),
+        "selected_count": float(selected_count),
+        "selected_ratio": float(selected_count / max(eligible_count, 1)),
+        "test_good_total": float(good_total),
+        "selected_test_good": float(selected_good),
+        "selected_false_positive": float(selected_bad),
+        "selected_precision": float(selected_good / max(selected_count, 1)),
+        "selected_recall": float(selected_good / max(good_total, 1)),
+        "selected_FDR": float(selected_bad / max(selected_count, 1)),
+        "selected_positive_gain_ratio": float(positive_gain_count / max(selected_count, 1)),
+        "selected_target_energy": selected_energy,
+        "eligible_target_energy": eligible_energy,
+        "selected_target_energy_coverage": float(selected_energy / max(eligible_energy, 1e-10)),
+        "selected_good_target_energy": selected_good_energy,
+        "selected_bad_target_energy": selected_bad_energy,
+        "weighted_FDR": float(selected_bad_energy / max(selected_energy, 1e-10)),
+        "selected_positive_gain": selected_gain,
+        "oracle_positive_gain": oracle_gain,
+        "oracle_gain_capture": float(selected_gain / max(oracle_gain, 1e-10)),
+        "oracle_good_target_energy": oracle_energy,
+        "oracle_energy_capture": float(selected_good_energy / max(oracle_energy, 1e-10)),
+        "selected_C_test_corr_median": _median(selected, "C_test_corr"),
+        "selected_C_test_EE_median": _median(selected, "C_test_explained_energy"),
+        "selected_C_test_gain_sum": _sum_metric(selected, "C_test_gain"),
+        "selected_leak_median": _median(selected, "C_test_leak_ratio"),
+        "selected_lp_drift_median": _median(selected, "C_test_lp_drift"),
+        "selected_beta_saturation_median": _median(selected, "C_fit_beta_beta_saturation"),
+    }
+
+
+def _top_k(rows: Sequence[Dict[str, object]], key: str, k: int, *, descending: bool = True) -> List[Dict[str, object]]:
+    def sort_key(row: Dict[str, object]) -> float:
+        value = _finite_float(row.get(key), float("-inf") if descending else float("inf"))
+        return value
+
+    return sorted(rows, key=sort_key, reverse=descending)[: max(int(k), 0)]
+
+
+def _baseline_reports(
+    eligible_rows: Sequence[Dict[str, object]],
+    selected_count: int,
+    *,
+    label_key: str = "test_good_strict",
+) -> Dict[str, Dict[str, float]]:
+    rows = list(eligible_rows)
+    k = max(int(selected_count), 0)
+    if k <= 0:
+        return {}
+    rng = np.random.default_rng(20240624)
+    reports: Dict[str, Dict[str, float]] = {
+        "top_target_energy": _selector_report(_top_k(rows, "cluster_target_energy", k), rows, label_key=label_key),
+        "top_A_selection_EE": _selector_report(_top_k(rows, "A_selection_explained_energy", k), rows, label_key=label_key),
+        "top_C_selection_EE": _selector_report(_top_k(rows, "C_selection_explained_energy", k), rows, label_key=label_key),
+        "top_selector_score": _selector_report(_top_k(rows, "selector_score", k), rows, label_key=label_key),
+    }
+    random_reports = []
+    if rows:
+        indices = np.arange(len(rows))
+        for _ in range(64):
+            chosen = rng.choice(indices, size=min(k, len(rows)), replace=False)
+            random_reports.append(_selector_report([rows[int(i)] for i in chosen], rows, label_key=label_key))
+    if random_reports:
+        keys = sorted(random_reports[0].keys())
+        reports["random_matched_count_mean"] = {key: float(np.mean([r[key] for r in random_reports])) for key in keys}
+        reports["random_matched_count_p90"] = {key: float(np.percentile([r[key] for r in random_reports], 90.0)) for key in keys}
+    return reports
+
+
+def _transition_summary(eligible_rows: Sequence[Dict[str, object]]) -> Dict[str, object]:
+    stages = [
+        ("preeligible", lambda r: True),
+        ("A_selection", lambda r: bool(r.get("pass_A_selection"))),
+        ("AB_selection", lambda r: bool(r.get("pass_A_selection")) and bool(r.get("pass_B_selection"))),
+        (
+            "ABC_selection",
+            lambda r: bool(r.get("pass_A_selection")) and bool(r.get("pass_B_selection")) and bool(r.get("pass_C_selection")),
+        ),
+        (
+            "ABC_controls_selection",
+            lambda r: bool(r.get("pass_A_selection"))
+            and bool(r.get("pass_B_selection"))
+            and bool(r.get("pass_C_selection"))
+            and bool(r.get("pass_controls_selection")),
+        ),
+        ("core_pass", lambda r: bool(r.get("selector_core_pass"))),
+    ]
+    out: Dict[str, object] = {}
+    previous_count = None
+    for name, predicate in stages:
+        count = sum(1 for row in eligible_rows if predicate(row))
+        out[name] = {
+            "count": int(count),
+            "ratio_of_eligible": float(count / max(len(eligible_rows), 1)),
+            "ratio_from_previous": float(count / max(previous_count, 1)) if previous_count is not None else 1.0,
+        }
+        previous_count = count
+    reasons: Dict[str, int] = {}
+    for row in eligible_rows:
+        reason = str(row.get("selector_reject_reason", "not_evaluated"))
+        reasons[reason] = reasons.get(reason, 0) + 1
+    out["reject_reasons"] = reasons
+    return out
 
 
 def _write_debug(debug_root: Path, row: Dict[str, object], obs: Sequence[EvalObs], args: argparse.Namespace) -> None:
@@ -1120,8 +1517,14 @@ def main() -> None:
         and float(r.get("C_test_leak_ratio", 1e9)) < 0.3
         and float(r.get("delivery_retention", -1.0)) > 0.5
     ]
+    selected_rows = [r for r in eligible_rows if bool(r.get("selector_core_pass"))]
+    capacity_limited_rows = [r for r in eligible_rows if bool(r.get("selector_capacity_limited_pass"))]
     agg_ga = sum(max(float(r.get("A_test_gain", 0.0)), 0.0) for r in eligible_rows)
     agg_gc = sum(float(r.get("C_test_gain", 0.0)) for r in eligible_rows if float(r.get("A_test_gain", 0.0)) > 0.0)
+    selector_validation = _selector_report(selected_rows, eligible_rows, label_key="test_good_strict")
+    selector_positive_validation = _selector_report(selected_rows, eligible_rows, label_key="test_positive")
+    baselines = _baseline_reports(eligible_rows, len(selected_rows), label_key="test_good_strict")
+    transition = _transition_summary(eligible_rows)
     summary = {
         "version": "evaluate_residual_tetris_oracle_v0",
         "base_model_dir": str(base_model_dir),
@@ -1137,10 +1540,31 @@ def main() -> None:
         "num_clusters_total": int(len(clusters)),
         "num_clusters_evaluated": int(len(rows)),
         "num_clusters_eligible": int(len(eligible_rows)),
+        "lockbox_note": (
+            "A/B/C *_test fields are analysis-test diagnostics in this development run. "
+            "Deployable selection must use *_selection fields only; use an unseen final scene/test for final claims."
+        ),
         "num_gate_a_pass": int(len(pass_rows)),
         "num_gate_c_pass": int(len(c_pass_rows)),
         "gate_a_pass_ratio": float(len(pass_rows) / max(len(eligible_rows), 1)),
         "gate_c_pass_ratio": float(len(c_pass_rows) / max(len(eligible_rows), 1)),
+        "analysis_test_oracle": {
+            "num_gate_a_pass": int(len(pass_rows)),
+            "num_gate_c_pass": int(len(c_pass_rows)),
+            "gate_a_pass_ratio": float(len(pass_rows) / max(len(eligible_rows), 1)),
+            "gate_c_pass_ratio": float(len(c_pass_rows) / max(len(eligible_rows), 1)),
+            "aggregate_delivery_retention": float(agg_gc / max(agg_ga, 1e-10)) if agg_ga > 0.0 else float("nan"),
+        },
+        "selector_validation": selector_validation,
+        "selector_positive_validation": selector_positive_validation,
+        "selector_transition": transition,
+        "selector_baselines": baselines,
+        "selector_counts": {
+            "core_pass": int(len(selected_rows)),
+            "capacity_limited_pass": int(len(capacity_limited_rows)),
+            "test_good_strict": int(sum(1 for r in eligible_rows if bool(r.get("test_good_strict")))),
+            "test_positive": int(sum(1 for r in eligible_rows if bool(r.get("test_positive")))),
+        },
         "aggregate_delivery_retention": float(agg_gc / max(agg_ga, 1e-10)) if agg_ga > 0.0 else float("nan"),
         "candidate_grid": [c.name for c in candidate_grid],
         "params": vars(args),
@@ -1153,6 +1577,7 @@ def main() -> None:
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     (output_dir / "rows.json").write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
+    (output_dir / "selected_rows.json").write_text(json.dumps(selected_rows, indent=2) + "\n", encoding="utf-8")
     readme = output_dir / "README.txt"
     readme.write_text(
         "\n".join(
@@ -1165,8 +1590,13 @@ def main() -> None:
                 "C_*: true/proxy q_parent delivery capacity.",
                 "wrong_slot_* and shuffled_q_* are matched negative controls.",
                 "",
+                "Important: *_test fields are analysis-test diagnostics for this run.",
+                "Deployable selector flags use *_selection fields, matched-null selection margins,",
+                "and beta diagnostics only. See selector_validation and selector_transition.",
+                "",
                 f"Main summary: {output_dir / 'summary.json'}",
                 f"Rows: {output_dir / 'rows.json'}",
+                f"Selected rows: {output_dir / 'selected_rows.json'}",
                 f"Debug: {output_dir / 'debug'}",
                 f"physical_q_source={summary['physical_q_source']}",
             ]
