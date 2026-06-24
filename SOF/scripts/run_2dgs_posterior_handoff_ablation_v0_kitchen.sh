@@ -31,6 +31,7 @@ CHECK_ROOT="${CHECK_ROOT:-${WORK_ROOT}/check/2dgs_posterior_handoff/${INPUT_NAME
 METADATA_PATH="${METADATA_PATH:-${INPUT_MODEL_DIR}/point_cloud/iteration_${ITERATION}/sprayed_2dgs_posterior_metadata_v0.npz}"
 GT_DIR="${GT_DIR:-${BASE_MODEL_DIR}/train/ours_${ITERATION}/gt_1}"
 RUN_QUALITY_METRICS="${RUN_QUALITY_METRICS:-1}"
+SAVE_VARIANT_MODEL="${SAVE_VARIANT_MODEL:-0}"
 
 FRONT_OFFSET="${FRONT_OFFSET:-0.0015}"
 PARENT_TAU_FRACTION_MAX="${PARENT_TAU_FRACTION_MAX:-0.12}"
@@ -110,6 +111,10 @@ export_variant() {
   local tau="$6"
   local scale="$7"
   shift 7
+  local export_extra_args=()
+  if [[ "${SAVE_VARIANT_MODEL}" != "1" ]]; then
+    export_extra_args+=(--no_save_variant_model)
+  fi
   "${PYTHON_BIN}" "${SOF_ROOT}/scripts/export_gaussian_group_variant_v0.py" \
     --scene_root "${SCENE_ROOT}" \
     --model_path "${model_path}" \
@@ -124,6 +129,7 @@ export_variant() {
     --selection_mode "${mode}" \
     --tau_scale "${tau}" \
     --scale_multiplier "${scale}" \
+    "${export_extra_args[@]}" \
     "$@"
 }
 

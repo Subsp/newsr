@@ -384,6 +384,7 @@ def export_variant(
     save_alpha: bool,
     save_depth: bool,
     save_premul: bool,
+    save_variant_model: bool,
 ) -> Dict[str, object]:
     dataset = _build_dataset_args(str(scene_root), str(model_path), images_subdir, white_background)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -401,10 +402,6 @@ def export_variant(
     if selected_count <= 0 and str(selection_mode).strip().lower() != "full":
         raise ValueError(f"Selection '{selection_key}' from {selection_source} selected zero gaussians.")
 
-    variant_root = output_root / "variant_model"
-    point_dir = variant_root / "point_cloud" / f"iteration_{loaded_iter}"
-    point_dir.mkdir(parents=True, exist_ok=True)
-    _copy_render_config(model_path, variant_root)
     variant = _apply_group_variant(
         gaussians,
         selected_mask=selected_mask,
@@ -444,12 +441,22 @@ def export_variant(
             raise ValueError("Weak mask length mismatch for variant export.")
         _scale_masked_opacity(variant, weak_mask, weak_tau_scale)
         _scale_masked_dc(variant, weak_mask, weak_dc_scale)
-    variant.save_ply(str(point_dir / "point_cloud.ply"))
-    variant.save_tracking_metadata(str(point_dir / "gaussian_tags.pt"))
 
-    render_dataset = _build_dataset_args(str(scene_root), str(variant_root), images_subdir, white_background)
-    render_gaussians = GaussianModel(render_dataset.sh_degree)
-    render_scene = _make_scene(render_dataset, render_gaussians, load_iteration=loaded_iter)
+    variant_root = output_root / "variant_model"
+    point_dir = variant_root / "point_cloud" / f"iteration_{loaded_iter}"
+    if bool(save_variant_model):
+        point_dir.mkdir(parents=True, exist_ok=True)
+        _copy_render_config(model_path, variant_root)
+        variant.save_ply(str(point_dir / "point_cloud.ply"))
+        variant.save_tracking_metadata(str(point_dir / "gaussian_tags.pt"))
+        render_dataset = _build_dataset_args(str(scene_root), str(variant_root), images_subdir, white_background)
+        render_gaussians = GaussianModel(render_dataset.sh_degree)
+        render_scene = _make_scene(render_dataset, render_gaussians, load_iteration=loaded_iter)
+    else:
+        # Preview/ablation runs only need image outputs. Rendering the in-memory
+        # variant avoids writing another full point_cloud.ply for every state.
+        render_gaussians = variant
+        render_scene = scene
     _compute_3d_filter_compat(render_gaussians, render_scene.getTrainCameras().copy())
     background = torch.tensor([1, 1, 1] if white_background else [0, 0, 0], dtype=torch.float32, device="cuda")
 
@@ -535,11 +542,12 @@ def export_variant(
             "weak_gaussians": None if weak_mask is None else int(weak_mask.sum().item()),
             "weak_tau_scale": float(weak_tau_scale),
             "weak_dc_scale": float(weak_dc_scale),
+            "save_variant_model": bool(save_variant_model),
         },
         "paths": {
-            "variant_model_root": str(variant_root),
-            "variant_ply": str(point_dir / "point_cloud.ply"),
-            "variant_tags": str(point_dir / "gaussian_tags.pt"),
+            "variant_model_root": str(variant_root) if bool(save_variant_model) else None,
+            "variant_ply": str(point_dir / "point_cloud.ply") if bool(save_variant_model) else None,
+            "variant_tags": str(point_dir / "gaussian_tags.pt") if bool(save_variant_model) else None,
         },
         "renders": render_summary,
     }
@@ -581,6 +589,11 @@ def main() -> None:
     parser.add_argument("--save_alpha", action="store_true")
     parser.add_argument("--save_depth", action="store_true")
     parser.add_argument("--save_premul", action="store_true")
+    parser.add_argument(
+        "--no_save_variant_model",
+        action="store_true",
+        help="Render the in-memory variant without writing a full variant_model point cloud.",
+    )
     args = parser.parse_args()
 
     scene_root = Path(args.scene_root).expanduser().resolve()
@@ -631,6 +644,7 @@ def main() -> None:
         save_alpha=bool(args.save_alpha),
         save_depth=bool(args.save_depth),
         save_premul=bool(args.save_premul),
+        save_variant_model=not bool(args.no_save_variant_model),
     )
     print(json.dumps(summary, indent=2))
 
