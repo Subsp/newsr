@@ -324,6 +324,13 @@ def _safe_percentile(value: np.ndarray, percentile: float) -> float:
     return float(np.percentile(arr, percentile))
 
 
+def _concat_nonempty(values: Sequence[np.ndarray]) -> np.ndarray:
+    arrays = [np.asarray(v).reshape(-1) for v in values if np.asarray(v).size > 0]
+    if not arrays:
+        return np.zeros((0,), dtype=np.float32)
+    return np.concatenate(arrays, axis=0).astype(np.float32, copy=False)
+
+
 def _roi_bounds(center: np.ndarray, long_px: float, short_px: float, shape: Tuple[int, int], pad: int) -> Tuple[int, int, int, int]:
     h, w = shape
     r = int(math.ceil(max(float(long_px), float(short_px), 1.0) * 4.0 + float(pad)))
@@ -535,7 +542,7 @@ def _fit_beta(
         beta_rgb = np.asarray([beta[0], beta[0], beta[0]], dtype=np.float32)
     else:
         beta_rgb = beta.astype(np.float32)
-    q_concat = np.concatenate([q.reshape(-1) for q in q_values if q.size > 0], axis=0) if q_values else np.zeros((0,), dtype=np.float32)
+    q_concat = _concat_nonempty(q_values)
     stats = {
         "fit_pixels": float(fit_pixels),
         "target_energy": float(target_energy),
@@ -658,7 +665,7 @@ def _eval_beta(
     leak = off_energy / max(pred_energy, 1e-10)
     precision = pred_energy / max(pred_energy + off_energy, 1e-10)
     lp = lp_energy / max(target_energy, 1e-10)
-    q_concat = np.concatenate([q.reshape(-1) for q in q_vals if q.size > 0], axis=0) if q_vals else np.zeros((0,), dtype=np.float32)
+    q_concat = _concat_nonempty(q_vals)
     return {
         "views": float(len(obs_list)),
         "fit_pixels": float(fit_pixels),
@@ -859,7 +866,7 @@ def _eval_cluster(
     q_values = []
     for o in fit:
         q_values.append(o.q_parent[o.core_weight > float(args.core_weight_threshold)])
-    q_concat = np.concatenate([x.reshape(-1) for x in q_values if x.size > 0], axis=0) if q_values else np.zeros((0,), dtype=np.float32)
+    q_concat = _concat_nonempty(q_values)
     q_global = _safe_percentile(q_concat, float(args.q_percentile))
 
     beta_luma, _fit_luma = _fit_beta(fit, cand, args, q_mode="A", beta_mode="luma")
