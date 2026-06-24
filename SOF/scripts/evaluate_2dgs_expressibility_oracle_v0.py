@@ -104,6 +104,13 @@ def _normalize(value: np.ndarray, percentile: float) -> np.ndarray:
     arr = np.nan_to_num(np.asarray(value, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
     scale = float(np.percentile(arr, float(percentile)))
     if scale <= 1e-8:
+        positive = arr[arr > 1e-8]
+        if positive.size <= 0:
+            return np.zeros_like(arr, dtype=np.float32)
+        # Sparse alpha/support maps can have p99 == 0 even when the visible
+        # footprint is real. Fall back to the positive tail instead of erasing it.
+        scale = float(np.percentile(positive, min(float(percentile), 99.0)))
+    if scale <= 1e-8:
         return np.zeros_like(arr, dtype=np.float32)
     return np.clip(arr / scale, 0.0, 1.0).astype(np.float32)
 
@@ -200,6 +207,22 @@ def _linear_rgb_oracle(
     w = w_fit + w_leak
     beta = np.zeros((3,), dtype=np.float32)
     pred = np.zeros_like(t, dtype=np.float32)
+    fit_count = int(np.count_nonzero(w_fit > 1e-8))
+    target_energy = float(np.sum(w_fit[..., None] * t * t))
+    if fit_count < 16 or target_energy <= 1e-10:
+        return pred, beta, {
+            "valid_fit": 0.0,
+            "fit_pixels": float(fit_count),
+            "explained_energy": 0.0,
+            "psnr_fit": float("nan"),
+            "signed_corr_fit": 0.0,
+            "abs_corr_fit": 0.0,
+            "offtarget_leak_ratio": 0.0,
+            "beta_abs_max": 0.0,
+            "beta_l2": 0.0,
+            "pred_abs_p99": 0.0,
+            "pred_saturation_ratio": 0.0,
+        }
     for channel in range(3):
         bc = b[..., channel]
         tc = t[..., channel]
@@ -208,12 +231,13 @@ def _linear_rgb_oracle(
         beta[channel] = numerator / denominator
         pred[..., channel] = bc * beta[channel]
     fit_w = w_fit[..., None]
-    target_energy = float(np.sum(fit_w * t * t))
     residual_energy = float(np.sum(fit_w * (t - pred) * (t - pred)))
     explained = 1.0 - residual_energy / max(target_energy, 1e-8)
     on_abs = np.abs(pred).mean(axis=2)
     off_leak = _safe_mean(on_abs, leak_mask) / max(_safe_mean(on_abs, fit_mask), 1e-8)
     stats = {
+        "valid_fit": 1.0,
+        "fit_pixels": float(fit_count),
         "explained_energy": float(explained),
         "psnr_fit": _psnr(t, pred, fit_mask.astype(np.float32)),
         "signed_corr_fit": _corr(pred, t, fit_mask.astype(np.float32)),
@@ -242,16 +266,34 @@ def _linear_scalar_oracle(
     w = w_fit + w_leak
     wb_fit = w_fit[..., None]
     wb = w[..., None]
+    fit_count = int(np.count_nonzero(w_fit > 1e-8))
+    target_energy = float(np.sum(wb_fit * t * t))
+    if fit_count < 16 or target_energy <= 1e-10:
+        pred = np.zeros_like(t, dtype=np.float32)
+        return pred, 0.0, {
+            "valid_fit": 0.0,
+            "fit_pixels": float(fit_count),
+            "explained_energy": 0.0,
+            "psnr_fit": float("nan"),
+            "signed_corr_fit": 0.0,
+            "abs_corr_fit": 0.0,
+            "offtarget_leak_ratio": 0.0,
+            "gamma": 0.0,
+            "gamma_abs": 0.0,
+            "pred_abs_p99": 0.0,
+            "pred_saturation_ratio": 0.0,
+        }
     numerator = float(np.sum(wb_fit * b * t))
     denominator = float(np.sum(wb * b * b) + 1e-8)
     gamma = numerator / denominator
     pred = b * gamma
-    target_energy = float(np.sum(wb_fit * t * t))
     residual_energy = float(np.sum(wb_fit * (t - pred) * (t - pred)))
     explained = 1.0 - residual_energy / max(target_energy, 1e-8)
     pred_abs = np.abs(pred).mean(axis=2)
     off_leak = _safe_mean(pred_abs, leak_mask) / max(_safe_mean(pred_abs, fit_mask), 1e-8)
     stats = {
+        "valid_fit": 1.0,
+        "fit_pixels": float(fit_count),
         "explained_energy": float(explained),
         "psnr_fit": _psnr(t, pred, fit_mask.astype(np.float32)),
         "signed_corr_fit": _corr(pred, t, fit_mask.astype(np.float32)),
