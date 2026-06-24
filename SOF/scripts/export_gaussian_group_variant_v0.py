@@ -287,6 +287,7 @@ def _apply_group_variant(
     scale_multiplier: float,
     scale_axis_mode: str,
     filter_multiplier: float,
+    normal_offset: float,
 ) -> GaussianModel:
     full_mask = torch.ones((int(gaussians.get_xyz.shape[0]),), dtype=torch.bool, device=gaussians.get_xyz.device)
     variant = _clone_subset_gaussians(gaussians, full_mask)
@@ -315,6 +316,19 @@ def _apply_group_variant(
         variant._scaling.data[selected] = torch.log(torch.clamp(scale, min=1e-8))
     if float(filter_multiplier) != 1.0 and isinstance(variant.filter_3D, torch.Tensor):
         variant.filter_3D[selected] = torch.clamp(variant.filter_3D[selected] * float(filter_multiplier), min=0.0)
+    if float(normal_offset) != 0.0 and torch.any(selected):
+        quat = torch.nn.functional.normalize(variant._rotation.data[selected], dim=1, eps=1e-8)
+        w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+        normal = torch.stack(
+            [
+                2.0 * (x * z + y * w),
+                2.0 * (y * z - x * w),
+                1.0 - 2.0 * (x * x + y * y),
+            ],
+            dim=1,
+        )
+        normal = torch.nn.functional.normalize(normal, dim=1, eps=1e-8)
+        variant._xyz.data[selected] = variant._xyz.data[selected] + normal * float(normal_offset)
 
     mode = str(selection_mode).strip().lower()
     if mode == "selected_only":
@@ -373,6 +387,7 @@ def export_variant(
     scale_multiplier: float,
     scale_axis_mode: str,
     filter_multiplier: float,
+    normal_offset: float,
     post_mute_selection_source: str,
     post_mute_selection_key: str,
     post_mute_mask_payload_path: Path | None,
@@ -413,6 +428,7 @@ def export_variant(
         scale_multiplier=scale_multiplier,
         scale_axis_mode=scale_axis_mode,
         filter_multiplier=filter_multiplier,
+        normal_offset=normal_offset,
     )
     post_mute_mask = None
     if str(post_mute_selection_key).strip():
@@ -532,6 +548,7 @@ def export_variant(
             "scale_multiplier": float(scale_multiplier),
             "scale_axis_mode": str(scale_axis_mode),
             "filter_multiplier": float(filter_multiplier),
+            "normal_offset": float(normal_offset),
             "post_mute_selection_source": str(post_mute_selection_source),
             "post_mute_selection_key": str(post_mute_selection_key),
             "post_mute_mask_payload_path": str(post_mute_mask_payload_path) if post_mute_mask_payload_path else None,
@@ -578,6 +595,7 @@ def main() -> None:
     parser.add_argument("--scale_multiplier", type=float, default=1.0)
     parser.add_argument("--scale_axis_mode", choices=["all", "major_only"], default="all")
     parser.add_argument("--filter_multiplier", type=float, default=1.0)
+    parser.add_argument("--normal_offset", type=float, default=0.0)
     parser.add_argument("--post_mute_selection_source", default="payload")
     parser.add_argument("--post_mute_selection_key", default="")
     parser.add_argument("--post_mute_mask_payload_path", default=None)
@@ -633,6 +651,7 @@ def main() -> None:
         scale_multiplier=float(args.scale_multiplier),
         scale_axis_mode=str(args.scale_axis_mode),
         filter_multiplier=float(args.filter_multiplier),
+        normal_offset=float(args.normal_offset),
         post_mute_selection_source=str(args.post_mute_selection_source),
         post_mute_selection_key=str(args.post_mute_selection_key),
         post_mute_mask_payload_path=post_mute_mask_payload_path,
