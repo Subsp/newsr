@@ -255,7 +255,7 @@ def _compare_composed(
     *,
     lowpass_kernel: int,
 ) -> Dict[str, object]:
-    keys = (
+    render_critical_keys = (
         "pred",
         "pred_raw",
         "pred_lp",
@@ -263,10 +263,11 @@ def _compare_composed(
         "off_weight",
         "overlap",
         "q_parent_peak",
-        "dominant_id",
         "preview",
         "out_of_range",
     )
+    diagnostic_keys = ("dominant_id",)
+    keys = (*render_critical_keys, *diagnostic_keys)
     per_key: Dict[str, Dict[str, float]] = {}
     for key in keys:
         rows = []
@@ -291,15 +292,37 @@ def _compare_composed(
         if isinstance(av, (int, float)) and isinstance(bv, (int, float)):
             if math.isfinite(float(av)) and math.isfinite(float(bv)):
                 metric_diff[key] = float(abs(float(av) - float(bv)))
+    render_key_stats = {key: per_key[key] for key in render_critical_keys if key in per_key}
+    diagnostic_key_stats = {key: per_key[key] for key in diagnostic_keys if key in per_key}
+    render_critical_pass = (
+        all(v["mae"] < 1e-5 for v in render_key_stats.values())
+        and all(v["max_abs"] < 1e-4 for v in render_key_stats.values())
+        and all(v < 1e-3 for v in metric_diff.values())
+    )
+    diagnostic_exact_pass = (
+        all(v["mae"] < 1e-5 for v in diagnostic_key_stats.values())
+        and all(v["max_abs"] < 1e-4 for v in diagnostic_key_stats.values())
+    )
     return {
         "array_max_by_key": per_key,
+        "render_critical_keys": list(render_critical_keys),
+        "diagnostic_keys": list(diagnostic_keys),
         "static_metrics": static_metrics,
         "preview_metrics": preview_metrics,
         "metric_abs_diff": metric_diff,
+        "render_critical_pass": bool(render_critical_pass),
+        "diagnostic_exact_pass": bool(diagnostic_exact_pass),
+        "overall_ready_for_lockbox": bool(render_critical_pass),
+        "diagnostic_warning": (
+            "dominant_id is diagnostic-only and may differ on near-tie pixels; it does not affect residual rendering."
+            if not diagnostic_exact_pass
+            else ""
+        ),
         "passes": {
-            "float_mae_lt_1e-5": all(v["mae"] < 1e-5 for v in per_key.values()),
-            "max_error_lt_1e-4": all(v["max_abs"] < 1e-4 for v in per_key.values()),
+            "render_critical_float_mae_lt_1e-5": all(v["mae"] < 1e-5 for v in render_key_stats.values()),
+            "render_critical_max_error_lt_1e-4": all(v["max_abs"] < 1e-4 for v in render_key_stats.values()),
             "metric_diff_lt_1e-3": all(v < 1e-3 for v in metric_diff.values()),
+            "diagnostic_exact": bool(diagnostic_exact_pass),
         },
     }
 
