@@ -149,6 +149,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--selector_beta_saturation_max", type=float, default=0.50)
     parser.add_argument("--selector_beta_max_fraction_max", type=float, default=0.90)
     parser.add_argument("--selector_null_margin_min", type=float, default=0.0)
+    parser.add_argument("--selector_curve_counts", default="8,16,28,40,56,74,120")
+    parser.add_argument("--selector_curve_ratios", default="0.05,0.10,0.15,0.20,0.30,0.50")
+    parser.add_argument(
+        "--selector_curve_rank_keys",
+        default="selector_score,C_selection_explained_energy,A_selection_explained_energy,cluster_target_energy,C_selection_gain",
+    )
     parser.add_argument("--test_good_corr_threshold", type=float, default=0.20)
     parser.add_argument("--test_good_ee_threshold", type=float, default=0.05)
     parser.add_argument("--test_good_leak_max", type=float, default=0.30)
@@ -1267,12 +1273,208 @@ def _selector_report(
     }
 
 
+def _selector_report_pair(
+    selected_rows: Sequence[Dict[str, object]],
+    eligible_rows: Sequence[Dict[str, object]],
+) -> Dict[str, object]:
+    strict = _selector_report(selected_rows, eligible_rows, label_key="test_good_strict")
+    positive = _selector_report(selected_rows, eligible_rows, label_key="test_positive")
+    return {
+        "strict": strict,
+        "positive": positive,
+        "headline": {
+            "count": strict["selected_count"],
+            "strict_precision": strict["selected_precision"],
+            "strict_weighted_FDR": strict["weighted_FDR"],
+            "strict_gain_capture": strict["oracle_gain_capture"],
+            "strict_energy_capture": strict["oracle_energy_capture"],
+            "positive_precision": positive["selected_precision"],
+            "positive_weighted_FDR": positive["weighted_FDR"],
+            "positive_gain_capture": positive["oracle_gain_capture"],
+            "target_energy_coverage": strict["selected_target_energy_coverage"],
+            "beta_saturation_median": strict["selected_beta_saturation_median"],
+        },
+    }
+
+
 def _top_k(rows: Sequence[Dict[str, object]], key: str, k: int, *, descending: bool = True) -> List[Dict[str, object]]:
     def sort_key(row: Dict[str, object]) -> float:
         value = _finite_float(row.get(key), float("-inf") if descending else float("inf"))
         return value
 
     return sorted(rows, key=sort_key, reverse=descending)[: max(int(k), 0)]
+
+
+def _selector_stage_predicates() -> List[Tuple[str, object]]:
+    return [
+        ("A_only", lambda r: bool(r.get("pass_A_selection"))),
+        ("AB", lambda r: bool(r.get("pass_A_selection")) and bool(r.get("pass_B_selection"))),
+        (
+            "ABC_no_controls_no_capacity",
+            lambda r: bool(r.get("pass_A_selection"))
+            and bool(r.get("pass_B_selection"))
+            and bool(r.get("pass_C_selection")),
+        ),
+        (
+            "ABC_controls_no_capacity",
+            lambda r: bool(r.get("pass_A_selection"))
+            and bool(r.get("pass_B_selection"))
+            and bool(r.get("pass_C_selection"))
+            and bool(r.get("pass_controls_selection")),
+        ),
+        (
+            "ABC_capacity_no_controls",
+            lambda r: bool(r.get("pass_A_selection"))
+            and bool(r.get("pass_B_selection"))
+            and bool(r.get("pass_C_selection"))
+            and bool(r.get("pass_capacity")),
+        ),
+        ("core_pass", lambda r: bool(r.get("selector_core_pass"))),
+        ("capacity_limited_failures", lambda r: bool(r.get("selector_capacity_limited_pass"))),
+        ("C_only", lambda r: bool(r.get("pass_C_selection"))),
+        ("controls_only", lambda r: bool(r.get("pass_controls_selection"))),
+        ("capacity_only", lambda r: bool(r.get("pass_capacity"))),
+    ]
+
+
+def _selector_ablation_reports(eligible_rows: Sequence[Dict[str, object]]) -> Dict[str, object]:
+    rows = list(eligible_rows)
+    reports: Dict[str, object] = {}
+    for name, predicate in _selector_stage_predicates():
+        selected = [row for row in rows if predicate(row)]
+        reports[name] = _selector_report_pair(selected, rows)
+    return reports
+
+
+def _curve_counts(total: int, selected_count: int, args: argparse.Namespace) -> List[int]:
+    counts = {selected_count, max(selected_count * 2, 0)}
+    counts.update(int(x) for x in _parse_csv(str(args.selector_curve_counts), int) if int(x) > 0)
+    for ratio in _parse_csv(str(args.selector_curve_ratios), float):
+        if float(ratio) > 0.0:
+            counts.add(int(round(float(total) * float(ratio))))
+    return sorted(k for k in counts if 0 < k <= max(int(total), 0))
+
+
+def _rows_for_selector_family(rows: Sequence[Dict[str, object]], family: str) -> List[Dict[str, object]]:
+    predicates = {
+        "all": lambda r: True,
+        "A": lambda r: bool(r.get("pass_A_selection")),
+        "AB": lambda r: bool(r.get("pass_A_selection")) and bool(r.get("pass_B_selection")),
+        "ABC": lambda r: bool(r.get("pass_A_selection"))
+        and bool(r.get("pass_B_selection"))
+        and bool(r.get("pass_C_selection")),
+        "ABC_controls": lambda r: bool(r.get("pass_A_selection"))
+        and bool(r.get("pass_B_selection"))
+        and bool(r.get("pass_C_selection"))
+        and bool(r.get("pass_controls_selection")),
+        "ABC_capacity": lambda r: bool(r.get("pass_A_selection"))
+        and bool(r.get("pass_B_selection"))
+        and bool(r.get("pass_C_selection"))
+        and bool(r.get("pass_capacity")),
+    }
+    predicate = predicates[family]
+    return [row for row in rows if predicate(row)]
+
+
+def _curve_point(
+    *,
+    family: str,
+    rank_key: str,
+    selected_rows: Sequence[Dict[str, object]],
+    family_count: int,
+    eligible_rows: Sequence[Dict[str, object]],
+    k: int,
+) -> Dict[str, object]:
+    report = _selector_report_pair(selected_rows, eligible_rows)
+    return {
+        "family": family,
+        "rank_key": rank_key,
+        "k": int(k),
+        "family_count": int(family_count),
+        **report,
+    }
+
+
+def _selector_curve_headline(points: Sequence[Dict[str, object]]) -> Dict[str, object]:
+    def metric(point: Dict[str, object], section: str, key: str, default: float = float("-inf")) -> float:
+        value = point.get(section, {}).get(key, default) if isinstance(point.get(section), dict) else default
+        return _finite_float(value, default)
+
+    def brief(point: Optional[Dict[str, object]]) -> Optional[Dict[str, object]]:
+        if point is None:
+            return None
+        strict = point["strict"]
+        positive = point["positive"]
+        return {
+            "family": point["family"],
+            "rank_key": point["rank_key"],
+            "k": point["k"],
+            "family_count": point["family_count"],
+            "strict_precision": strict["selected_precision"],
+            "strict_FDR": strict["selected_FDR"],
+            "strict_weighted_FDR": strict["weighted_FDR"],
+            "strict_gain_capture": strict["oracle_gain_capture"],
+            "strict_energy_capture": strict["oracle_energy_capture"],
+            "positive_precision": positive["selected_precision"],
+            "positive_FDR": positive["selected_FDR"],
+            "positive_weighted_FDR": positive["weighted_FDR"],
+            "positive_gain_capture": positive["oracle_gain_capture"],
+            "target_energy_coverage": strict["selected_target_energy_coverage"],
+            "beta_saturation_median": strict["selected_beta_saturation_median"],
+        }
+
+    valid = [p for p in points if metric(p, "strict", "selected_count", 0.0) > 0.0]
+    strict_safe = [p for p in valid if metric(p, "strict", "selected_FDR") <= 0.35]
+    strict_loose = [p for p in valid if metric(p, "strict", "selected_FDR") <= 0.45]
+    positive_safe = [p for p in valid if metric(p, "positive", "weighted_FDR") <= 0.20]
+    return {
+        "best_strict_gain_at_FDR_le_035": brief(max(strict_safe, key=lambda p: metric(p, "strict", "oracle_gain_capture"), default=None)),
+        "best_strict_gain_at_FDR_le_045": brief(max(strict_loose, key=lambda p: metric(p, "strict", "oracle_gain_capture"), default=None)),
+        "best_positive_gain_at_weighted_FDR_le_020": brief(
+            max(positive_safe, key=lambda p: metric(p, "positive", "oracle_gain_capture"), default=None)
+        ),
+        "max_strict_precision": brief(max(valid, key=lambda p: metric(p, "strict", "selected_precision"), default=None)),
+        "max_strict_gain_capture": brief(max(valid, key=lambda p: metric(p, "strict", "oracle_gain_capture"), default=None)),
+        "max_positive_gain_capture": brief(max(valid, key=lambda p: metric(p, "positive", "oracle_gain_capture"), default=None)),
+    }
+
+
+def _selector_curve_reports(
+    eligible_rows: Sequence[Dict[str, object]],
+    selected_count: int,
+    args: argparse.Namespace,
+) -> Dict[str, object]:
+    rows = list(eligible_rows)
+    counts = _curve_counts(len(rows), selected_count, args)
+    rank_keys = [str(x) for x in _parse_csv(str(args.selector_curve_rank_keys), str)]
+    families = ["all", "A", "AB", "ABC", "ABC_controls", "ABC_capacity"]
+    points: List[Dict[str, object]] = []
+    for family in families:
+        family_rows = _rows_for_selector_family(rows, family)
+        if not family_rows:
+            continue
+        for rank_key in rank_keys:
+            for k in counts:
+                if k > len(family_rows):
+                    continue
+                selected = _top_k(family_rows, rank_key, k)
+                points.append(
+                    _curve_point(
+                        family=family,
+                        rank_key=rank_key,
+                        selected_rows=selected,
+                        family_count=len(family_rows),
+                        eligible_rows=rows,
+                        k=k,
+                    )
+                )
+    return {
+        "counts": counts,
+        "families": families,
+        "rank_keys": rank_keys,
+        "points": points,
+        "headline": _selector_curve_headline(points),
+    }
 
 
 def _baseline_reports(
@@ -1524,6 +1726,8 @@ def main() -> None:
     selector_validation = _selector_report(selected_rows, eligible_rows, label_key="test_good_strict")
     selector_positive_validation = _selector_report(selected_rows, eligible_rows, label_key="test_positive")
     baselines = _baseline_reports(eligible_rows, len(selected_rows), label_key="test_good_strict")
+    selector_ablation = _selector_ablation_reports(eligible_rows)
+    selector_curve = _selector_curve_reports(eligible_rows, len(selected_rows), args)
     transition = _transition_summary(eligible_rows)
     summary = {
         "version": "evaluate_residual_tetris_oracle_v0",
@@ -1559,6 +1763,8 @@ def main() -> None:
         "selector_positive_validation": selector_positive_validation,
         "selector_transition": transition,
         "selector_baselines": baselines,
+        "selector_ablation": selector_ablation,
+        "selector_curve_headline": selector_curve["headline"],
         "selector_counts": {
             "core_pass": int(len(selected_rows)),
             "capacity_limited_pass": int(len(capacity_limited_rows)),
@@ -1578,6 +1784,8 @@ def main() -> None:
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     (output_dir / "rows.json").write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
     (output_dir / "selected_rows.json").write_text(json.dumps(selected_rows, indent=2) + "\n", encoding="utf-8")
+    (output_dir / "selector_ablation.json").write_text(json.dumps(selector_ablation, indent=2) + "\n", encoding="utf-8")
+    (output_dir / "selector_curve.json").write_text(json.dumps(selector_curve, indent=2) + "\n", encoding="utf-8")
     readme = output_dir / "README.txt"
     readme.write_text(
         "\n".join(
@@ -1597,6 +1805,8 @@ def main() -> None:
                 f"Main summary: {output_dir / 'summary.json'}",
                 f"Rows: {output_dir / 'rows.json'}",
                 f"Selected rows: {output_dir / 'selected_rows.json'}",
+                f"Selector ablation: {output_dir / 'selector_ablation.json'}",
+                f"Selector curve: {output_dir / 'selector_curve.json'}",
                 f"Debug: {output_dir / 'debug'}",
                 f"physical_q_source={summary['physical_q_source']}",
             ]
