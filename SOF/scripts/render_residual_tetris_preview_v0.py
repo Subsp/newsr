@@ -64,6 +64,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--clean_negative_view_ratio", type=float, default=0.5)
     parser.add_argument("--clean_lp_drift_marginal_min", type=float, default=0.0)
     parser.add_argument("--clean_leakage_marginal_min", type=float, default=0.0)
+    parser.add_argument("--minimal_clean_drop_cluster_ids", default="165")
     return parser.parse_args()
 
 
@@ -83,6 +84,7 @@ def _copy_to_check(output_dir: Path, check_dir: Path) -> None:
         "dose_curve.json",
         "leave_one_cell_out.json",
         "per_cell_marginals.json",
+        "minimal_clean_selected_rows.json",
         "clean_selected_rows.json",
         "clean_rejected_rows.json",
         "negative_view_diagnostics.json",
@@ -98,9 +100,12 @@ def _copy_to_check(output_dir: Path, check_dir: Path) -> None:
         "visuals/deploy_top40_bounded/base_plus_residual",
         "visuals/deploy_top40_bounded/residual_pred",
         "visuals/deploy_top40_bounded/error_after",
-        "visuals/deploy_top40_clean/base_plus_residual",
-        "visuals/deploy_top40_clean/residual_pred",
-        "visuals/deploy_top40_clean/error_after",
+        "visuals/deploy_top40_minimal_clean_dev/base_plus_residual",
+        "visuals/deploy_top40_minimal_clean_dev/residual_pred",
+        "visuals/deploy_top40_minimal_clean_dev/error_after",
+        "visuals/deploy_top40_clean29/base_plus_residual",
+        "visuals/deploy_top40_clean29/residual_pred",
+        "visuals/deploy_top40_clean29/error_after",
         "visuals/core28/base_plus_residual",
         "visuals/base",
         "visuals/target_hf",
@@ -408,11 +413,39 @@ def _compose(
     return out
 
 
-def _metrics_for_view(data: Dict[str, np.ndarray], lowpass_kernel: int = 21) -> Dict[str, float]:
+def _support_map_from_composed(composed: Dict[str, Dict[str, np.ndarray]]) -> Dict[str, Dict[str, np.ndarray]]:
+    return {
+        stem: {
+            "weight": np.asarray(data["weight"], dtype=np.float32).copy(),
+            "off_weight": np.asarray(data["off_weight"], dtype=np.float32).copy(),
+        }
+        for stem, data in composed.items()
+    }
+
+
+def _support_for_data(
+    data: Dict[str, np.ndarray],
+    support_map: Optional[Dict[str, Dict[str, np.ndarray]]],
+    stem: str,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if support_map is None or stem not in support_map:
+        return np.asarray(data["weight"], dtype=np.float32), np.asarray(data["off_weight"], dtype=np.float32)
+    support = support_map[stem]
+    return np.asarray(support["weight"], dtype=np.float32), np.asarray(support.get("off_weight", data["off_weight"]), dtype=np.float32)
+
+
+def _metrics_for_view(
+    data: Dict[str, np.ndarray],
+    lowpass_kernel: int = 21,
+    support_weight: Optional[np.ndarray] = None,
+    off_support_weight: Optional[np.ndarray] = None,
+) -> Dict[str, float]:
     target = data["target_hf"]
     pred = data["pred"]
-    w = np.clip(data["weight"], 0.0, 1.0)
-    ow = np.clip(data["off_weight"], 0.0, 1.0)
+    w_src = data["weight"] if support_weight is None else support_weight
+    ow_src = data["off_weight"] if off_support_weight is None else off_support_weight
+    w = np.clip(w_src, 0.0, 1.0)
+    ow = np.clip(ow_src, 0.0, 1.0)
     fw = w[..., None]
     ow3 = ow[..., None]
     delta_lp = oracle._box_blur(pred, int(lowpass_kernel))
@@ -443,8 +476,21 @@ def _metrics_for_view(data: Dict[str, np.ndarray], lowpass_kernel: int = 21) -> 
     }
 
 
-def _per_view_metrics_for_composed(composed: Dict[str, Dict[str, np.ndarray]], lowpass_kernel: int = 21) -> Dict[str, Dict[str, float]]:
-    return {stem: _metrics_for_view(data, lowpass_kernel=lowpass_kernel) for stem, data in composed.items()}
+def _per_view_metrics_for_composed(
+    composed: Dict[str, Dict[str, np.ndarray]],
+    lowpass_kernel: int = 21,
+    support_map: Optional[Dict[str, Dict[str, np.ndarray]]] = None,
+) -> Dict[str, Dict[str, float]]:
+    out: Dict[str, Dict[str, float]] = {}
+    for stem, data in composed.items():
+        support_weight, off_support_weight = _support_for_data(data, support_map, stem)
+        out[stem] = _metrics_for_view(
+            data,
+            lowpass_kernel=lowpass_kernel,
+            support_weight=support_weight,
+            off_support_weight=off_support_weight,
+        )
+    return out
 
 
 def _finite_median(values: Sequence[float], default: float = 0.0) -> float:
@@ -454,7 +500,11 @@ def _finite_median(values: Sequence[float], default: float = 0.0) -> float:
     return float(np.median(arr))
 
 
-def _metrics_for_composed(composed: Dict[str, Dict[str, np.ndarray]], lowpass_kernel: int = 21) -> Dict[str, float]:
+def _metrics_for_composed(
+    composed: Dict[str, Dict[str, np.ndarray]],
+    lowpass_kernel: int = 21,
+    support_map: Optional[Dict[str, Dict[str, np.ndarray]]] = None,
+) -> Dict[str, float]:
     target_energy = 0.0
     residual_energy = 0.0
     pred_energy = 0.0
@@ -466,11 +516,17 @@ def _metrics_for_composed(composed: Dict[str, Dict[str, np.ndarray]], lowpass_ke
     pred_luma: List[np.ndarray] = []
     target_luma: List[np.ndarray] = []
     weights: List[np.ndarray] = []
-    for data in composed.values():
+    for stem, data in composed.items():
         target = data["target_hf"]
         pred = data["pred"]
-        w = np.clip(data["weight"], 0.0, 1.0)
-        view_metrics = _metrics_for_view(data, lowpass_kernel=lowpass_kernel)
+        support_weight, off_support_weight = _support_for_data(data, support_map, stem)
+        w = np.clip(support_weight, 0.0, 1.0)
+        view_metrics = _metrics_for_view(
+            data,
+            lowpass_kernel=lowpass_kernel,
+            support_weight=support_weight,
+            off_support_weight=off_support_weight,
+        )
         te = float(view_metrics["target_energy"])
         re = float(view_metrics["residual_energy"])
         pe = float(view_metrics["pred_energy"])
@@ -536,6 +592,8 @@ def _variant_report(
     state: Dict[str, object],
     args: SimpleNamespace,
     bounded_clip: Optional[float] = None,
+    raw_support_by_split: Optional[Dict[Optional[str], Dict[str, Dict[str, np.ndarray]]]] = None,
+    global_support_by_split: Optional[Dict[Optional[str], Dict[str, Dict[str, np.ndarray]]]] = None,
 ) -> Dict[str, object]:
     report: Dict[str, object] = {
         "name": name,
@@ -552,7 +610,12 @@ def _variant_report(
         split_filter=None,
         bounded_clip=bounded_clip,
     )
-    report["all_views"] = _metrics_for_composed(all_composed, lowpass_kernel=int(args.lowpass_kernel))
+    report["all_views"] = _metrics_with_support_comparison(
+        all_composed,
+        lowpass_kernel=int(args.lowpass_kernel),
+        raw_support=raw_support_by_split.get(None) if raw_support_by_split else None,
+        global_support=global_support_by_split.get(None) if global_support_by_split else None,
+    )
     for split in SPLITS:
         composed = _compose(
             selected_ids=selected_ids,
@@ -563,7 +626,12 @@ def _variant_report(
             split_filter=split,
             bounded_clip=bounded_clip,
         )
-        metrics = _metrics_for_composed(composed, lowpass_kernel=int(args.lowpass_kernel))
+        metrics = _metrics_with_support_comparison(
+            composed,
+            lowpass_kernel=int(args.lowpass_kernel),
+            raw_support=raw_support_by_split.get(split) if raw_support_by_split else None,
+            global_support=global_support_by_split.get(split) if global_support_by_split else None,
+        )
         sum_individual = _individual_gain(rows, split)
         sum_positive_individual = _positive_individual_gain(rows, split)
         metrics["joint_gain"] = metrics.get("gain", float("nan"))
@@ -575,6 +643,30 @@ def _variant_report(
         metrics["joint_gain_capture_positive"] = float(metrics["joint_gain"] / max(sum_positive_individual, 1e-10))
         report["by_split"][SPLIT_DISPLAY[split]] = metrics
     return report
+
+
+def _metrics_with_support_comparison(
+    composed: Dict[str, Dict[str, np.ndarray]],
+    *,
+    lowpass_kernel: int,
+    raw_support: Optional[Dict[str, Dict[str, np.ndarray]]],
+    global_support: Optional[Dict[str, Dict[str, np.ndarray]]],
+) -> Dict[str, object]:
+    variant_metrics = _metrics_for_composed(composed, lowpass_kernel=lowpass_kernel)
+    raw_metrics = _metrics_for_composed(composed, lowpass_kernel=lowpass_kernel, support_map=raw_support)
+    global_metrics = _metrics_for_composed(composed, lowpass_kernel=lowpass_kernel, support_map=global_support)
+    variant_metrics["gain_on_variant_support"] = variant_metrics.get("gain", float("nan"))
+    variant_metrics["gain_on_raw_union_support"] = raw_metrics.get("gain", float("nan"))
+    variant_metrics["gain_on_global_eligible_support"] = global_metrics.get("gain", float("nan"))
+    variant_metrics["target_energy_on_variant_support"] = variant_metrics.get("target_energy", float("nan"))
+    variant_metrics["target_energy_on_raw_union_support"] = raw_metrics.get("target_energy", float("nan"))
+    variant_metrics["target_energy_on_global_eligible_support"] = global_metrics.get("target_energy", float("nan"))
+    variant_metrics["support_metrics"] = {
+        "variant_support": dict(variant_metrics),
+        "raw_union_support": raw_metrics,
+        "global_eligible_support": global_metrics,
+    }
+    return variant_metrics
 
 
 def _save_variant_visuals(
@@ -747,15 +839,41 @@ def _leave_one_out(
         analysis_values = list((item.get("view_marginals_analysis_test") or {}).values())
         fallback_values = list(view_marginals_all.values())
         values_for_clean = analysis_values if analysis_values else fallback_values
+        selection_values = list((item.get("view_marginals_selection") or {}).values())
         negative_view_count = int(sum(1 for x in values_for_clean if float(x) < 0.0))
         item["negative_view_count"] = negative_view_count
         item["negative_view_ratio"] = float(negative_view_count / max(len(values_for_clean), 1))
         item["worst_view_marginal"] = float(min(values_for_clean)) if values_for_clean else 0.0
         item["median_view_marginal"] = _finite_median(values_for_clean, default=0.0)
         item.update(_overlap_stats_for_cell(cid, contributions, selected))
+        item["selection_LOO_median_marginal"] = _finite_median(selection_values, default=0.0)
+        item["selection_LOO_worst_marginal"] = float(min(selection_values)) if selection_values else 0.0
+        item["selection_negative_view_ratio"] = float(
+            sum(1 for x in selection_values if float(x) < 0.0) / max(len(selection_values), 1)
+        )
+        item["selection_overlap_conflict"] = item.get("overlap_conflict_score", 0.0)
+        item["selection_phase_consistency"] = _phase_consistency_for_cell(cid, contributions, split_filter="selection")
         out.append(item)
     out.sort(key=lambda x: _json_float(x.get("analysis_test_marginal_gain"), 0.0))
     return out
+
+
+def _phase_consistency_for_cell(cid: int, contributions: Dict[int, List[Contribution]], split_filter: Optional[str]) -> float:
+    num = 0.0
+    den = 0.0
+    for contrib in contributions.get(int(cid), []):
+        if split_filter is not None and contrib.split != split_filter:
+            continue
+        pred_luma = np.sum(contrib.pred_hp * oracle.LUMA[None, None, :], axis=2)
+        target_luma = np.sum(contrib.target_hf * oracle.LUMA[None, None, :], axis=2)
+        active = contrib.fit_w > 1e-8
+        if not np.any(active):
+            continue
+        strength = np.minimum(np.abs(pred_luma), np.abs(target_luma)) * contrib.fit_w
+        same = (pred_luma * target_luma) >= 0.0
+        num += float(np.sum(strength * same.astype(np.float32) * active.astype(np.float32)))
+        den += float(np.sum(strength * active.astype(np.float32)))
+    return float(num / max(den, 1e-10))
 
 
 def _cell_stems(contributions: Dict[int, List[Contribution]], cid: int, split_filter: Optional[str]) -> List[str]:
@@ -869,6 +987,11 @@ def _clean_deploy_rows(
             "LP_drift_marginal",
             "leakage_marginal",
             "overlap_conflict_score",
+            "selection_LOO_median_marginal",
+            "selection_LOO_worst_marginal",
+            "selection_negative_view_ratio",
+            "selection_overlap_conflict",
+            "selection_phase_consistency",
         ):
             if key in item:
                 merged[key] = item[key]
@@ -889,6 +1012,8 @@ def _dose_curve(
     args: SimpleNamespace,
     counts: Sequence[int],
     bounded_clip: Optional[float],
+    raw_support_by_split: Optional[Dict[Optional[str], Dict[str, Dict[str, np.ndarray]]]] = None,
+    global_support_by_split: Optional[Dict[Optional[str], Dict[str, Dict[str, np.ndarray]]]] = None,
 ) -> List[Dict[str, object]]:
     out: List[Dict[str, object]] = []
     for k in counts:
@@ -903,6 +1028,8 @@ def _dose_curve(
             state=state,
             args=args,
             bounded_clip=bounded_clip,
+            raw_support_by_split=raw_support_by_split,
+            global_support_by_split=global_support_by_split,
         )
         out.append(report)
     return out
@@ -1135,11 +1262,15 @@ def main() -> None:
     core_rows = _read_json(oracle_dir / "core_selected_rows.json")
     rows_all = _read_json(oracle_dir / "rows.json")
     rows_by_id = {_row_cluster_id(row): row for row in rows_all if row.get("valid")}
+    valid_ids = sorted(rows_by_id)
     deploy_ids = [_row_cluster_id(row) for row in deploy_rows]
     core_ids = [_row_cluster_id(row) for row in core_rows]
     dose_counts = [int(x) for x in oracle._parse_csv(args.dose_counts, int) if int(x) > 0]
     focus_ids = [int(x) for x in oracle._parse_csv(args.focus_cluster_ids, int) if int(x) >= 0]
-    all_needed_ids = sorted(set(deploy_ids) | set(core_ids) | set(focus_ids))
+    minimal_clean_drop_ids = {int(x) for x in oracle._parse_csv(args.minimal_clean_drop_cluster_ids, int) if int(x) >= 0}
+    minimal_clean_rows = [row for row in deploy_rows if _row_cluster_id(row) not in minimal_clean_drop_ids]
+    minimal_clean_ids = [_row_cluster_id(row) for row in minimal_clean_rows]
+    all_needed_ids = sorted(set(valid_ids) | set(deploy_ids) | set(core_ids) | set(focus_ids) | minimal_clean_drop_ids)
 
     print(f"[residual-preview-v0] oracle : {oracle_dir}")
     print(f"[residual-preview-v0] output : {output_dir}")
@@ -1153,6 +1284,32 @@ def main() -> None:
     contributions = _build_contributions(row_union, obs_by_cluster, oracle_args)
 
     _save_shared_visuals(stems=stems, state=state, oracle_args=oracle_args, output_dir=output_dir, args=args)
+
+    raw_support_composed_by_split: Dict[Optional[str], Dict[str, Dict[str, np.ndarray]]] = {}
+    global_support_composed_by_split: Dict[Optional[str], Dict[str, Dict[str, np.ndarray]]] = {}
+    for split_key in [None, *SPLITS]:
+        raw_support_composed_by_split[split_key] = _support_map_from_composed(
+            _compose(
+                selected_ids=deploy_ids,
+                contributions=contributions,
+                stems=stems,
+                state=state,
+                args=oracle_args,
+                split_filter=split_key,
+                bounded_clip=None,
+            )
+        )
+        global_support_composed_by_split[split_key] = _support_map_from_composed(
+            _compose(
+                selected_ids=valid_ids,
+                contributions=contributions,
+                stems=stems,
+                state=state,
+                args=oracle_args,
+                split_filter=split_key,
+                bounded_clip=None,
+            )
+        )
 
     core_composed = _compose(
         selected_ids=core_ids,
@@ -1177,6 +1334,14 @@ def main() -> None:
         state=state,
         args=oracle_args,
         bounded_clip=float(args.bounded_delta_clip),
+    )
+    deploy_minimal_clean_composed = _compose(
+        selected_ids=minimal_clean_ids,
+        contributions=contributions,
+        stems=stems,
+        state=state,
+        args=oracle_args,
+        bounded_clip=None,
     )
 
     loo = {
@@ -1232,7 +1397,14 @@ def main() -> None:
         lowpass_kernel=int(oracle_args.lowpass_kernel),
     )
     _save_variant_visuals(
-        variant_name="deploy_top40_clean",
+        variant_name="deploy_top40_minimal_clean_dev",
+        composed=deploy_minimal_clean_composed,
+        output_dir=output_dir,
+        args=args,
+        lowpass_kernel=int(oracle_args.lowpass_kernel),
+    )
+    _save_variant_visuals(
+        variant_name="deploy_top40_clean29",
         composed=deploy_clean_composed,
         output_dir=output_dir,
         args=args,
@@ -1248,6 +1420,8 @@ def main() -> None:
             stems=stems,
             state=state,
             args=oracle_args,
+            raw_support_by_split=raw_support_composed_by_split,
+            global_support_by_split=global_support_composed_by_split,
         ),
         "deploy_top40_raw": _variant_report(
             name="deploy_top40_raw",
@@ -1257,6 +1431,8 @@ def main() -> None:
             stems=stems,
             state=state,
             args=oracle_args,
+            raw_support_by_split=raw_support_composed_by_split,
+            global_support_by_split=global_support_composed_by_split,
         ),
         "deploy_top40_bounded": _variant_report(
             name="deploy_top40_bounded",
@@ -1267,15 +1443,30 @@ def main() -> None:
             state=state,
             args=oracle_args,
             bounded_clip=float(args.bounded_delta_clip),
+            raw_support_by_split=raw_support_composed_by_split,
+            global_support_by_split=global_support_composed_by_split,
         ),
-        "deploy_top40_clean": _variant_report(
-            name="deploy_top40_clean",
+        "deploy_top40_minimal_clean_dev": _variant_report(
+            name="deploy_top40_minimal_clean_dev",
+            rows=minimal_clean_rows,
+            selected_ids=minimal_clean_ids,
+            contributions=contributions,
+            stems=stems,
+            state=state,
+            args=oracle_args,
+            raw_support_by_split=raw_support_composed_by_split,
+            global_support_by_split=global_support_composed_by_split,
+        ),
+        "deploy_top40_clean29": _variant_report(
+            name="deploy_top40_clean29",
             rows=clean_rows,
             selected_ids=clean_ids,
             contributions=contributions,
             stems=stems,
             state=state,
             args=oracle_args,
+            raw_support_by_split=raw_support_composed_by_split,
+            global_support_by_split=global_support_composed_by_split,
         ),
     }
     dose_curve = {
@@ -1287,6 +1478,8 @@ def main() -> None:
             args=oracle_args,
             counts=dose_counts,
             bounded_clip=None,
+            raw_support_by_split=raw_support_composed_by_split,
+            global_support_by_split=global_support_composed_by_split,
         ),
         "bounded": _dose_curve(
             deploy_rows=deploy_rows,
@@ -1296,8 +1489,21 @@ def main() -> None:
             args=oracle_args,
             counts=dose_counts,
             bounded_clip=float(args.bounded_delta_clip),
+            raw_support_by_split=raw_support_composed_by_split,
+            global_support_by_split=global_support_composed_by_split,
         ),
-        "clean": _dose_curve(
+        "minimal_clean_dev": _dose_curve(
+            deploy_rows=minimal_clean_rows,
+            contributions=contributions,
+            stems=stems,
+            state=state,
+            args=oracle_args,
+            counts=dose_counts,
+            bounded_clip=None,
+            raw_support_by_split=raw_support_composed_by_split,
+            global_support_by_split=global_support_composed_by_split,
+        ),
+        "clean29": _dose_curve(
             deploy_rows=clean_rows,
             contributions=contributions,
             stems=stems,
@@ -1305,6 +1511,8 @@ def main() -> None:
             args=oracle_args,
             counts=dose_counts,
             bounded_clip=None,
+            raw_support_by_split=raw_support_composed_by_split,
+            global_support_by_split=global_support_composed_by_split,
         ),
     }
     _write_cell_sheets(
@@ -1335,7 +1543,11 @@ def main() -> None:
         "frozen_inputs": {
             "deploy_set": "deploy_top40",
             "deploy_count": int(len(deploy_ids)),
-            "clean_set": "deploy_top40_clean",
+            "bounded_set": "deploy_top40_bounded",
+            "minimal_clean_set": "deploy_top40_minimal_clean_dev",
+            "minimal_clean_drop_cluster_ids": sorted(int(x) for x in minimal_clean_drop_ids),
+            "minimal_clean_count": int(len(minimal_clean_ids)),
+            "clean_set": "deploy_top40_clean29",
             "clean_count": int(len(clean_ids)),
             "clean_rejected_count": int(len(clean_rejected_rows)),
             "control_set": "core_pass28",
@@ -1353,12 +1565,20 @@ def main() -> None:
         "bounded_delta_clip": float(args.bounded_delta_clip),
         "metric_definitions": {
             "joint_gain": "Target HF energy minus residual energy after summing all frozen cells once.",
+            "gain_on_variant_support": "Gain measured only where the evaluated variant has active support; useful for coverage efficiency, not fair cross-version comparison.",
+            "gain_on_raw_union_support": "Gain measured on the fixed deploy_top40_raw support; preferred for fair raw/bounded/minimal-clean/clean29 comparison.",
+            "gain_on_global_eligible_support": "Gain measured on the union support of all valid oracle rows loaded from rows.json; broader fair comparison against eligible candidate regions.",
             "sum_individual_gain": "Signed sum of frozen per-cell C_*_gain from oracle rows for the same split.",
             "sum_positive_individual_gain": "Positive-only sum of frozen per-cell C_*_gain; used as the stable gain-capture denominator.",
             "joint_gain_capture_positive": "joint_gain / sum_positive_individual_gain.",
             "marginal_gain_all": "Joint gain(all deploy cells) - joint gain(all except this cell), using all frozen observations.",
             "marginal_gain_selection": "Same leave-one-cell-out marginal on selection observations.",
             "marginal_gain_analysis_test": "Same leave-one-cell-out marginal on analysis_test observations; diagnostic only, not a final lockbox metric.",
+            "selection_LOO_median_marginal": "Median per-view leave-one-out marginal on selection views only; intended for future lockbox-safe clean policy.",
+            "selection_LOO_worst_marginal": "Worst per-view leave-one-out marginal on selection views only.",
+            "selection_negative_view_ratio": "Fraction of selection views where the leave-one-out marginal is negative.",
+            "selection_overlap_conflict": "Overlap conflict score recorded for selection-only clean policy design.",
+            "selection_phase_consistency": "Weighted sign agreement between this cell residual and target HF on selection views.",
             "negative_view_count": "Number of analysis_test views, or all available views if no analysis_test view exists, where the leave-one-cell-out marginal is negative.",
             "worst_view_marginal": "Worst per-view leave-one-cell-out marginal in the same view set used by negative_view_count.",
             "median_view_marginal": "Median per-view leave-one-cell-out marginal in the same view set used by negative_view_count.",
@@ -1375,6 +1595,7 @@ def main() -> None:
     (output_dir / "dose_curve.json").write_text(json.dumps(dose_curve, indent=2) + "\n", encoding="utf-8")
     (output_dir / "leave_one_cell_out.json").write_text(json.dumps(loo, indent=2) + "\n", encoding="utf-8")
     (output_dir / "per_cell_marginals.json").write_text(json.dumps(loo["raw"], indent=2) + "\n", encoding="utf-8")
+    (output_dir / "minimal_clean_selected_rows.json").write_text(json.dumps(minimal_clean_rows, indent=2) + "\n", encoding="utf-8")
     (output_dir / "clean_selected_rows.json").write_text(json.dumps(clean_rows, indent=2) + "\n", encoding="utf-8")
     (output_dir / "clean_rejected_rows.json").write_text(json.dumps(clean_rejected_rows, indent=2) + "\n", encoding="utf-8")
     (output_dir / "negative_view_diagnostics.json").write_text(json.dumps(negative_view_diagnostics, indent=2) + "\n", encoding="utf-8")
@@ -1418,7 +1639,7 @@ def _readme(output_dir: Path) -> str:
             "This is an offline closed-loop composition preview for the V1 sparse residual branch.",
             "It does not train the base 3DGS, refit beta, search slots, add cells, or change selector order.",
             "The composed residual is delta_k = q_parent_k * projected_signed_piece_k * beta_k, accumulated over frozen cells.",
-            "deploy_top40_raw is the fixed baseline; deploy_top40_clean is a diagnostic derivative and must not replace raw.",
+            "deploy_top40_raw is the fixed baseline; deploy_top40_minimal_clean_dev and deploy_top40_clean29 are diagnostic derivatives and must not replace raw.",
             "",
             "Main files:",
             f"  {output_dir / 'summary.json'}",
@@ -1426,6 +1647,7 @@ def _readme(output_dir: Path) -> str:
             f"  {output_dir / 'dose_curve.json'}",
             f"  {output_dir / 'leave_one_cell_out.json'}",
             f"  {output_dir / 'per_cell_marginals.json'}",
+            f"  {output_dir / 'minimal_clean_selected_rows.json'}",
             f"  {output_dir / 'clean_selected_rows.json'}",
             f"  {output_dir / 'clean_rejected_rows.json'}",
             f"  {output_dir / 'negative_view_diagnostics.json'}",
@@ -1436,7 +1658,8 @@ def _readme(output_dir: Path) -> str:
             f"  {output_dir / 'visuals/core28/base_plus_residual'}",
             f"  {output_dir / 'visuals/deploy_top40_raw/base_plus_residual'}",
             f"  {output_dir / 'visuals/deploy_top40_bounded/base_plus_residual'}",
-            f"  {output_dir / 'visuals/deploy_top40_clean/base_plus_residual'}",
+            f"  {output_dir / 'visuals/deploy_top40_minimal_clean_dev/base_plus_residual'}",
+            f"  {output_dir / 'visuals/deploy_top40_clean29/base_plus_residual'}",
             f"  {output_dir / 'negative_view_diagnostics'}",
             f"  {output_dir / 'cell_sheet'}",
             "",
