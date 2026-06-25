@@ -155,6 +155,10 @@ def _parse_args() -> argparse.Namespace:
         "--selector_curve_rank_keys",
         default="selector_score,C_selection_explained_energy,A_selection_explained_energy,cluster_target_energy,C_selection_gain",
     )
+    parser.add_argument("--deploy_selector_family", default="A")
+    parser.add_argument("--deploy_selector_rank_key", default="C_selection_gain")
+    parser.add_argument("--deploy_selector_top_k", type=int, default=40)
+    parser.add_argument("--deploy_selector_min_rank_value", type=float, default=float("-inf"))
     parser.add_argument("--test_good_corr_threshold", type=float, default=0.20)
     parser.add_argument("--test_good_ee_threshold", type=float, default=0.05)
     parser.add_argument("--test_good_leak_max", type=float, default=0.30)
@@ -1371,9 +1375,46 @@ def _rows_for_selector_family(rows: Sequence[Dict[str, object]], family: str) ->
         and bool(r.get("pass_B_selection"))
         and bool(r.get("pass_C_selection"))
         and bool(r.get("pass_capacity")),
+        "core_pass": lambda r: bool(r.get("selector_core_pass")),
+        "capacity_limited_failures": lambda r: bool(r.get("selector_capacity_limited_pass")),
     }
+    if family not in predicates:
+        raise KeyError(f"Unknown selector family '{family}'. Choices: {', '.join(sorted(predicates))}")
     predicate = predicates[family]
     return [row for row in rows if predicate(row)]
+
+
+def _ranked_selector_rows(
+    eligible_rows: Sequence[Dict[str, object]],
+    *,
+    family: str,
+    rank_key: str,
+    top_k: int,
+    min_rank_value: float,
+) -> List[Dict[str, object]]:
+    family_rows = _rows_for_selector_family(eligible_rows, family)
+    if math.isfinite(float(min_rank_value)):
+        family_rows = [row for row in family_rows if _finite_float(row.get(rank_key), float("-inf")) >= float(min_rank_value)]
+    if int(top_k) <= 0:
+        return _top_k(family_rows, rank_key, len(family_rows))
+    return _top_k(family_rows, rank_key, int(top_k))
+
+
+def _deploy_selector_summary(
+    deploy_rows: Sequence[Dict[str, object]],
+    eligible_rows: Sequence[Dict[str, object]],
+    args: argparse.Namespace,
+) -> Dict[str, object]:
+    return {
+        "policy": {
+            "family": str(args.deploy_selector_family),
+            "rank_key": str(args.deploy_selector_rank_key),
+            "top_k": int(args.deploy_selector_top_k),
+            "min_rank_value": float(args.deploy_selector_min_rank_value),
+            "note": "Deploy selector uses selection-visible fields only; strict/positive reports use test labels for analysis.",
+        },
+        **_selector_report_pair(deploy_rows, eligible_rows),
+    }
 
 
 def _curve_point(
@@ -1719,15 +1760,25 @@ def main() -> None:
         and float(r.get("C_test_leak_ratio", 1e9)) < 0.3
         and float(r.get("delivery_retention", -1.0)) > 0.5
     ]
-    selected_rows = [r for r in eligible_rows if bool(r.get("selector_core_pass"))]
+    core_selected_rows = [r for r in eligible_rows if bool(r.get("selector_core_pass"))]
+    deploy_selected_rows = _ranked_selector_rows(
+        eligible_rows,
+        family=str(args.deploy_selector_family),
+        rank_key=str(args.deploy_selector_rank_key),
+        top_k=int(args.deploy_selector_top_k),
+        min_rank_value=float(args.deploy_selector_min_rank_value),
+    )
     capacity_limited_rows = [r for r in eligible_rows if bool(r.get("selector_capacity_limited_pass"))]
     agg_ga = sum(max(float(r.get("A_test_gain", 0.0)), 0.0) for r in eligible_rows)
     agg_gc = sum(float(r.get("C_test_gain", 0.0)) for r in eligible_rows if float(r.get("A_test_gain", 0.0)) > 0.0)
-    selector_validation = _selector_report(selected_rows, eligible_rows, label_key="test_good_strict")
-    selector_positive_validation = _selector_report(selected_rows, eligible_rows, label_key="test_positive")
-    baselines = _baseline_reports(eligible_rows, len(selected_rows), label_key="test_good_strict")
+    selector_validation = _selector_report(deploy_selected_rows, eligible_rows, label_key="test_good_strict")
+    selector_positive_validation = _selector_report(deploy_selected_rows, eligible_rows, label_key="test_positive")
+    core_selector_validation = _selector_report(core_selected_rows, eligible_rows, label_key="test_good_strict")
+    core_selector_positive_validation = _selector_report(core_selected_rows, eligible_rows, label_key="test_positive")
+    deploy_selector = _deploy_selector_summary(deploy_selected_rows, eligible_rows, args)
+    baselines = _baseline_reports(eligible_rows, len(core_selected_rows), label_key="test_good_strict")
     selector_ablation = _selector_ablation_reports(eligible_rows)
-    selector_curve = _selector_curve_reports(eligible_rows, len(selected_rows), args)
+    selector_curve = _selector_curve_reports(eligible_rows, len(core_selected_rows), args)
     transition = _transition_summary(eligible_rows)
     summary = {
         "version": "evaluate_residual_tetris_oracle_v0",
@@ -1761,12 +1812,16 @@ def main() -> None:
         },
         "selector_validation": selector_validation,
         "selector_positive_validation": selector_positive_validation,
+        "deploy_selector": deploy_selector,
+        "core_selector_validation": core_selector_validation,
+        "core_selector_positive_validation": core_selector_positive_validation,
         "selector_transition": transition,
         "selector_baselines": baselines,
         "selector_ablation": selector_ablation,
         "selector_curve_headline": selector_curve["headline"],
         "selector_counts": {
-            "core_pass": int(len(selected_rows)),
+            "deploy_selected": int(len(deploy_selected_rows)),
+            "core_pass": int(len(core_selected_rows)),
             "capacity_limited_pass": int(len(capacity_limited_rows)),
             "test_good_strict": int(sum(1 for r in eligible_rows if bool(r.get("test_good_strict")))),
             "test_positive": int(sum(1 for r in eligible_rows if bool(r.get("test_positive")))),
@@ -1783,7 +1838,9 @@ def main() -> None:
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     (output_dir / "rows.json").write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
-    (output_dir / "selected_rows.json").write_text(json.dumps(selected_rows, indent=2) + "\n", encoding="utf-8")
+    (output_dir / "selected_rows.json").write_text(json.dumps(deploy_selected_rows, indent=2) + "\n", encoding="utf-8")
+    (output_dir / "deploy_selected_rows.json").write_text(json.dumps(deploy_selected_rows, indent=2) + "\n", encoding="utf-8")
+    (output_dir / "core_selected_rows.json").write_text(json.dumps(core_selected_rows, indent=2) + "\n", encoding="utf-8")
     (output_dir / "selector_ablation.json").write_text(json.dumps(selector_ablation, indent=2) + "\n", encoding="utf-8")
     (output_dir / "selector_curve.json").write_text(json.dumps(selector_curve, indent=2) + "\n", encoding="utf-8")
     readme = output_dir / "README.txt"
@@ -1801,10 +1858,13 @@ def main() -> None:
                 "Important: *_test fields are analysis-test diagnostics for this run.",
                 "Deployable selector flags use *_selection fields, matched-null selection margins,",
                 "and beta diagnostics only. See selector_validation and selector_transition.",
+                "selected_rows.json follows the deploy selector policy, not the old core_pass hard gate.",
                 "",
                 f"Main summary: {output_dir / 'summary.json'}",
                 f"Rows: {output_dir / 'rows.json'}",
-                f"Selected rows: {output_dir / 'selected_rows.json'}",
+                f"Selected rows (deploy): {output_dir / 'selected_rows.json'}",
+                f"Deploy selected rows: {output_dir / 'deploy_selected_rows.json'}",
+                f"Core selected rows: {output_dir / 'core_selected_rows.json'}",
                 f"Selector ablation: {output_dir / 'selector_ablation.json'}",
                 f"Selector curve: {output_dir / 'selector_curve.json'}",
                 f"Debug: {output_dir / 'debug'}",
