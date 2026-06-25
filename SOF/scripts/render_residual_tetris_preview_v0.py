@@ -37,6 +37,8 @@ class Contribution:
     fit_w: np.ndarray
     off_w: np.ndarray
     abs_luma: np.ndarray
+    q_parent: np.ndarray
+    target_hf: np.ndarray
 
 
 def _parse_args() -> argparse.Namespace:
@@ -59,6 +61,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dose_counts", default="5,10,20,40")
     parser.add_argument("--focus_cluster_ids", default="64,174,70,133,156,223")
     parser.add_argument("--cell_sheet_max_obs", type=int, default=3)
+    parser.add_argument("--clean_negative_view_ratio", type=float, default=0.5)
+    parser.add_argument("--clean_lp_drift_marginal_min", type=float, default=0.0)
+    parser.add_argument("--clean_leakage_marginal_min", type=float, default=0.0)
     return parser.parse_args()
 
 
@@ -77,6 +82,10 @@ def _copy_to_check(output_dir: Path, check_dir: Path) -> None:
         "joint_metrics.json",
         "dose_curve.json",
         "leave_one_cell_out.json",
+        "per_cell_marginals.json",
+        "clean_selected_rows.json",
+        "clean_rejected_rows.json",
+        "negative_view_diagnostics.json",
         "README.txt",
     ):
         src = output_dir / name
@@ -89,15 +98,22 @@ def _copy_to_check(output_dir: Path, check_dir: Path) -> None:
         "visuals/deploy_top40_bounded/base_plus_residual",
         "visuals/deploy_top40_bounded/residual_pred",
         "visuals/deploy_top40_bounded/error_after",
+        "visuals/deploy_top40_clean/base_plus_residual",
+        "visuals/deploy_top40_clean/residual_pred",
+        "visuals/deploy_top40_clean/error_after",
         "visuals/core28/base_plus_residual",
         "visuals/base",
         "visuals/target_hf",
+        "negative_view_diagnostics",
         "cell_sheet",
     ):
         src_dir = output_dir / rel
         if not src_dir.is_dir():
             continue
         dst_dir = check_dir / rel
+        if rel == "negative_view_diagnostics":
+            shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
+            continue
         dst_dir.mkdir(parents=True, exist_ok=True)
         for image_path in sorted(src_dir.glob("*.png"))[:64]:
             shutil.copy2(image_path, dst_dir / image_path.name)
@@ -262,7 +278,7 @@ def _build_contributions(rows: Sequence[Dict[str, object]], obs_by_cluster: Dict
         beta = _beta_from_row(row)
         row_contribs: List[Contribution] = []
         for obs in obs_by_cluster.get(cid, []):
-            basis, _target, fit_w, off_w, raw_basis, lp_basis = oracle._basis_arrays(obs, cand, args, "C", None)
+            basis, target, fit_w, off_w, raw_basis, lp_basis = oracle._basis_arrays(obs, cand, args, "C", None)
             pred_hp = basis[..., None] * beta[None, None, :]
             pred_raw = raw_basis[..., None] * beta[None, None, :]
             pred_lp = lp_basis[..., None] * beta[None, None, :]
@@ -279,6 +295,8 @@ def _build_contributions(rows: Sequence[Dict[str, object]], obs_by_cluster: Dict
                     fit_w=fit_w.astype(np.float32),
                     off_w=off_w.astype(np.float32),
                     abs_luma=abs_luma,
+                    q_parent=obs.q_parent.astype(np.float32),
+                    target_hf=target.astype(np.float32),
                 )
             )
         out[cid] = row_contribs
@@ -346,6 +364,7 @@ def _compose(
         weight = np.zeros((h, w), dtype=np.float32)
         off_weight = np.zeros((h, w), dtype=np.float32)
         overlap = np.zeros((h, w), dtype=np.float32)
+        q_parent_peak = np.zeros((h, w), dtype=np.float32)
         dominant_val = np.zeros((h, w), dtype=np.float32)
         dominant_id = np.full((h, w), -1, dtype=np.int32)
         for cid in selected:
@@ -365,6 +384,7 @@ def _compose(
                 x0, y0, x1, y1 = contrib.roi
                 active = contrib.fit_w > float(args.core_weight_threshold)
                 overlap[y0:y1, x0:x1] += active.astype(np.float32)
+                q_parent_peak[y0:y1, x0:x1] = np.maximum(q_parent_peak[y0:y1, x0:x1], contrib.q_parent)
                 dominant_slice = dominant_val[y0:y1, x0:x1]
                 dominant_id_slice = dominant_id[y0:y1, x0:x1]
                 better = contrib.abs_luma > dominant_slice
@@ -380,11 +400,58 @@ def _compose(
             "weight": weight,
             "off_weight": off_weight,
             "overlap": overlap,
+            "q_parent_peak": q_parent_peak,
             "dominant_id": dominant_id,
             "preview": preview,
             "out_of_range": ((base + pred) < 0.0) | ((base + pred) > 1.0),
         }
     return out
+
+
+def _metrics_for_view(data: Dict[str, np.ndarray], lowpass_kernel: int = 21) -> Dict[str, float]:
+    target = data["target_hf"]
+    pred = data["pred"]
+    w = np.clip(data["weight"], 0.0, 1.0)
+    ow = np.clip(data["off_weight"], 0.0, 1.0)
+    fw = w[..., None]
+    ow3 = ow[..., None]
+    delta_lp = oracle._box_blur(pred, int(lowpass_kernel))
+    te = float(np.sum(fw * target * target))
+    re = float(np.sum(fw * (target - pred) * (target - pred)))
+    pe = float(np.sum(fw * pred * pred))
+    oe = float(np.sum(ow3 * pred * pred))
+    le = float(np.sum(fw * delta_lp * delta_lp))
+    active = w > 1e-8
+    out_ratio = 0.0
+    if np.any(active):
+        out = np.any(data["out_of_range"], axis=2)
+        out_ratio = float(np.count_nonzero(out & active) / max(float(np.count_nonzero(active)), 1.0))
+    pred_luma = np.sum(pred * oracle.LUMA[None, None, :], axis=2)
+    target_luma = np.sum(target * oracle.LUMA[None, None, :], axis=2)
+    corr = oracle._weighted_corr(pred_luma, target_luma, w)
+    return {
+        "active": bool(te > 1e-12),
+        "HF_corr": float("nan") if corr is None else float(corr),
+        "explained_energy": float(1.0 - re / max(te, 1e-10)) if te > 0 else float("-inf"),
+        "gain": float(te - re),
+        "target_energy": te,
+        "residual_energy": re,
+        "pred_energy": pe,
+        "off_target_leakage": float(oe / max(pe, 1e-10)),
+        "LP_drift": float(le / max(te, 1e-10)),
+        "out_of_range_ratio": out_ratio,
+    }
+
+
+def _per_view_metrics_for_composed(composed: Dict[str, Dict[str, np.ndarray]], lowpass_kernel: int = 21) -> Dict[str, Dict[str, float]]:
+    return {stem: _metrics_for_view(data, lowpass_kernel=lowpass_kernel) for stem, data in composed.items()}
+
+
+def _finite_median(values: Sequence[float], default: float = 0.0) -> float:
+    arr = np.asarray([float(x) for x in values if math.isfinite(float(x))], dtype=np.float32)
+    if arr.size == 0:
+        return float(default)
+    return float(np.median(arr))
 
 
 def _metrics_for_composed(composed: Dict[str, Dict[str, np.ndarray]], lowpass_kernel: int = 21) -> Dict[str, float]:
@@ -403,15 +470,12 @@ def _metrics_for_composed(composed: Dict[str, Dict[str, np.ndarray]], lowpass_ke
         target = data["target_hf"]
         pred = data["pred"]
         w = np.clip(data["weight"], 0.0, 1.0)
-        ow = np.clip(data["off_weight"], 0.0, 1.0)
-        fw = w[..., None]
-        ow3 = ow[..., None]
-        delta_lp = oracle._box_blur(pred, int(lowpass_kernel))
-        te = float(np.sum(fw * target * target))
-        re = float(np.sum(fw * (target - pred) * (target - pred)))
-        pe = float(np.sum(fw * pred * pred))
-        oe = float(np.sum(ow3 * pred * pred))
-        le = float(np.sum(fw * delta_lp * delta_lp))
+        view_metrics = _metrics_for_view(data, lowpass_kernel=lowpass_kernel)
+        te = float(view_metrics["target_energy"])
+        re = float(view_metrics["residual_energy"])
+        pe = float(view_metrics["pred_energy"])
+        oe = float(view_metrics["off_target_leakage"]) * max(pe, 1e-10)
+        le = float(view_metrics["LP_drift"]) * max(te, 1e-10)
         target_energy += te
         residual_energy += re
         pred_energy += pe
@@ -421,8 +485,7 @@ def _metrics_for_composed(composed: Dict[str, Dict[str, np.ndarray]], lowpass_ke
             view_gains.append(te - re)
         active = w > 1e-8
         if np.any(active):
-            out = np.any(data["out_of_range"], axis=2)
-            out_ratio_num += float(np.count_nonzero(out & active))
+            out_ratio_num += float(view_metrics["out_of_range_ratio"]) * float(np.count_nonzero(active))
             out_ratio_den += float(np.count_nonzero(active))
         pred_luma.append(np.sum(pred * oracle.LUMA[None, None, :], axis=2))
         target_luma.append(np.sum(target * oracle.LUMA[None, None, :], axis=2))
@@ -590,58 +653,141 @@ def _leave_one_out(
     bounded_clip: Optional[float] = None,
 ) -> List[Dict[str, object]]:
     selected = list(selected_ids)
+    all_composed = _compose(
+        selected_ids=selected,
+        contributions=contributions,
+        stems=stems,
+        state=state,
+        args=args,
+        split_filter=None,
+        bounded_clip=bounded_clip,
+    )
+    all_metrics_all = _metrics_for_composed(all_composed, lowpass_kernel=int(args.lowpass_kernel))
+    all_view_metrics_all = _per_view_metrics_for_composed(all_composed, lowpass_kernel=int(args.lowpass_kernel))
+    all_composed_by_split = {
+        split: _compose(
+            selected_ids=selected,
+            contributions=contributions,
+            stems=stems,
+            state=state,
+            args=args,
+            split_filter=split,
+            bounded_clip=bounded_clip,
+        )
+        for split in SPLITS
+    }
     all_by_split = {
-        split: _metrics_for_composed(
-            _compose(
+        split: _metrics_for_composed(all_composed_by_split[split], lowpass_kernel=int(args.lowpass_kernel))
+        for split in SPLITS
+    }
+    all_view_by_split = {
+        split: _per_view_metrics_for_composed(all_composed_by_split[split], lowpass_kernel=int(args.lowpass_kernel))
+        for split in SPLITS
+    }
+    row_by_id = {_row_cluster_id(row): row for row in rows}
+    out: List[Dict[str, object]] = []
+    for cid in selected:
+        without_all_composed = _compose(
+            selected_ids=selected,
+            contributions=contributions,
+            stems=stems,
+            state=state,
+            args=args,
+            split_filter=None,
+            skip_cluster_id=cid,
+            bounded_clip=bounded_clip,
+        )
+        without_all_metrics = _metrics_for_composed(without_all_composed, lowpass_kernel=int(args.lowpass_kernel))
+        without_all_view_metrics = _per_view_metrics_for_composed(without_all_composed, lowpass_kernel=int(args.lowpass_kernel))
+        view_marginals_all = _view_gain_marginals(
+            all_view_metrics_all,
+            without_all_view_metrics,
+            _cell_stems(contributions, cid, split_filter=None),
+        )
+        item: Dict[str, object] = {
+            "cluster_id": int(cid),
+            "rank": int(selected.index(cid) + 1),
+            "C_selection_gain": _json_float(row_by_id.get(cid, {}).get("C_selection_gain"), float("nan")),
+            "C_test_gain": _json_float(row_by_id.get(cid, {}).get("C_test_gain"), float("nan")),
+            "marginal_gain_all": float(all_metrics_all.get("gain", 0.0) - without_all_metrics.get("gain", 0.0)),
+            "LP_drift_marginal": float(all_metrics_all.get("LP_drift", 0.0) - without_all_metrics.get("LP_drift", 0.0)),
+            "leakage_marginal": float(all_metrics_all.get("off_target_leakage", 0.0) - without_all_metrics.get("off_target_leakage", 0.0)),
+            "view_marginals_all": view_marginals_all,
+        }
+        for split in SPLITS:
+            without_composed = _compose(
                 selected_ids=selected,
                 contributions=contributions,
                 stems=stems,
                 state=state,
                 args=args,
                 split_filter=split,
+                skip_cluster_id=cid,
                 bounded_clip=bounded_clip,
-            ),
-            lowpass_kernel=int(args.lowpass_kernel),
-        )
-        for split in SPLITS
-    }
-    row_by_id = {_row_cluster_id(row): row for row in rows}
-    out: List[Dict[str, object]] = []
-    for cid in selected:
-        item: Dict[str, object] = {
-            "cluster_id": int(cid),
-            "rank": int(selected.index(cid) + 1),
-            "C_selection_gain": _json_float(row_by_id.get(cid, {}).get("C_selection_gain"), float("nan")),
-            "C_test_gain": _json_float(row_by_id.get(cid, {}).get("C_test_gain"), float("nan")),
-        }
-        for split in SPLITS:
-            without = _metrics_for_composed(
-                _compose(
-                    selected_ids=selected,
-                    contributions=contributions,
-                    stems=stems,
-                    state=state,
-                    args=args,
-                    split_filter=split,
-                    skip_cluster_id=cid,
-                    bounded_clip=bounded_clip,
-                ),
-                lowpass_kernel=int(args.lowpass_kernel),
             )
+            without = _metrics_for_composed(without_composed, lowpass_kernel=int(args.lowpass_kernel))
+            without_view_metrics = _per_view_metrics_for_composed(without_composed, lowpass_kernel=int(args.lowpass_kernel))
             all_metrics = all_by_split[split]
             display = SPLIT_DISPLAY[split]
-            item[f"{display}_marginal_gain"] = float(all_metrics.get("gain", 0.0) - without.get("gain", 0.0))
-            item[f"{display}_marginal_LP_drift"] = float(all_metrics.get("LP_drift", 0.0) - without.get("LP_drift", 0.0))
-            item[f"{display}_marginal_leakage"] = float(all_metrics.get("off_target_leakage", 0.0) - without.get("off_target_leakage", 0.0))
+            gain = float(all_metrics.get("gain", 0.0) - without.get("gain", 0.0))
+            lp_drift = float(all_metrics.get("LP_drift", 0.0) - without.get("LP_drift", 0.0))
+            leakage = float(all_metrics.get("off_target_leakage", 0.0) - without.get("off_target_leakage", 0.0))
+            view_marginals = _view_gain_marginals(
+                all_view_by_split[split],
+                without_view_metrics,
+                _cell_stems(contributions, cid, split_filter=split),
+            )
+            item[f"{display}_marginal_gain"] = gain
+            item[f"{display}_marginal_LP_drift"] = lp_drift
+            item[f"{display}_marginal_leakage"] = leakage
+            item[f"marginal_gain_{display}"] = gain
+            item[f"LP_drift_marginal_{display}"] = lp_drift
+            item[f"leakage_marginal_{display}"] = leakage
+            item[f"view_marginals_{display}"] = view_marginals
+        analysis_values = list((item.get("view_marginals_analysis_test") or {}).values())
+        fallback_values = list(view_marginals_all.values())
+        values_for_clean = analysis_values if analysis_values else fallback_values
+        negative_view_count = int(sum(1 for x in values_for_clean if float(x) < 0.0))
+        item["negative_view_count"] = negative_view_count
+        item["negative_view_ratio"] = float(negative_view_count / max(len(values_for_clean), 1))
+        item["worst_view_marginal"] = float(min(values_for_clean)) if values_for_clean else 0.0
+        item["median_view_marginal"] = _finite_median(values_for_clean, default=0.0)
         item.update(_overlap_stats_for_cell(cid, contributions, selected))
         out.append(item)
     out.sort(key=lambda x: _json_float(x.get("analysis_test_marginal_gain"), 0.0))
     return out
 
 
+def _cell_stems(contributions: Dict[int, List[Contribution]], cid: int, split_filter: Optional[str]) -> List[str]:
+    stems: List[str] = []
+    seen = set()
+    for contrib in contributions.get(int(cid), []):
+        if split_filter is not None and contrib.split != split_filter:
+            continue
+        if contrib.stem in seen:
+            continue
+        seen.add(contrib.stem)
+        stems.append(contrib.stem)
+    return stems
+
+
+def _view_gain_marginals(
+    all_view_metrics: Dict[str, Dict[str, float]],
+    without_view_metrics: Dict[str, Dict[str, float]],
+    stems: Sequence[str],
+) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for stem in stems:
+        all_gain = _json_float(all_view_metrics.get(stem, {}).get("gain"), 0.0)
+        without_gain = _json_float(without_view_metrics.get(stem, {}).get("gain"), 0.0)
+        out[stem] = float(all_gain - without_gain)
+    return out
+
+
 def _overlap_stats_for_cell(cid: int, contributions: Dict[int, List[Contribution]], selected_ids: Sequence[int]) -> Dict[str, float]:
     total = 0.0
     overlapped = 0.0
+    sign_conflict = 0.0
     by_stem: Dict[str, List[Contribution]] = {}
     for sid in selected_ids:
         for contrib in contributions.get(int(sid), []):
@@ -653,6 +799,8 @@ def _overlap_stats_for_cell(cid: int, contributions: Dict[int, List[Contribution
         total += float(np.count_nonzero(active))
         x0, y0, x1, y1 = contrib.roi
         count = np.zeros_like(contrib.fit_w, dtype=np.float32)
+        other_luma_sum = np.zeros_like(contrib.fit_w, dtype=np.float32)
+        self_luma = np.sum(contrib.pred_hp * oracle.LUMA[None, None, :], axis=2)
         for other in by_stem.get(contrib.stem, []):
             ox0, oy0, ox1, oy1 = other.roi
             ix0, iy0 = max(x0, ox0), max(y0, oy0)
@@ -664,12 +812,72 @@ def _overlap_stats_for_cell(cid: int, contributions: Dict[int, List[Contribution
             oxs0, oys0 = ix0 - ox0, iy0 - oy0
             oxs1, oys1 = ix1 - ox0, iy1 - oy0
             count[sy0:sy1, sx0:sx1] += (other.fit_w[oys0:oys1, oxs0:oxs1] > 1e-8).astype(np.float32)
+            if int(other.cluster_id) == int(cid):
+                continue
+            other_luma = np.sum(other.pred_hp * oracle.LUMA[None, None, :], axis=2)
+            other_active = other.fit_w[oys0:oys1, oxs0:oxs1] > 1e-8
+            other_luma_sum[sy0:sy1, sx0:sx1] += other_luma[oys0:oys1, oxs0:oxs1] * other_active.astype(np.float32)
         overlapped += float(np.count_nonzero(active & (count > 1.0)))
+        sign_conflict += float(np.count_nonzero(active & (self_luma * other_luma_sum < 0.0)))
+    duplicate_ratio = float(overlapped / max(total, 1.0))
+    sign_conflict_ratio = float(sign_conflict / max(total, 1.0))
     return {
         "overlap_active_pixels": total,
         "overlap_duplicate_pixels": overlapped,
-        "overlap_duplicate_ratio": float(overlapped / max(total, 1.0)),
+        "overlap_duplicate_ratio": duplicate_ratio,
+        "overlap_sign_conflict_pixels": sign_conflict,
+        "overlap_sign_conflict_ratio": sign_conflict_ratio,
+        "overlap_conflict_score": float(0.5 * duplicate_ratio + 0.5 * sign_conflict_ratio),
     }
+
+
+def _clean_deploy_rows(
+    deploy_rows: Sequence[Dict[str, object]],
+    per_cell_marginals: Sequence[Dict[str, object]],
+    args: argparse.Namespace,
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    marginal_by_id = {int(item["cluster_id"]): item for item in per_cell_marginals}
+    clean: List[Dict[str, object]] = []
+    rejected: List[Dict[str, object]] = []
+    for row in deploy_rows:
+        cid = _row_cluster_id(row)
+        item = marginal_by_id.get(cid, {})
+        reasons: List[str] = []
+        median_view = _json_float(item.get("median_view_marginal"), 0.0)
+        negative_ratio = _json_float(item.get("negative_view_ratio"), 0.0)
+        aggregate_gain = _json_float(item.get("marginal_gain_all"), 0.0)
+        lp_drift = _json_float(item.get("LP_drift_marginal"), 0.0)
+        leakage = _json_float(item.get("leakage_marginal"), 0.0)
+        if median_view < 0.0:
+            reasons.append("median_view_marginal<0")
+        if negative_ratio > float(args.clean_negative_view_ratio):
+            reasons.append("negative_view_ratio>threshold")
+        if aggregate_gain < 0.0 and (
+            lp_drift > float(args.clean_lp_drift_marginal_min)
+            or leakage > float(args.clean_leakage_marginal_min)
+        ):
+            reasons.append("aggregate_negative_with_drift_or_leakage")
+        merged = dict(row)
+        for key in (
+            "marginal_gain_all",
+            "marginal_gain_selection",
+            "marginal_gain_analysis_test",
+            "negative_view_count",
+            "negative_view_ratio",
+            "worst_view_marginal",
+            "median_view_marginal",
+            "LP_drift_marginal",
+            "leakage_marginal",
+            "overlap_conflict_score",
+        ):
+            if key in item:
+                merged[key] = item[key]
+        if reasons:
+            merged["clean_reject_reason"] = ";".join(reasons)
+            rejected.append(merged)
+        else:
+            clean.append(merged)
+    return clean, rejected
 
 
 def _dose_curve(
@@ -731,6 +939,159 @@ def _write_cell_sheets(
             )
         if panels:
             _save_sheet(root / f"cluster_{int(cid):05d}.png", f"cluster={cid} selected={int(cid) in set(selected_ids)}", panels)
+
+
+def _normalize_for_gray(arr: np.ndarray, percentile: float = 99.0) -> np.ndarray:
+    value = np.asarray(arr, dtype=np.float32)
+    finite = value[np.isfinite(value)]
+    if finite.size == 0:
+        return np.zeros_like(value, dtype=np.float32)
+    scale = float(np.percentile(np.abs(finite), float(percentile)))
+    if scale <= 1e-8:
+        return np.zeros_like(value, dtype=np.float32)
+    return np.clip(np.abs(value) / scale, 0.0, 1.0).astype(np.float32)
+
+
+def _sign_conflict_map_for_stem(
+    *,
+    stem: str,
+    selected_ids: Sequence[int],
+    contributions: Dict[int, List[Contribution]],
+    shape: Tuple[int, int],
+    split_filter: Optional[str],
+) -> np.ndarray:
+    h, w = shape
+    pos = np.zeros((h, w), dtype=np.float32)
+    neg = np.zeros((h, w), dtype=np.float32)
+    for cid in selected_ids:
+        for contrib in contributions.get(int(cid), []):
+            if contrib.stem != stem:
+                continue
+            if split_filter is not None and contrib.split != split_filter:
+                continue
+            x0, y0, x1, y1 = contrib.roi
+            luma = np.sum(contrib.pred_hp * oracle.LUMA[None, None, :], axis=2)
+            active = contrib.fit_w > 1e-8
+            pos[y0:y1, x0:x1] += np.maximum(luma, 0.0) * active.astype(np.float32)
+            neg[y0:y1, x0:x1] += np.maximum(-luma, 0.0) * active.astype(np.float32)
+    return np.minimum(pos, neg) / np.maximum(pos + neg, 1e-8)
+
+
+def _negative_view_diagnostics(
+    *,
+    deploy_ids: Sequence[int],
+    deploy_rows: Sequence[Dict[str, object]],
+    contributions: Dict[int, List[Contribution]],
+    stems: Sequence[str],
+    state: Dict[str, object],
+    oracle_args: SimpleNamespace,
+    preview_args: argparse.Namespace,
+    output_dir: Path,
+    per_cell_marginals: Sequence[Dict[str, object]],
+) -> Dict[str, object]:
+    test_composed = _compose(
+        selected_ids=deploy_ids,
+        contributions=contributions,
+        stems=stems,
+        state=state,
+        args=oracle_args,
+        split_filter="test",
+        bounded_clip=None,
+    )
+    view_metrics = _per_view_metrics_for_composed(test_composed, lowpass_kernel=int(oracle_args.lowpass_kernel))
+    active_views = [
+        (stem, metrics)
+        for stem, metrics in view_metrics.items()
+        if bool(metrics.get("active")) and math.isfinite(_json_float(metrics.get("gain"), float("nan")))
+    ]
+    negative = [(stem, metrics) for stem, metrics in active_views if _json_float(metrics.get("gain"), 0.0) < 0.0]
+    negative.sort(key=lambda item: _json_float(item[1].get("gain"), 0.0))
+    marginal_by_id = {int(item["cluster_id"]): item for item in per_cell_marginals}
+    row_by_id = {_row_cluster_id(row): row for row in deploy_rows}
+    root = output_dir / "negative_view_diagnostics"
+    root.mkdir(parents=True, exist_ok=True)
+    diagnostics: Dict[str, object] = {
+        "analysis_test_view_metrics": view_metrics,
+        "negative_view_count": int(len(negative)),
+        "negative_stems": [stem for stem, _metrics in negative],
+        "views": {},
+    }
+    for stem, metrics in negative:
+        data = test_composed[stem]
+        view_dir = root / stem
+        view_dir.mkdir(parents=True, exist_ok=True)
+        oracle._save_rgb(
+            view_dir / "base_plus_residual.png",
+            data["preview"],
+        )
+        oracle._save_rgb(
+            view_dir / "target_hf_signed.png",
+            np.clip(data["target_hf"] * float(preview_args.visual_signed_scale) + 0.5, 0.0, 1.0),
+        )
+        oracle._save_rgb(
+            view_dir / "residual_pred_signed.png",
+            np.clip(data["pred"] * float(preview_args.visual_signed_scale) + 0.5, 0.0, 1.0),
+        )
+        oracle._save_rgb(view_dir / "dominant_residual_cell_map.png", _dominant_id_rgb(data["dominant_id"]))
+        oracle._save_gray(view_dir / "overlap_count.png", np.clip(data["overlap"] / 8.0, 0.0, 1.0))
+        oracle._save_gray(view_dir / "q_parent_peak.png", np.clip(data["q_parent_peak"], 0.0, 1.0))
+        conflict = _sign_conflict_map_for_stem(
+            stem=stem,
+            selected_ids=deploy_ids,
+            contributions=contributions,
+            shape=data["weight"].shape,
+            split_filter="test",
+        )
+        oracle._save_gray(view_dir / "overlap_sign_conflict.png", np.clip(conflict, 0.0, 1.0))
+        target_luma = np.sum(data["target_hf"] * oracle.LUMA[None, None, :], axis=2)
+        pred_luma = np.sum(data["pred"] * oracle.LUMA[None, None, :], axis=2)
+        phase_mismatch = (target_luma * pred_luma < 0.0).astype(np.float32) * np.minimum(np.abs(target_luma), np.abs(pred_luma))
+        oracle._save_gray(view_dir / "target_prediction_phase_mismatch.png", _normalize_for_gray(phase_mismatch))
+
+        all_metric = _metrics_for_view(data, lowpass_kernel=int(oracle_args.lowpass_kernel))
+        ranking: List[Dict[str, object]] = []
+        for cid in deploy_ids:
+            if stem not in _cell_stems(contributions, int(cid), split_filter="test"):
+                continue
+            without = _compose(
+                selected_ids=deploy_ids,
+                contributions=contributions,
+                stems=[stem],
+                state=state,
+                args=oracle_args,
+                split_filter="test",
+                skip_cluster_id=int(cid),
+                bounded_clip=None,
+            )
+            without_metric = _metrics_for_view(without[stem], lowpass_kernel=int(oracle_args.lowpass_kernel))
+            marginal = _json_float(all_metric.get("gain"), 0.0) - _json_float(without_metric.get("gain"), 0.0)
+            item = marginal_by_id.get(int(cid), {})
+            row = row_by_id.get(int(cid), {})
+            ranking.append(
+                {
+                    "cluster_id": int(cid),
+                    "view_marginal_gain": float(marginal),
+                    "C_selection_gain": row.get("C_selection_gain"),
+                    "C_test_gain": row.get("C_test_gain"),
+                    "median_view_marginal": item.get("median_view_marginal"),
+                    "negative_view_count": item.get("negative_view_count"),
+                    "overlap_conflict_score": item.get("overlap_conflict_score"),
+                }
+            )
+        ranking.sort(key=lambda x: _json_float(x.get("view_marginal_gain"), 0.0))
+        (view_dir / "cell_marginal_ranking.json").write_text(json.dumps(ranking, indent=2) + "\n", encoding="utf-8")
+        diagnostics["views"][stem] = {
+            "metrics": metrics,
+            "cell_marginal_ranking": ranking,
+            "paths": {
+                "base_plus_residual": str(view_dir / "base_plus_residual.png"),
+                "dominant_residual_cell_map": str(view_dir / "dominant_residual_cell_map.png"),
+                "overlap_sign_conflict": str(view_dir / "overlap_sign_conflict.png"),
+                "q_parent_peak": str(view_dir / "q_parent_peak.png"),
+                "target_prediction_phase_mismatch": str(view_dir / "target_prediction_phase_mismatch.png"),
+            },
+        }
+    return diagnostics
 
 
 def _save_sheet(path: Path, title: str, panels: Sequence[Tuple[str, np.ndarray]]) -> None:
@@ -818,6 +1179,37 @@ def main() -> None:
         bounded_clip=float(args.bounded_delta_clip),
     )
 
+    loo = {
+        "raw": _leave_one_out(
+            rows=deploy_rows,
+            selected_ids=deploy_ids,
+            contributions=contributions,
+            stems=stems,
+            state=state,
+            args=oracle_args,
+            bounded_clip=None,
+        ),
+        "bounded": _leave_one_out(
+            rows=deploy_rows,
+            selected_ids=deploy_ids,
+            contributions=contributions,
+            stems=stems,
+            state=state,
+            args=oracle_args,
+            bounded_clip=float(args.bounded_delta_clip),
+        ),
+    }
+    clean_rows, clean_rejected_rows = _clean_deploy_rows(deploy_rows, loo["raw"], args)
+    clean_ids = [_row_cluster_id(row) for row in clean_rows]
+    deploy_clean_composed = _compose(
+        selected_ids=clean_ids,
+        contributions=contributions,
+        stems=stems,
+        state=state,
+        args=oracle_args,
+        bounded_clip=None,
+    )
+
     _save_variant_visuals(
         variant_name="core28",
         composed=core_composed,
@@ -835,6 +1227,13 @@ def main() -> None:
     _save_variant_visuals(
         variant_name="deploy_top40_bounded",
         composed=deploy_bounded_composed,
+        output_dir=output_dir,
+        args=args,
+        lowpass_kernel=int(oracle_args.lowpass_kernel),
+    )
+    _save_variant_visuals(
+        variant_name="deploy_top40_clean",
+        composed=deploy_clean_composed,
         output_dir=output_dir,
         args=args,
         lowpass_kernel=int(oracle_args.lowpass_kernel),
@@ -869,6 +1268,15 @@ def main() -> None:
             args=oracle_args,
             bounded_clip=float(args.bounded_delta_clip),
         ),
+        "deploy_top40_clean": _variant_report(
+            name="deploy_top40_clean",
+            rows=clean_rows,
+            selected_ids=clean_ids,
+            contributions=contributions,
+            stems=stems,
+            state=state,
+            args=oracle_args,
+        ),
     }
     dose_curve = {
         "raw": _dose_curve(
@@ -889,25 +1297,14 @@ def main() -> None:
             counts=dose_counts,
             bounded_clip=float(args.bounded_delta_clip),
         ),
-    }
-    loo = {
-        "raw": _leave_one_out(
-            rows=deploy_rows,
-            selected_ids=deploy_ids,
+        "clean": _dose_curve(
+            deploy_rows=clean_rows,
             contributions=contributions,
             stems=stems,
             state=state,
             args=oracle_args,
+            counts=dose_counts,
             bounded_clip=None,
-        ),
-        "bounded": _leave_one_out(
-            rows=deploy_rows,
-            selected_ids=deploy_ids,
-            contributions=contributions,
-            stems=stems,
-            state=state,
-            args=oracle_args,
-            bounded_clip=float(args.bounded_delta_clip),
         ),
     }
     _write_cell_sheets(
@@ -919,19 +1316,39 @@ def main() -> None:
         args=oracle_args,
         preview_args=args,
     )
+    negative_view_diagnostics = _negative_view_diagnostics(
+        deploy_ids=deploy_ids,
+        deploy_rows=deploy_rows,
+        contributions=contributions,
+        stems=stems,
+        state=state,
+        oracle_args=oracle_args,
+        preview_args=args,
+        output_dir=output_dir,
+        per_cell_marginals=loo["raw"],
+    )
 
     summary = {
-        "version": "render_residual_tetris_preview_v0",
+        "version": "render_residual_tetris_static_v1_preview",
         "oracle_dir": str(oracle_dir),
         "output_dir": str(output_dir),
         "frozen_inputs": {
             "deploy_set": "deploy_top40",
             "deploy_count": int(len(deploy_ids)),
+            "clean_set": "deploy_top40_clean",
+            "clean_count": int(len(clean_ids)),
+            "clean_rejected_count": int(len(clean_rejected_rows)),
             "control_set": "core_pass28",
             "core_count": int(len(core_ids)),
             "ranking": oracle_summary.get("deploy_selector", {}).get("policy", {}).get("rank_key", "C_selection_gain"),
             "views": ["fit", "selection", "analysis_test"],
             "note": "beta, slot, piece geometry, donor IDs, and order are loaded from oracle JSON and are not refit.",
+        },
+        "clean_policy": {
+            "negative_view_ratio_threshold": float(args.clean_negative_view_ratio),
+            "lp_drift_marginal_min": float(args.clean_lp_drift_marginal_min),
+            "leakage_marginal_min": float(args.clean_leakage_marginal_min),
+            "rule": "Reject only cells with negative median view marginal, majority negative views, or aggregate negative marginal with drift/leakage. Raw deploy_top40 is preserved.",
         },
         "bounded_delta_clip": float(args.bounded_delta_clip),
         "metric_definitions": {
@@ -939,16 +1356,28 @@ def main() -> None:
             "sum_individual_gain": "Signed sum of frozen per-cell C_*_gain from oracle rows for the same split.",
             "sum_positive_individual_gain": "Positive-only sum of frozen per-cell C_*_gain; used as the stable gain-capture denominator.",
             "joint_gain_capture_positive": "joint_gain / sum_positive_individual_gain.",
+            "marginal_gain_all": "Joint gain(all deploy cells) - joint gain(all except this cell), using all frozen observations.",
+            "marginal_gain_selection": "Same leave-one-cell-out marginal on selection observations.",
+            "marginal_gain_analysis_test": "Same leave-one-cell-out marginal on analysis_test observations; diagnostic only, not a final lockbox metric.",
+            "negative_view_count": "Number of analysis_test views, or all available views if no analysis_test view exists, where the leave-one-cell-out marginal is negative.",
+            "worst_view_marginal": "Worst per-view leave-one-cell-out marginal in the same view set used by negative_view_count.",
+            "median_view_marginal": "Median per-view leave-one-cell-out marginal in the same view set used by negative_view_count.",
+            "overlap_conflict_score": "Average of active-pixel overlap duplicate ratio and sign-conflict ratio with other deploy cells.",
             "off_target_leakage": "Energy of the final composed residual outside the tolerated support divided by in-support residual energy.",
             "LP_drift": "Low-pass energy of the final composed residual divided by target HF energy.",
         },
         "joint_metrics": reports,
         "go_no_go": _go_no_go(reports),
+        "negative_view_diagnostics": negative_view_diagnostics,
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     (output_dir / "joint_metrics.json").write_text(json.dumps(reports, indent=2) + "\n", encoding="utf-8")
     (output_dir / "dose_curve.json").write_text(json.dumps(dose_curve, indent=2) + "\n", encoding="utf-8")
     (output_dir / "leave_one_cell_out.json").write_text(json.dumps(loo, indent=2) + "\n", encoding="utf-8")
+    (output_dir / "per_cell_marginals.json").write_text(json.dumps(loo["raw"], indent=2) + "\n", encoding="utf-8")
+    (output_dir / "clean_selected_rows.json").write_text(json.dumps(clean_rows, indent=2) + "\n", encoding="utf-8")
+    (output_dir / "clean_rejected_rows.json").write_text(json.dumps(clean_rejected_rows, indent=2) + "\n", encoding="utf-8")
+    (output_dir / "negative_view_diagnostics.json").write_text(json.dumps(negative_view_diagnostics, indent=2) + "\n", encoding="utf-8")
     (output_dir / "README.txt").write_text(_readme(output_dir), encoding="utf-8")
 
     if args.check_dir:
@@ -984,16 +1413,22 @@ def _go_no_go(reports: Dict[str, object]) -> Dict[str, object]:
 def _readme(output_dir: Path) -> str:
     return "\n".join(
         [
-            "Residual Tetris deploy preview V0.",
+            "Residual Tetris static sparse residual branch preview.",
             "",
-            "This is an offline closed-loop composition preview. It does not refit beta or selector decisions.",
+            "This is an offline closed-loop composition preview for the V1 sparse residual branch.",
+            "It does not train the base 3DGS, refit beta, search slots, add cells, or change selector order.",
             "The composed residual is delta_k = q_parent_k * projected_signed_piece_k * beta_k, accumulated over frozen cells.",
+            "deploy_top40_raw is the fixed baseline; deploy_top40_clean is a diagnostic derivative and must not replace raw.",
             "",
             "Main files:",
             f"  {output_dir / 'summary.json'}",
             f"  {output_dir / 'joint_metrics.json'}",
             f"  {output_dir / 'dose_curve.json'}",
             f"  {output_dir / 'leave_one_cell_out.json'}",
+            f"  {output_dir / 'per_cell_marginals.json'}",
+            f"  {output_dir / 'clean_selected_rows.json'}",
+            f"  {output_dir / 'clean_rejected_rows.json'}",
+            f"  {output_dir / 'negative_view_diagnostics.json'}",
             "",
             "Visual directories:",
             f"  {output_dir / 'visuals/base'}",
@@ -1001,6 +1436,8 @@ def _readme(output_dir: Path) -> str:
             f"  {output_dir / 'visuals/core28/base_plus_residual'}",
             f"  {output_dir / 'visuals/deploy_top40_raw/base_plus_residual'}",
             f"  {output_dir / 'visuals/deploy_top40_bounded/base_plus_residual'}",
+            f"  {output_dir / 'visuals/deploy_top40_clean/base_plus_residual'}",
+            f"  {output_dir / 'negative_view_diagnostics'}",
             f"  {output_dir / 'cell_sheet'}",
             "",
         ]

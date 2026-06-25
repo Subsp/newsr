@@ -22,6 +22,9 @@ VISUAL_SIGNED_SCALE="${VISUAL_SIGNED_SCALE:-4.0}"
 ERROR_SCALE="${ERROR_SCALE:-8.0}"
 LP_SCALE="${LP_SCALE:-16.0}"
 LEAK_SCALE="${LEAK_SCALE:-24.0}"
+CLEAN_NEGATIVE_VIEW_RATIO="${CLEAN_NEGATIVE_VIEW_RATIO:-0.5}"
+CLEAN_LP_DRIFT_MARGINAL_MIN="${CLEAN_LP_DRIFT_MARGINAL_MIN:-0.0}"
+CLEAN_LEAKAGE_MARGINAL_MIN="${CLEAN_LEAKAGE_MARGINAL_MIN:-0.0}"
 
 for required in "${ORACLE_DIR}/summary.json" "${ORACLE_DIR}/deploy_selected_rows.json" "${ORACLE_DIR}/core_selected_rows.json" "${ORACLE_DIR}/rows.json"; do
   if [[ ! -e "${required}" ]]; then
@@ -54,6 +57,9 @@ ARGS=(
   --error_scale "${ERROR_SCALE}"
   --lp_scale "${LP_SCALE}"
   --leak_scale "${LEAK_SCALE}"
+  --clean_negative_view_ratio "${CLEAN_NEGATIVE_VIEW_RATIO}"
+  --clean_lp_drift_marginal_min "${CLEAN_LP_DRIFT_MARGINAL_MIN}"
+  --clean_leakage_marginal_min "${CLEAN_LEAKAGE_MARGINAL_MIN}"
 )
 
 if [[ "${OVERWRITE}" == "1" ]]; then
@@ -67,7 +73,13 @@ echo "  ${CHECK_DIR}/summary.json"
 echo "  ${CHECK_DIR}/joint_metrics.json"
 echo "  ${CHECK_DIR}/dose_curve.json"
 echo "  ${CHECK_DIR}/leave_one_cell_out.json"
+echo "  ${CHECK_DIR}/per_cell_marginals.json"
+echo "  ${CHECK_DIR}/clean_selected_rows.json"
+echo "  ${CHECK_DIR}/clean_rejected_rows.json"
+echo "  ${CHECK_DIR}/negative_view_diagnostics.json"
 echo "  ${CHECK_DIR}/visuals/deploy_top40_raw/base_plus_residual"
 echo "  ${CHECK_DIR}/visuals/deploy_top40_bounded/base_plus_residual"
+echo "  ${CHECK_DIR}/visuals/deploy_top40_clean/base_plus_residual"
 echo "  ${CHECK_DIR}/visuals/core28/base_plus_residual"
+echo "  ${CHECK_DIR}/negative_view_diagnostics"
 echo "  ${CHECK_DIR}/cell_sheet"
