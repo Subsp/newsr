@@ -14,13 +14,15 @@ SR_PRIOR_NAME="${SR_PRIOR_NAME:-qwen_steps1_seed42_rcgm_aligned_images2_train244
 SR_DIR="${SR_DIR:-${SCENE_ASSET_ROOT}/prepared_sr_priors/${SR_PRIOR_NAME}/fused_priors}"
 LR_DIR="${LR_DIR:-${SCENE_ASSET_ROOT}/kitchen_mip_vanilla_images8_v1/mip30k_rerun_check_directsrc_r1_v0/train/ours_30000/test_preds_1}"
 NPSE_ROOT="${NPSE_ROOT:-${SCENE_ASSET_ROOT}/npse_cache/render_x1_restormer_depthprior_npse_yellow_fidelity_nogate_full_v0}"
-MASK_DIR="${MASK_DIR:-${NPSE_ROOT}/trust_edge}"
+MASK_DIR="${MASK_DIR-${NPSE_ROOT}/trust_edge}"
 
 OUTPUT_NAME="${OUTPUT_NAME:-${SR_PRIOR_NAME}_sr_hf_evidence_v0}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${SCENE_ASSET_ROOT}/sr_hf_evidence/${OUTPUT_NAME}}"
 
 MATCH_POLICY="${MATCH_POLICY:-order_if_needed}"
 LIMIT="${LIMIT:-0}"
+VIEW_OFFSET="${VIEW_OFFSET:-0}"
+VIEW_STEMS="${VIEW_STEMS:-}"
 DEBUG_LIMIT="${DEBUG_LIMIT:-12}"
 OVERWRITE="${OVERWRITE:-0}"
 
@@ -49,20 +51,25 @@ SIGMA_LONG_PX="${SIGMA_LONG_PX:-2.4}"
 SIGMA_SHORT_PX="${SIGMA_SHORT_PX:-0.35}"
 VIS_CLIP="${VIS_CLIP:-0.10}"
 
-for required in "${SR_DIR}" "${LR_DIR}" "${MASK_DIR}"; do
+for required in "${SR_DIR}" "${LR_DIR}"; do
   if [[ ! -d "${required}" ]]; then
     echo "[sr-hf-evidence-v0] required path not found: ${required}" >&2
     exit 1
   fi
 done
+if [[ -n "${MASK_DIR}" && ! -d "${MASK_DIR}" ]]; then
+  echo "[sr-hf-evidence-v0] required path not found: ${MASK_DIR}" >&2
+  exit 1
+fi
 
 ARGS=(
   --sr_dir "${SR_DIR}"
   --lr_dir "${LR_DIR}"
-  --mask_dir "${MASK_DIR}"
   --output_root "${OUTPUT_ROOT}"
   --match_policy "${MATCH_POLICY}"
   --limit "${LIMIT}"
+  --view_offset "${VIEW_OFFSET}"
+  --view_stems "${VIEW_STEMS}"
   --debug_limit "${DEBUG_LIMIT}"
   --highpass_kernel "${HIGHPASS_KERNEL}"
   --tensor_radius "${TENSOR_RADIUS}"
@@ -90,13 +97,18 @@ ARGS=(
   --vis_clip "${VIS_CLIP}"
 )
 
+if [[ -n "${MASK_DIR}" ]]; then
+  ARGS+=(--mask_dir "${MASK_DIR}")
+fi
+
 if [[ "${OVERWRITE}" == "1" ]]; then
   ARGS+=(--overwrite)
 fi
 
 echo "[sr-hf-evidence-v0] sr     : ${SR_DIR}"
 echo "[sr-hf-evidence-v0] lr     : ${LR_DIR}"
-echo "[sr-hf-evidence-v0] mask   : ${MASK_DIR}"
+echo "[sr-hf-evidence-v0] mask   : ${MASK_DIR:-<none/full>}"
+echo "[sr-hf-evidence-v0] select : offset=${VIEW_OFFSET} limit=${LIMIT} stems=${VIEW_STEMS:-<none>}"
 echo "[sr-hf-evidence-v0] output : ${OUTPUT_ROOT}"
 
 "${PYTHON_BIN}" "${SOF_ROOT}/scripts/build_sr_hf_evidence_cache_v0.py" "${ARGS[@]}"

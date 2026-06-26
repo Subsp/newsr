@@ -36,6 +36,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mask_dir", default="")
     parser.add_argument("--match_policy", default="order_if_needed", choices=["stem", "order", "order_if_needed"])
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--view_offset", type=int, default=0, help="Apply before --limit when selecting SR frames by sorted order.")
+    parser.add_argument("--view_stems", default="", help="Comma-separated SR stems to process. Takes precedence over --view_offset.")
     parser.add_argument("--highpass_kernel", type=int, default=9)
     parser.add_argument("--tensor_radius", type=int, default=4)
     parser.add_argument("--mask_power", type=float, default=1.5)
@@ -76,6 +78,24 @@ def _list_images(root: Path) -> List[Path]:
 
 def _lookup(paths: Sequence[Path]) -> Dict[str, Path]:
     return {p.stem.lower(): p for p in paths}
+
+
+def _select_paths(paths: Sequence[Path], *, view_stems: str, view_offset: int, limit: int) -> List[Path]:
+    selected = list(paths)
+    stems = [part.strip() for part in str(view_stems).split(",") if part.strip()]
+    if stems:
+        lookup = _lookup(selected)
+        missing = [stem for stem in stems if stem.lower() not in lookup]
+        if missing:
+            raise FileNotFoundError(f"Requested view_stems not found in SR dir: {missing}")
+        selected = [lookup[stem.lower()] for stem in stems]
+    else:
+        offset = max(0, int(view_offset))
+        if offset:
+            selected = selected[offset:]
+    if int(limit) > 0:
+        selected = selected[: int(limit)]
+    return selected
 
 
 def _resolve(paths: Sequence[Path], lookup: Dict[str, Path], ref: Path, index: int, policy: str) -> Optional[Path]:
@@ -389,8 +409,12 @@ def main() -> None:
     sr_paths = _list_images(sr_dir)
     lr_paths = _list_images(lr_dir)
     mask_paths = _list_images(mask_dir) if mask_dir is not None and mask_dir.is_dir() else []
-    if int(args.limit) > 0:
-        sr_paths = sr_paths[: int(args.limit)]
+    sr_paths = _select_paths(
+        sr_paths,
+        view_stems=str(args.view_stems),
+        view_offset=int(args.view_offset),
+        limit=int(args.limit),
+    )
     lr_lookup = _lookup(lr_paths)
     mask_lookup = _lookup(mask_paths)
 
@@ -642,6 +666,8 @@ def main() -> None:
         "mask_dir": str(mask_dir) if mask_dir is not None else None,
         "output_root": str(output_root),
         "match_policy": str(args.match_policy),
+        "view_offset": int(args.view_offset),
+        "view_stems": [part.strip() for part in str(args.view_stems).split(",") if part.strip()],
         "num_frames": len(rows),
         "highpass_kernel": int(args.highpass_kernel),
         "geometry_score_threshold": float(args.geometry_score_threshold),

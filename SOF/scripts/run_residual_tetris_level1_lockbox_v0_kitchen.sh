@@ -35,7 +35,9 @@ VISUAL_SIGNED_SCALE="${VISUAL_SIGNED_SCALE:-4.0}"
 ERROR_SCALE="${ERROR_SCALE:-8.0}"
 LP_SCALE="${LP_SCALE:-16.0}"
 LEAK_SCALE="${LEAK_SCALE:-24.0}"
+OUT_OF_RANGE_SCALE="${OUT_OF_RANGE_SCALE:-1.0}"
 CHANGED_THRESHOLD="${CHANGED_THRESHOLD:-0.00392156862745098}"
+CAMERA_INDEX_OFFSET="${CAMERA_INDEX_OFFSET:-0}"
 WRITE_BUFFERS="${WRITE_BUFFERS:-1}"
 
 for required in \
@@ -97,7 +99,9 @@ ARGS=(
   --error_scale "${ERROR_SCALE}"
   --lp_scale "${LP_SCALE}"
   --leak_scale "${LEAK_SCALE}"
+  --out_of_range_scale "${OUT_OF_RANGE_SCALE}"
   --changed_threshold "${CHANGED_THRESHOLD}"
+  --camera_index_offset "${CAMERA_INDEX_OFFSET}"
   --write_buffers "${WRITE_BUFFERS}"
 )
 

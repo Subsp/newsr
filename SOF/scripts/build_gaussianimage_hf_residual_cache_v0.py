@@ -82,6 +82,8 @@ def _parse_args() -> argparse.Namespace:
     parser.set_defaults(neutral_outside_mask=False)
     parser.add_argument("--save_pt", action="store_true")
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--view_offset", type=int, default=0, help="Apply before --limit when selecting target frames by sorted order.")
+    parser.add_argument("--view_stems", default="", help="Comma-separated target stems to process. Takes precedence over --view_offset.")
     parser.add_argument("--debug_limit", type=int, default=24)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -95,6 +97,24 @@ def _list_images(root: Path) -> List[Path]:
 
 def _lookup(paths: Sequence[Path]) -> Dict[str, Path]:
     return {p.stem.lower(): p for p in paths}
+
+
+def _select_paths(paths: Sequence[Path], *, view_stems: str, view_offset: int, limit: int) -> List[Path]:
+    selected = list(paths)
+    stems = [part.strip() for part in str(view_stems).split(",") if part.strip()]
+    if stems:
+        lookup = _lookup(selected)
+        missing = [stem for stem in stems if stem.lower() not in lookup]
+        if missing:
+            raise FileNotFoundError(f"Requested view_stems not found in target dir: {missing}")
+        selected = [lookup[stem.lower()] for stem in stems]
+    else:
+        offset = max(0, int(view_offset))
+        if offset:
+            selected = selected[offset:]
+    if int(limit) > 0:
+        selected = selected[: int(limit)]
+    return selected
 
 
 def _resolve(
@@ -1036,8 +1056,12 @@ def main() -> None:
     target_paths = _list_images(target_dir)
     anchor_paths = _list_images(anchor_dir)
     mask_paths = _list_images(mask_dir)
-    if int(args.limit) > 0:
-        target_paths = target_paths[: int(args.limit)]
+    target_paths = _select_paths(
+        target_paths,
+        view_stems=str(args.view_stems),
+        view_offset=int(args.view_offset),
+        limit=int(args.limit),
+    )
 
     dirs = {
         "target_hf": output_dir / "target_hf",
@@ -1133,6 +1157,10 @@ def main() -> None:
         f"[gaussianimage-hf-v0] fit    : model={args.model} n={args.num_gaussians} "
         f"iters={args.iterations} lr={args.lr} loss={args.loss} mode={args.fit_target_mode} "
         f"output={args.output_profile}"
+    )
+    print(
+        f"[gaussianimage-hf-v0] select : offset={args.view_offset} limit={args.limit} "
+        f"stems={args.view_stems or '<none>'}"
     )
 
     for index, target_path in enumerate(tqdm(target_paths, desc="GaussianImage HF")):
@@ -1418,6 +1446,8 @@ def main() -> None:
         "mask_dir": str(mask_dir),
         "output_dir": str(output_dir),
         "match_policy": args.match_policy,
+        "view_offset": int(args.view_offset),
+        "view_stems": [part.strip() for part in str(args.view_stems).split(",") if part.strip()],
         "model": args.model,
         "fit_target_mode": args.fit_target_mode,
         "rgb_loss_weight_mode": args.rgb_loss_weight_mode,

@@ -21,6 +21,8 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-${SCENE_ASSET_ROOT}/2dgs_hf_residual/${OUTPUT_NAME}}
 
 MATCH_POLICY="${MATCH_POLICY:-order_if_needed}"
 LIMIT="${LIMIT:-8}"
+VIEW_OFFSET="${VIEW_OFFSET:-0}"
+VIEW_STEMS="${VIEW_STEMS:-}"
 DEBUG_LIMIT="${DEBUG_LIMIT:-24}"
 OVERWRITE="${OVERWRITE:-0}"
 
@@ -124,6 +126,8 @@ ARGS=(
   --segment_color_smooth_weight "${SEGMENT_COLOR_SMOOTH_WEIGHT}"
   --light_visual_strength "${LIGHT_VIS_STRENGTH}"
   --limit "${LIMIT}"
+  --view_offset "${VIEW_OFFSET}"
+  --view_stems "${VIEW_STEMS}"
   --debug_limit "${DEBUG_LIMIT}"
 )
 
@@ -160,6 +164,7 @@ echo "[gaussianimage-hf-v0] target  : ${TARGET_DIR}"
 echo "[gaussianimage-hf-v0] anchor  : ${ANCHOR_DIR}"
 echo "[gaussianimage-hf-v0] mask    : ${MASK_DIR}"
 echo "[gaussianimage-hf-v0] output  : ${OUTPUT_ROOT}"
+echo "[gaussianimage-hf-v0] select  : offset=${VIEW_OFFSET} limit=${LIMIT} stems=${VIEW_STEMS:-<none>}"
 
 "${PYTHON_BIN}" "${SOF_ROOT}/scripts/build_gaussianimage_hf_residual_cache_v0.py" "${ARGS[@]}"
 

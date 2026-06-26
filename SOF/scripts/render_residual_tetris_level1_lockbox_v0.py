@@ -59,7 +59,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--error_scale", type=float, default=8.0)
     parser.add_argument("--lp_scale", type=float, default=16.0)
     parser.add_argument("--leak_scale", type=float, default=24.0)
+    parser.add_argument("--out_of_range_scale", type=float, default=1.0)
     parser.add_argument("--changed_threshold", type=float, default=1.0 / 255.0)
+    parser.add_argument(
+        "--camera_index_offset",
+        type=int,
+        default=0,
+        help=(
+            "Order fallback offset into cameras.json. Use 244 for kitchen test views "
+            "when lockbox images are numbered 00000.. and cannot stem-match camera names."
+        ),
+    )
     parser.add_argument("--write_buffers", type=int, default=1)
     return parser.parse_args()
 
@@ -202,10 +212,12 @@ def _load_lockbox_state(args: SimpleNamespace) -> Dict[str, object]:
 
     views = []
     per_view = []
-    for view_index, primitive_path in enumerate(primitive_paths):
+    camera_index_offset = max(0, int(getattr(args, "camera_index_offset", 0)))
+    for view_order, primitive_path in enumerate(primitive_paths):
+        camera_view_index = int(view_order + camera_index_offset)
         view, info = oracle._load_view_primitives(
             primitive_path,
-            view_index,
+            camera_view_index,
             spray_args,
             cameras,
             base_xyz,
@@ -219,10 +231,13 @@ def _load_lockbox_state(args: SimpleNamespace) -> Dict[str, object]:
         )
         per_view.append(info)
         if view is None:
-            print(f"[level1-lockbox-v0] skip {view_index + 1}/{len(primitive_paths)} {primitive_path.stem}: {info.get('status')}")
+            print(f"[level1-lockbox-v0] skip {view_order + 1}/{len(primitive_paths)} {primitive_path.stem}: {info.get('status')}")
             continue
         views.append(view)
-        print(f"[level1-lockbox-v0] view {len(views)}/{len(primitive_paths)} {view.stem} prims={view.mu_xy.shape[0]} q={float(view.q.mean()):.4f}")
+        print(
+            f"[level1-lockbox-v0] view {len(views)}/{len(primitive_paths)} {view.stem} "
+            f"camera_index={camera_view_index} prims={view.mu_xy.shape[0]} q={float(view.q.mean()):.4f}"
+        )
     if not views:
         raise RuntimeError("No usable lockbox views.")
 
