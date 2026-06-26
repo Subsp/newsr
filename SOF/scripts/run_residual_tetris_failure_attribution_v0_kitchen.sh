@@ -120,7 +120,7 @@ ARGS=(
   --signs "${SIGNS}"
   --dev_q_reference "${DEV_Q_REFERENCE}"
   --q_scale_stat "${Q_SCALE_STAT}"
-  --shift_grid "${SHIFT_GRID}"
+  "--shift_grid=${SHIFT_GRID}"
   --shift_q_modes "${SHIFT_Q_MODES}"
   --shift_signs "${SHIFT_SIGNS}"
   --shift_lambdas "${SHIFT_LAMBDAS}"
