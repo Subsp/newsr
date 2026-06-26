@@ -130,6 +130,66 @@ def _load_frozen(static_dir: Path) -> Dict[str, object]:
     }
 
 
+def _camera_for_view(
+    cameras: Dict[str, Dict[str, object]],
+    stem: str,
+    view_index: int,
+    policy: str,
+) -> Tuple[Optional[Dict[str, object]], str]:
+    found = cameras.get(stem.lower())
+    if found is not None:
+        return found, "stem"
+    if policy == "stem":
+        return None, "missing"
+    values = list(cameras.values())
+    if int(view_index) < 0 or int(view_index) >= len(values):
+        return None, "missing"
+    return values[int(view_index)], "order"
+
+
+def _resolve_optional_image(
+    paths: Sequence[Path],
+    lookup: Dict[str, Path],
+    stem: str,
+    image_order_index: int,
+    policy: str,
+) -> Optional[Path]:
+    found = lookup.get(stem.lower())
+    if found is not None:
+        return found
+    if policy == "stem":
+        return None
+    if 0 <= int(image_order_index) < len(paths):
+        return paths[int(image_order_index)]
+    return None
+
+
+def _infer_lockbox_source_size(
+    primitive_path: Path,
+    primitive: Dict[str, np.ndarray],
+    stem: str,
+    image_order_index: int,
+    policy: str,
+    image_sets: Sequence[Tuple[Sequence[Path], Dict[str, Path]]],
+) -> Tuple[int, int]:
+    for paths, lookup in image_sets:
+        image_path = _resolve_optional_image(paths, lookup, stem, image_order_index, policy)
+        if image_path is not None and image_path.is_file():
+            from PIL import Image
+
+            with Image.open(image_path) as image:
+                return image.size
+    key = "mu_xy" if "mu_xy" in primitive else "xy" if "xy" in primitive else ""
+    if key:
+        xy = np.asarray(primitive[key], dtype=np.float32).reshape(-1, 2)
+        if xy.size > 0:
+            return (
+                max(1, int(math.ceil(float(np.nanmax(xy[:, 0])) + 1.0))),
+                max(1, int(math.ceil(float(np.nanmax(xy[:, 1])) + 1.0))),
+            )
+    raise ValueError(f"Cannot infer source size for lockbox view: {primitive_path}")
+
+
 def _oracle_args_from_static(static_dir: Path, frozen: Dict[str, object], args: argparse.Namespace) -> SimpleNamespace:
     if args.oracle_dir:
         oracle_summary = _read_json(Path(args.oracle_dir) / "summary.json")
@@ -203,9 +263,13 @@ def _load_lockbox_state(args: SimpleNamespace) -> Dict[str, object]:
     _base_vertices, base_xyz, base_opacity, _base_rgb = oracle._load_base_vertices(base_ply)
     spray_args = oracle._make_spray_args(args)
 
+    base_paths = oracle._list_files(Path(args.base_render_dir).expanduser().resolve())
+    sr_paths = oracle._list_files(Path(args.sr_dir).expanduser().resolve())
     carrier_rgb_paths = _list_images(Path(args.carrier_rgb_dir)) if str(getattr(args, "carrier_rgb_dir", "")) else []
     carrier_render_paths = _list_images(Path(args.carrier_render_dir)) if str(getattr(args, "carrier_render_dir", "")) else []
     weight_paths = _list_images(Path(args.weight_dir))
+    base_lookup = oracle._image_lookup(base_paths)
+    sr_lookup = oracle._image_lookup(sr_paths)
     carrier_rgb_lookup = oracle._image_lookup(carrier_rgb_paths)
     carrier_render_lookup = oracle._image_lookup(carrier_render_paths)
     weight_lookup_for_loader = oracle._image_lookup(weight_paths)
@@ -215,34 +279,71 @@ def _load_lockbox_state(args: SimpleNamespace) -> Dict[str, object]:
     camera_index_offset = max(0, int(getattr(args, "camera_index_offset", 0)))
     for view_order, primitive_path in enumerate(primitive_paths):
         camera_view_index = int(view_order + camera_index_offset)
-        view, info = oracle._load_view_primitives(
-            primitive_path,
-            camera_view_index,
-            spray_args,
-            cameras,
-            base_xyz,
-            base_opacity,
-            carrier_rgb_paths,
-            carrier_rgb_lookup,
-            carrier_render_paths,
-            carrier_render_lookup,
-            weight_paths,
-            weight_lookup_for_loader,
-        )
+        primitive = dict(np.load(primitive_path))
+        if "mu_xy" in primitive and "color" in primitive:
+            view, info = oracle._load_view_primitives(
+                primitive_path,
+                camera_view_index,
+                spray_args,
+                cameras,
+                base_xyz,
+                base_opacity,
+                carrier_rgb_paths,
+                carrier_rgb_lookup,
+                carrier_render_paths,
+                carrier_render_lookup,
+                weight_paths,
+                weight_lookup_for_loader,
+            )
+        else:
+            cam, cam_match = _camera_for_view(cameras, primitive_path.stem, camera_view_index, str(args.match_policy))
+            if cam is None:
+                view = None
+                info = {"stem": primitive_path.stem, "status": "missing_camera", "camera_match": cam_match}
+            else:
+                source_size = _infer_lockbox_source_size(
+                    primitive_path,
+                    primitive,
+                    primitive_path.stem,
+                    view_order,
+                    str(args.match_policy),
+                    (
+                        (base_paths, base_lookup),
+                        (sr_paths, sr_lookup),
+                        (weight_paths, weight_lookup_for_loader),
+                    ),
+                )
+                xy = np.asarray(primitive.get("xy", primitive.get("mu_xy", np.zeros((0, 2), dtype=np.float32))), dtype=np.float32)
+                q = np.asarray(primitive.get("score", np.ones((xy.reshape(-1, 2).shape[0],), dtype=np.float32)), dtype=np.float32).reshape(-1)
+                view = SimpleNamespace(
+                    view_index=camera_view_index,
+                    stem=primitive_path.stem,
+                    camera=cam,
+                    source_size=source_size,
+                    primitive_path=primitive_path,
+                    mu_xy=xy.reshape(-1, 2),
+                    q=q,
+                )
+                info = {
+                    "stem": primitive_path.stem,
+                    "status": "metadata_only",
+                    "camera_match": cam_match,
+                    "source_size": list(source_size),
+                    "num_primitives": int(view.mu_xy.shape[0]),
+                }
         per_view.append(info)
         if view is None:
             print(f"[level1-lockbox-v0] skip {view_order + 1}/{len(primitive_paths)} {primitive_path.stem}: {info.get('status')}")
             continue
         views.append(view)
+        q_mean = float(np.asarray(view.q, dtype=np.float32).mean()) if np.asarray(view.q).size else 0.0
         print(
             f"[level1-lockbox-v0] view {len(views)}/{len(primitive_paths)} {view.stem} "
-            f"camera_index={camera_view_index} prims={view.mu_xy.shape[0]} q={float(view.q.mean()):.4f}"
+            f"camera_index={camera_view_index} prims={view.mu_xy.shape[0]} q={q_mean:.4f}"
         )
     if not views:
         raise RuntimeError("No usable lockbox views.")
 
-    base_paths = oracle._list_files(Path(args.base_render_dir).expanduser().resolve())
-    sr_paths = oracle._list_files(Path(args.sr_dir).expanduser().resolve())
     q_root = Path(args.q_parent_dir).expanduser().resolve() if str(getattr(args, "q_parent_dir", "")) else None
     q_paths = oracle._list_files(q_root) if q_root is not None and q_root.is_dir() else []
     return {
