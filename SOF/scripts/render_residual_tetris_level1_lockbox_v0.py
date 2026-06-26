@@ -136,9 +136,10 @@ def _camera_for_view(
     view_index: int,
     policy: str,
 ) -> Tuple[Optional[Dict[str, object]], str]:
-    found = cameras.get(stem.lower())
-    if found is not None:
-        return found, "stem"
+    if policy != "order":
+        found = cameras.get(stem.lower())
+        if found is not None:
+            return found, "stem"
     if policy == "stem":
         return None, "missing"
     values = list(cameras.values())
@@ -337,9 +338,12 @@ def _load_lockbox_state(args: SimpleNamespace) -> Dict[str, object]:
             continue
         views.append(view)
         q_mean = float(np.asarray(view.q, dtype=np.float32).mean()) if np.asarray(view.q).size else 0.0
+        actual_camera_index = int(view.camera.get("_index", camera_view_index))
+        camera_match = str(info.get("camera_match", "unknown"))
         print(
             f"[level1-lockbox-v0] view {len(views)}/{len(primitive_paths)} {view.stem} "
-            f"camera_index={camera_view_index} prims={view.mu_xy.shape[0]} q={q_mean:.4f}"
+            f"requested_camera_index={camera_view_index} actual_camera_index={actual_camera_index} "
+            f"camera_match={camera_match} prims={view.mu_xy.shape[0]} q={q_mean:.4f}"
         )
     if not views:
         raise RuntimeError("No usable lockbox views.")
