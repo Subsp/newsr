@@ -50,6 +50,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--carrier_render_dir", default="")
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--check_dir", default="")
+    parser.add_argument("--target_type", default="")
+    parser.add_argument(
+        "--q_parent_mode",
+        default="auto",
+        choices=("auto", "true_donor_contribution", "effective_hf_weight_fallback"),
+        help=(
+            "Records and validates the q_parent source. In auto mode, a q_parent_dir "
+            "means true_donor_contribution, otherwise effective_hf_weight_fallback."
+        ),
+    )
     parser.add_argument("--match_policy", choices=["stem", "order_if_needed", "order"], default="")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
@@ -72,6 +82,68 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--write_buffers", type=int, default=1)
     return parser.parse_args()
+
+
+def _infer_target_type(args: argparse.Namespace) -> str:
+    if str(args.target_type).strip():
+        return str(args.target_type).strip()
+    text = " ".join([str(args.sr_dir), str(args.primitive_dir), str(args.weight_dir)]).lower()
+    if "gt" in text:
+        return "GT_HF"
+    if "vosr" in text or "qwen" in text:
+        return "VOSR_HF"
+    if "sr" in text or "fused_prior" in text or "fused_priors" in text:
+        return "SR_HF"
+    return "unknown_hf"
+
+
+def _resolve_q_parent_mode(args: argparse.Namespace) -> str:
+    if str(args.q_parent_mode) != "auto":
+        return str(args.q_parent_mode)
+    return "true_donor_contribution" if str(args.q_parent_dir).strip() else "effective_hf_weight_fallback"
+
+
+def _validate_q_parent_mode(args: argparse.Namespace, output_dir: Path, check_dir: Path) -> str:
+    mode = _resolve_q_parent_mode(args)
+    has_q_dir = bool(str(args.q_parent_dir).strip())
+    if mode == "true_donor_contribution" and not has_q_dir:
+        raise ValueError("q_parent_mode=true_donor_contribution requires --q_parent_dir / LOCKBOX_Q_PARENT_DIR.")
+    if mode == "effective_hf_weight_fallback" and has_q_dir:
+        raise ValueError("q_parent_mode=effective_hf_weight_fallback conflicts with non-empty --q_parent_dir.")
+    joined = " ".join([str(output_dir), str(check_dir), str(args.target_type), str(args.q_parent_mode)]).lower()
+    if not has_q_dir and ("true_q" in joined or "donor_q" in joined or "true-donor" in joined):
+        raise ValueError(
+            "Experiment name suggests true/donor q, but --q_parent_dir is empty; refusing q fallback."
+        )
+    return mode
+
+
+def _q_stats_from_obs(obs_by_cluster: Dict[int, List[oracle.EvalObs]], args: SimpleNamespace) -> Dict[str, float]:
+    values: List[np.ndarray] = []
+    masses: List[float] = []
+    support_masses: List[float] = []
+    threshold = float(getattr(args, "core_weight_threshold", 1e-4))
+    for obs_list in obs_by_cluster.values():
+        for obs in obs_list:
+            q = np.asarray(obs.q_parent, dtype=np.float32)
+            mask = np.asarray(obs.core_weight, dtype=np.float32) > threshold
+            if np.any(mask):
+                values.append(q[mask].reshape(-1))
+            masses.append(float(np.sum(q)))
+            support_masses.append(float(np.sum(q * np.asarray(obs.core_weight, dtype=np.float32))))
+    if values:
+        arr = np.concatenate(values, axis=0).astype(np.float32)
+    else:
+        arr = np.zeros((0,), dtype=np.float32)
+    return {
+        "count": int(arr.size),
+        "mean": float(np.mean(arr)) if arr.size else 0.0,
+        "median": float(np.median(arr)) if arr.size else 0.0,
+        "p95": float(np.percentile(arr, 95.0)) if arr.size else 0.0,
+        "max": float(np.max(arr)) if arr.size else 0.0,
+        "mass_mean": float(np.mean(masses)) if masses else 0.0,
+        "mass_on_support_mean": float(np.mean(support_masses)) if support_masses else 0.0,
+    }
 
 
 def _read_json(path: Path):
@@ -637,6 +709,8 @@ def main() -> None:
     static_dir = Path(cli_args.static_v1_dir).expanduser().resolve()
     output_dir = Path(cli_args.output_dir).expanduser().resolve()
     check_dir = Path(cli_args.check_dir).expanduser().resolve() if cli_args.check_dir else Path("")
+    target_type = _infer_target_type(cli_args)
+    q_parent_mode = _validate_q_parent_mode(cli_args, output_dir, check_dir)
     if output_dir.exists() and not cli_args.overwrite:
         raise FileExistsError(f"Output exists; pass --overwrite: {output_dir}")
     if output_dir.exists() and cli_args.overwrite:
@@ -673,6 +747,7 @@ def main() -> None:
     }
     all_ids = sorted(set(frozen["frozen_by_id"].keys()))
     obs_by_cluster = _build_lockbox_obs(cluster_ids=all_ids, frozen_by_id=frozen_by_id, state=state, args=args_ns)
+    q_stats = _q_stats_from_obs(obs_by_cluster, args_ns)
     row_union = [cell["frozen_row"] for cid, cell in sorted(frozen_by_id.items()) if obs_by_cluster.get(cid)]
     contributions = preview._build_contributions(row_union, obs_by_cluster, args_ns)
 
@@ -714,6 +789,10 @@ def main() -> None:
             "primary": ["raw_union_support", "global_eligible_support"],
             "supplemental": "variant_support",
         },
+        "target_type": target_type,
+        "q_parent_mode": q_parent_mode,
+        "q_parent_source": str(getattr(args_ns, "q_parent_dir", "")) if q_parent_mode == "true_donor_contribution" else str(args_ns.weight_dir),
+        "q_stats": q_stats,
         "bounded_mode": bounded_mode,
         "bounded_delta_clip": bounded_clip,
         "variants": {},
@@ -749,9 +828,13 @@ def main() -> None:
             "sr_dir": str(args_ns.sr_dir),
             "weight_dir": str(args_ns.weight_dir),
             "q_parent_dir": str(getattr(args_ns, "q_parent_dir", "")),
+            "target_type": target_type,
+            "q_parent_mode": q_parent_mode,
+            "q_parent_source": str(getattr(args_ns, "q_parent_dir", "")) if q_parent_mode == "true_donor_contribution" else str(args_ns.weight_dir),
             "match_policy": str(args_ns.match_policy),
             "limit": int(args_ns.limit),
         },
+        "q_stats": q_stats,
         "forbidden_actions": [
             "no cell deletion",
             "no top-k change",
@@ -765,6 +848,9 @@ def main() -> None:
         "runtime_sec": float(runtime),
         "num_lockbox_views": int(len(stems)),
         "lockbox_views": stems,
+        "target_type": target_type,
+        "q_parent_mode": q_parent_mode,
+        "q_stats": q_stats,
         "ready_to_evaluate": True,
         "headline": {
             name: {
