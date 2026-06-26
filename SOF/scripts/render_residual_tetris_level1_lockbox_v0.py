@@ -226,6 +226,7 @@ def _oracle_args_from_static(static_dir: Path, frozen: Dict[str, object], args: 
     if args.match_policy:
         values["match_policy"] = str(args.match_policy)
     values["limit"] = int(args.limit)
+    values["camera_index_offset"] = int(args.camera_index_offset)
     defaults = {
         "roi_pad_px": 12,
         "responsibility_bg_tau": 0.25,
