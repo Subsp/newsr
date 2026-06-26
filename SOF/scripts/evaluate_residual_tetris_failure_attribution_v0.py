@@ -80,6 +80,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--shift_q_modes", default="proxy_scaled,true")
     parser.add_argument("--shift_signs", default="plus")
     parser.add_argument("--shift_lambdas", default="1.0")
+    parser.add_argument("--per_cell_shift_grid", default="", help="Optional per-cell shift grid. Empty by default to avoid heavy scans.")
     parser.add_argument("--write_per_cell_report", type=int, default=1)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -107,6 +108,9 @@ def _copy_to_check(output_dir: Path, check_dir: Path) -> None:
         "failure_attribution_per_view.json",
         "q_distribution_report.json",
         "target_similarity_report.json",
+        "shift_attribution_report.json",
+        "alignment_sanity_report.json",
+        "qtrue_status_or_qtrue_metrics.json",
         "per_cell_failure_report.json",
         "summary.json",
         "manifest.json",
@@ -251,6 +255,15 @@ def _shift_composed(composed: Dict[str, Dict[str, np.ndarray]], dx: int, dy: int
     return shifted
 
 
+def _shift_target_composed(composed: Dict[str, Dict[str, np.ndarray]], dx: int, dy: int) -> Dict[str, Dict[str, np.ndarray]]:
+    shifted: Dict[str, Dict[str, np.ndarray]] = {}
+    for stem, data in composed.items():
+        new_data = {k: v for k, v in data.items()}
+        new_data["target_hf"] = _shift_zero(np.asarray(data["target_hf"], dtype=np.float32), dx=dx, dy=dy)
+        shifted[stem] = new_data
+    return shifted
+
+
 def _scale_contributions(
     contributions: Dict[int, List[preview.Contribution]],
     factor: float,
@@ -268,6 +281,72 @@ def _scale_contributions(
             )
             for contrib in items
         ]
+    return out
+
+
+def _build_shifted_basis_contributions(
+    *,
+    rows: Sequence[Dict[str, object]],
+    obs_by_cluster: Dict[int, List[oracle.EvalObs]],
+    args: SimpleNamespace,
+    shift_mode: str,
+    dx: int,
+    dy: int,
+    factor: float,
+) -> Dict[int, List[preview.Contribution]]:
+    out: Dict[int, List[preview.Contribution]] = {}
+    for row in rows:
+        cid = preview._row_cluster_id(row)
+        cand = preview._candidate_from_row(row)
+        beta = preview._beta_from_row(row)
+        row_contribs: List[preview.Contribution] = []
+        for obs in obs_by_cluster.get(cid, []):
+            xx, yy = oracle._coords(obs.roi)
+            phi = oracle._piece(
+                candidate=cand,
+                xx=xx,
+                yy=yy,
+                center=obs.center,
+                theta=obs.theta,
+                long_px=obs.long_px,
+                short_px=obs.short_px,
+                args=args,
+            )
+            q = np.clip(np.asarray(obs.q_parent, dtype=np.float32), 0.0, 1.0)
+            if shift_mode == "phi":
+                phi = _shift_zero(phi.astype(np.float32), dx=dx, dy=dy)
+            elif shift_mode == "q":
+                q = _shift_zero(q, dx=dx, dy=dy)
+            else:
+                raise ValueError(f"unsupported shifted basis mode: {shift_mode}")
+            raw_basis = (q * phi).astype(np.float32)
+            basis_hp = oracle._highpass(raw_basis, int(args.highpass_kernel)).astype(np.float32) * float(factor)
+            raw_scaled = raw_basis * float(factor)
+            lp_scaled = oracle._box_blur(raw_basis, int(args.lowpass_kernel)).astype(np.float32) * float(factor)
+            pred_hp = basis_hp[..., None] * beta[None, None, :]
+            pred_raw = raw_scaled[..., None] * beta[None, None, :]
+            pred_lp = lp_scaled[..., None] * beta[None, None, :]
+            fit_w = np.clip(np.asarray(obs.core_weight, dtype=np.float32), 0.0, 1.0)
+            tolerance = oracle._dilate(fit_w > float(args.core_weight_threshold), int(args.tolerance_radius))
+            off_w = np.where(tolerance, 0.0, np.clip(obs.support, 0.0, 1.0)).astype(np.float32)
+            abs_luma = np.abs(np.sum(pred_hp * oracle.LUMA[None, None, :], axis=2)).astype(np.float32)
+            row_contribs.append(
+                preview.Contribution(
+                    cluster_id=cid,
+                    stem=obs.stem,
+                    split=obs.split,
+                    roi=obs.roi,
+                    pred_hp=pred_hp.astype(np.float32),
+                    pred_raw=pred_raw.astype(np.float32),
+                    pred_lp=pred_lp.astype(np.float32),
+                    fit_w=fit_w,
+                    off_w=off_w,
+                    abs_luma=abs_luma,
+                    q_parent=q.astype(np.float32),
+                    target_hf=obs.target_hf.astype(np.float32),
+                )
+            )
+        out[cid] = row_contribs
     return out
 
 
@@ -380,6 +459,67 @@ def _target_similarity(
     }
 
 
+def _alignment_sanity_report(
+    *,
+    target_dirs: Sequence[Tuple[str, Path]],
+    state: Dict[str, object],
+    args: SimpleNamespace,
+    shift_values: Sequence[int],
+) -> Dict[str, object]:
+    if not shift_values:
+        return {"skipped": True, "reason": "shift_grid is empty"}
+    weight_paths = oracle._list_files(Path(args.weight_dir))
+    weight_lookup = oracle._image_lookup(weight_paths)
+    report: Dict[str, object] = {"version": VERSION, "grid": [int(x) for x in shift_values], "targets": {}}
+    for target_name, target_dir in target_dirs:
+        target_paths = oracle._list_files(target_dir)
+        target_lookup = oracle._image_lookup(target_paths)
+        per_view = []
+        global_by_shift: Dict[Tuple[int, int], Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray]]] = {}
+        for view in state["views"]:
+            stem = view.stem
+            view_index = int(view.view_index)
+            base_path = oracle._resolve_path(state["base_paths"], state["base_lookup"], stem, view_index, str(args.match_policy))
+            target_path = oracle._resolve_path(target_paths, target_lookup, stem, view_index, str(args.match_policy))
+            weight_path = oracle._resolve_path(weight_paths, weight_lookup, stem, view_index, str(args.match_policy))
+            base = oracle._load_rgb(base_path)
+            size = (base.shape[1], base.shape[0])
+            target = oracle._load_rgb(target_path, size=size)
+            weight = oracle._load_gray(weight_path, size=size)
+            base_edge = np.abs(np.sum(oracle._highpass(base, int(args.highpass_kernel)) * oracle.LUMA[None, None, :], axis=2))
+            target_edge = np.abs(np.sum(oracle._highpass(target, int(args.highpass_kernel)) * oracle.LUMA[None, None, :], axis=2))
+            best_gain = {"corr": -1e30, "dx": 0, "dy": 0}
+            for dy in shift_values:
+                for dx in shift_values:
+                    shifted_target = _shift_zero(target_edge, dx=int(dx), dy=int(dy))
+                    corr = oracle._weighted_corr(base_edge, shifted_target, weight)
+                    corr_value = float(corr) if corr is not None and math.isfinite(float(corr)) else -1e30
+                    if corr_value > float(best_gain["corr"]):
+                        best_gain = {"corr": corr_value, "dx": int(dx), "dy": int(dy)}
+                    key = (int(dx), int(dy))
+                    if key not in global_by_shift:
+                        global_by_shift[key] = ([], [], [])
+                    global_by_shift[key][0].append(base_edge.reshape(-1))
+                    global_by_shift[key][1].append(shifted_target.reshape(-1))
+                    global_by_shift[key][2].append(weight.reshape(-1))
+            per_view.append({"stem": stem, **best_gain})
+        best_global = {"corr": -1e30, "dx": 0, "dy": 0}
+        for (dx, dy), arrays in global_by_shift.items():
+            a = np.concatenate(arrays[0], axis=0) if arrays[0] else np.zeros((0,), dtype=np.float32)
+            b = np.concatenate(arrays[1], axis=0) if arrays[1] else np.zeros((0,), dtype=np.float32)
+            w = np.concatenate(arrays[2], axis=0) if arrays[2] else np.zeros((0,), dtype=np.float32)
+            corr = oracle._weighted_corr(a, b, w)
+            corr_value = float(corr) if corr is not None and math.isfinite(float(corr)) else -1e30
+            if corr_value > float(best_global["corr"]):
+                best_global = {"corr": corr_value, "dx": int(dx), "dy": int(dy)}
+        report["targets"][target_name] = {
+            "target_dir": str(target_dir),
+            "best_global_base_edge_vs_target_edge_shift": best_global,
+            "per_view": per_view,
+        }
+    return report
+
+
 def _changed_metrics(composed: Dict[str, Dict[str, np.ndarray]], threshold: float) -> Dict[str, float]:
     rows = [level1._changed_metrics(data, threshold) for data in composed.values()]
     if not rows:
@@ -472,6 +612,131 @@ def _best_shift_for_composed(
         "best_by_gain": best_gain or {},
         "best_by_corr": best_corr or {},
     }
+
+
+def _targeted_shift_report_for_variant(
+    *,
+    selected_ids: Sequence[int],
+    rows: Sequence[Dict[str, object]],
+    obs_by_cluster: Dict[int, List[oracle.EvalObs]],
+    base_contributions: Dict[int, List[preview.Contribution]],
+    stems: Sequence[str],
+    state: Dict[str, object],
+    args: SimpleNamespace,
+    raw_support: Dict[str, Dict[str, np.ndarray]],
+    global_support: Dict[str, Dict[str, np.ndarray]],
+    lowpass_kernel: int,
+    changed_threshold: float,
+    shift_values: Sequence[int],
+    factor: float,
+) -> Dict[str, object]:
+    if not shift_values:
+        return {}
+    base_scaled = _scale_contributions(base_contributions, factor=float(factor))
+    base_composed = static_v1._static_compose(
+        selected_ids=selected_ids,
+        contributions=base_scaled,
+        stems=stems,
+        state=state,
+        args=args,
+    )
+    report: Dict[str, object] = {
+        "grid": [int(x) for x in shift_values],
+        "modes": {},
+    }
+    mode_rows: Dict[str, object] = {}
+    mode_rows["whole_delta"] = _best_shift_for_composed(
+        composed=base_composed,
+        raw_support=raw_support,
+        global_support=global_support,
+        rows=rows,
+        lowpass_kernel=lowpass_kernel,
+        changed_threshold=changed_threshold,
+        shift_values=shift_values,
+    )
+    # Replace target-only entries with target-shifted metrics; whole-delta helper shifts pred.
+    best_gain: Optional[Dict[str, object]] = None
+    best_corr: Optional[Dict[str, object]] = None
+    for dy in shift_values:
+        for dx in shift_values:
+            shifted_target = _shift_target_composed(base_composed, dx=int(dx), dy=int(dy))
+            metrics = _metrics_for_composed(
+                composed=shifted_target,
+                raw_support=raw_support,
+                global_support=global_support,
+                rows=rows,
+                lowpass_kernel=lowpass_kernel,
+                changed_threshold=changed_threshold,
+            )
+            row = {
+                "dx": int(dx),
+                "dy": int(dy),
+                "gain": metrics.get("gain"),
+                "HF_corr": metrics.get("HF_corr"),
+                "explained_energy": metrics.get("explained_energy"),
+                "positive_view_ratio": metrics.get("positive_view_ratio"),
+            }
+            gain = float(row["gain"]) if row.get("gain") is not None and math.isfinite(float(row["gain"])) else -1e30
+            corr = float(row["HF_corr"]) if row.get("HF_corr") is not None and math.isfinite(float(row["HF_corr"])) else -1e30
+            if best_gain is None or gain > float(best_gain.get("gain", -1e30)):
+                best_gain = row
+            if best_corr is None or corr > float(best_corr.get("HF_corr", -1e30)):
+                best_corr = row
+    mode_rows["target_only"] = {
+        "grid": [int(x) for x in shift_values],
+        "best_by_gain": best_gain or {},
+        "best_by_corr": best_corr or {},
+    }
+    for shift_mode in ("phi", "q"):
+        best_gain = None
+        best_corr = None
+        for dy in shift_values:
+            for dx in shift_values:
+                shifted_contrib = _build_shifted_basis_contributions(
+                    rows=rows,
+                    obs_by_cluster=obs_by_cluster,
+                    args=args,
+                    shift_mode=shift_mode,
+                    dx=int(dx),
+                    dy=int(dy),
+                    factor=float(factor),
+                )
+                shifted_composed = static_v1._static_compose(
+                    selected_ids=selected_ids,
+                    contributions=shifted_contrib,
+                    stems=stems,
+                    state=state,
+                    args=args,
+                )
+                metrics = _metrics_for_composed(
+                    composed=shifted_composed,
+                    raw_support=raw_support,
+                    global_support=global_support,
+                    rows=rows,
+                    lowpass_kernel=lowpass_kernel,
+                    changed_threshold=changed_threshold,
+                )
+                row = {
+                    "dx": int(dx),
+                    "dy": int(dy),
+                    "gain": metrics.get("gain"),
+                    "HF_corr": metrics.get("HF_corr"),
+                    "explained_energy": metrics.get("explained_energy"),
+                    "positive_view_ratio": metrics.get("positive_view_ratio"),
+                }
+                gain = float(row["gain"]) if row.get("gain") is not None and math.isfinite(float(row["gain"])) else -1e30
+                corr = float(row["HF_corr"]) if row.get("HF_corr") is not None and math.isfinite(float(row["HF_corr"])) else -1e30
+                if best_gain is None or gain > float(best_gain.get("gain", -1e30)):
+                    best_gain = row
+                if best_corr is None or corr > float(best_corr.get("HF_corr", -1e30)):
+                    best_corr = row
+        mode_rows[f"{shift_mode}_only"] = {
+            "grid": [int(x) for x in shift_values],
+            "best_by_gain": best_gain or {},
+            "best_by_corr": best_corr or {},
+        }
+    report["modes"] = mode_rows
+    return report
 
 
 def _single_cell_gain(
@@ -771,6 +1036,11 @@ def main() -> None:
         "variants": {},
     }
     per_view: Dict[str, object] = {"version": VERSION, "variants": {}}
+    shift_attribution_report: Dict[str, object] = {
+        "version": VERSION,
+        "note": "Diagnostic only; shifts are not a deployable model change.",
+        "variants": {},
+    }
 
     bounded_clip: Optional[float]
     bounded_mode = str(cli.bounded_mode)
@@ -797,6 +1067,7 @@ def main() -> None:
 
     visual_written = 0
     shift_values = _parse_csv_ints(cli.shift_grid) if str(cli.shift_grid).strip() else []
+    per_cell_shift_values = _parse_csv_ints(cli.per_cell_shift_grid) if str(cli.per_cell_shift_grid).strip() else []
     shift_q_modes = set(_parse_csv_strings(cli.shift_q_modes))
     shift_signs = set(_parse_csv_strings(cli.shift_signs))
     shift_lambdas = {float(x) for x in _parse_csv_floats(cli.shift_lambdas)}
@@ -850,6 +1121,23 @@ def main() -> None:
                             changed_threshold=float(cli.changed_threshold),
                             shift_values=shift_values,
                         )
+                        targeted = _targeted_shift_report_for_variant(
+                            selected_ids=selected_ids,
+                            rows=rows,
+                            obs_by_cluster=obs,
+                            base_contributions=contrib,
+                            stems=stems,
+                            state=compose_state,
+                            args=proxy_args,
+                            raw_support=raw_support,
+                            global_support=global_support,
+                            lowpass_kernel=int(proxy_args.lowpass_kernel),
+                            changed_threshold=float(cli.changed_threshold),
+                            shift_values=shift_values,
+                            factor=sign * float(lamb),
+                        )
+                        metrics["variants"][key]["targeted_shift_diagnostic"] = targeted
+                        shift_attribution_report["variants"][key] = targeted
                     per_view["variants"][key] = _per_view_for_composed(
                         composed=composed,
                         raw_support=raw_support,
@@ -869,6 +1157,12 @@ def main() -> None:
             args=proxy_args,
             active_threshold=float(cli.target_active_threshold),
         )
+    alignment_sanity_report = _alignment_sanity_report(
+        target_dirs=target_dirs,
+        state=compose_state,
+        args=proxy_args,
+        shift_values=shift_values,
+    )
 
     per_cell_report: Dict[str, object] = {}
     if int(cli.write_per_cell_report):
@@ -883,9 +1177,21 @@ def main() -> None:
             raw_support=raw_support,
             global_support=global_support,
             alt_target_path=Path(cli.alt_target_dir).expanduser().resolve() if str(cli.alt_target_dir).strip() else None,
-            shift_values=shift_values,
+            shift_values=per_cell_shift_values,
             changed_threshold=float(cli.changed_threshold),
         )
+    qtrue_status = {
+        "version": VERSION,
+        "requested": "true" in _parse_csv_strings(cli.q_modes),
+        "available": bool(str(cli.q_parent_dir).strip()),
+        "q_parent_dir": str(Path(cli.q_parent_dir).expanduser().resolve()) if str(cli.q_parent_dir).strip() else "",
+        "status": "available" if str(cli.q_parent_dir).strip() else "unavailable",
+        "note": (
+            "Exact true donor q requires precomputed donor contribution maps. "
+            "Current frozen_cells_3d only stores parent_index/source primitive geometry, not donor gaussian ids/weights."
+        ),
+        "report": q_reports.get("true", {}),
+    }
 
     headline = {}
     for key, value in metrics["variants"].items():
@@ -906,6 +1212,7 @@ def main() -> None:
         "target_primary": target_type,
         "q_report": q_reports,
         "headline": headline,
+        "qtrue_status": qtrue_status,
         "next_reading_hint": "Look for q_proxy_scaled/lambda improvements before changing selector or cells.",
     }
     manifest = {
@@ -944,6 +1251,9 @@ def main() -> None:
     _write_json(output_dir / "failure_attribution_per_view.json", per_view)
     _write_json(output_dir / "q_distribution_report.json", q_reports)
     _write_json(output_dir / "target_similarity_report.json", target_similarity)
+    _write_json(output_dir / "shift_attribution_report.json", shift_attribution_report)
+    _write_json(output_dir / "alignment_sanity_report.json", alignment_sanity_report)
+    _write_json(output_dir / "qtrue_status_or_qtrue_metrics.json", qtrue_status)
     _write_json(output_dir / "per_cell_failure_report.json", per_cell_report)
     _write_json(output_dir / "metrics.json", metrics)
     _write_json(output_dir / "per_view_metrics.json", per_view)
