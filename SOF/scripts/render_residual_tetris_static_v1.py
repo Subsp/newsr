@@ -538,6 +538,65 @@ def _write_cell_file(path: Path, name: str, rows: Sequence[Dict[str, object]]) -
     return payload
 
 
+def _frozen_cells_3d_payload(
+    *,
+    rows_by_id: Dict[int, Dict[str, object]],
+    state: Dict[str, object],
+) -> Dict[str, object]:
+    clusters = state["clusters"]
+    results = state["results"]
+    views = state["views"]
+    cells: List[Dict[str, object]] = []
+    for cluster_id in sorted(rows_by_id):
+        if cluster_id < 0 or cluster_id >= len(results) or cluster_id >= len(clusters):
+            continue
+        result = results[cluster_id]
+        cluster = clusters[cluster_id]
+        if not cluster:
+            continue
+        source_slot, source_local_index = cluster[0]
+        source_view = views[source_slot]
+        cell = {
+            "cluster_id": int(cluster_id),
+            "xyz": np.asarray(result.xyz, dtype=np.float32).reshape(3).tolist(),
+            "normal": np.asarray(result.normal, dtype=np.float32).reshape(3).tolist(),
+            "status": str(result.status),
+            "score": float(result.score),
+            "reproj_rms": float(result.reproj_rms),
+            "max_center_std": float(result.max_center_std),
+            "hessian_cond": float(result.hessian_cond),
+            "mode_dominance": float(result.mode_dominance),
+            "mode_entropy": float(result.mode_entropy),
+            "parent_index": int(result.parent_index),
+            "cluster_size": int(len(cluster)),
+            "source_view": {
+                "view_slot": int(source_slot),
+                "view_index": int(source_view.view_index),
+                "stem": str(source_view.stem),
+                "source_size": [int(source_view.source_size[0]), int(source_view.source_size[1])],
+                "camera": source_view.camera,
+                "local_primitive_index": int(source_local_index),
+                "original_primitive_id": int(source_view.original_primitive_id[source_local_index]),
+                "center": np.asarray(source_view.mu_xy[source_local_index], dtype=np.float32).reshape(2).tolist(),
+                "theta": float(source_view.theta[source_local_index]),
+                "long_px": float(source_view.long_px[source_local_index]),
+                "short_px": float(source_view.short_px[source_local_index]),
+                "q": float(source_view.q[source_local_index]),
+            },
+            "frozen_row": rows_by_id[cluster_id],
+        }
+        cells.append(cell)
+    payload = {
+        "version": VERSION,
+        "description": "Frozen 3D cell geometry and source image frame for Level-1 lockbox projection.",
+        "count": int(len(cells)),
+        "cluster_ids": [int(cell["cluster_id"]) for cell in cells],
+        "cells": cells,
+    }
+    payload["sha256"] = _sha256_json(payload["cells"])
+    return payload
+
+
 def _renderer_config(args: argparse.Namespace, oracle_args: SimpleNamespace) -> Dict[str, object]:
     return {
         "version": VERSION,
@@ -582,6 +641,7 @@ def _renderer_config(args: argparse.Namespace, oracle_args: SimpleNamespace) -> 
             "support retuning",
             "cell deletion beyond frozen variant lists",
         ],
+        "frozen_3d_cells": "frozen_cells_3d.json",
     }
 
 
@@ -593,6 +653,7 @@ def _manifest(
     oracle_args: SimpleNamespace,
     cells: Dict[str, Dict[str, object]],
     config: Dict[str, object],
+    frozen_cells_3d: Dict[str, object],
     stems: Sequence[str],
 ) -> Dict[str, object]:
     params = dict(oracle_summary.get("params", {}))
@@ -625,6 +686,11 @@ def _manifest(
                 "rows_sha256": payload["rows_sha256"],
             }
             for name, payload in cells.items()
+        },
+        "frozen_cells_3d": {
+            "file": "frozen_cells_3d.json",
+            "count": int(frozen_cells_3d.get("count", 0)),
+            "sha256": str(frozen_cells_3d.get("sha256", "")),
         },
         "renderer_config_sha256": _sha256_json(config),
         "analysis_test_policy": "read-only development set; no further deletion/top-k/bounded tuning allowed",
@@ -701,6 +767,7 @@ def _copy_to_check(output_dir: Path, check_dir: Path) -> None:
         "cells_deploy_top40_raw.json",
         "cells_core28.json",
         "cells_minimal_clean_dev.json",
+        "frozen_cells_3d.json",
         "static_v1_metrics.json",
         "numeric_closure.json",
         "README.txt",
@@ -786,6 +853,8 @@ def main() -> None:
         ),
     }
     _write_json(output_dir / "renderer_config.json", renderer_config)
+    frozen_cells_3d = _frozen_cells_3d_payload(rows_by_id=rows_by_id, state=state)
+    _write_json(output_dir / "frozen_cells_3d.json", frozen_cells_3d)
     manifest = _manifest(
         oracle_dir=oracle_dir,
         output_dir=output_dir,
@@ -793,6 +862,7 @@ def main() -> None:
         oracle_args=oracle_args,
         cells=cells,
         config=renderer_config,
+        frozen_cells_3d=frozen_cells_3d,
         stems=stems,
     )
     _write_json(output_dir / "v1_manifest.json", manifest)
@@ -887,6 +957,7 @@ def main() -> None:
             "formal_variants": list(MAIN_VARIANTS),
             "diagnostic_buffers": "buffers/<variant>/<stem>.npz",
             "per_cell_buffers": f"buffers/per_cell/{args.per_cell_buffer_variant}/<stem>/cluster_XXXXX.npz",
+            "frozen_3d_cells": "frozen_cells_3d.json",
             "acceptance": {
                 "float_mae": "< 1e-5",
                 "max_error": "< 1e-4",
